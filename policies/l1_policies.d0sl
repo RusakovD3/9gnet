@@ -1,0 +1,443 @@
+// L1 d0sl policies for G-Net subscriber layer
+// Python parses this file and uses it as the source of truth for L1 tensors and monitoring.
+
+SLA "L1_GOLD_BROADCAST_MP3" {
+    grade: "gold";
+    traffic: "broadcast_mp3";
+    codec: "MP3/VLC";
+    target_bitrate_kbps: 320;
+    min_bitrate_kbps: 320;
+    latency_budget_ms: 80;
+    packet_loss_budget_percent: 0.5;
+    jitter_budget_ms: 30;
+    monitoring_interval_seconds: 1;
+    bitrate_drop_window_seconds: 10;
+
+    SLO "Bitrate" {
+        metric: "bitrate_kbps";
+        statistic: "p95";
+        operator: GTE;
+        value: 320;
+        unit: "kbps";
+        window_seconds: 10;
+    }
+
+    SLO "Latency" {
+        metric: "latency_ms";
+        statistic: "p95";
+        operator: LTE;
+        value: 80;
+        unit: "ms";
+        window_seconds: 10;
+    }
+
+    SLO "PacketLoss" {
+        metric: "packet_loss_percent";
+        statistic: "avg";
+        operator: LTE;
+        value: 0.5;
+        unit: "%";
+        window_seconds: 10;
+    }
+
+    SLO "Jitter" {
+        metric: "jitter_ms";
+        statistic: "p95";
+        operator: LTE;
+        value: 30;
+        unit: "ms";
+        window_seconds: 10;
+    }
+}
+
+SLA "L1_GOLD_FTP" {
+    grade: "gold";
+    traffic: "ftp";
+    codec: "TCP/IP";
+    target_bitrate_kbps: 320;
+    min_bitrate_kbps: 320;
+    latency_budget_ms: 300;
+    packet_loss_budget_percent: 0.5;
+    jitter_budget_ms: 100;
+    monitoring_interval_seconds: 1;
+    bitrate_drop_window_seconds: 10;
+
+    SLO "Bitrate" {
+        metric: "bitrate_kbps";
+        statistic: "p95";
+        operator: GTE;
+        value: 320;
+        unit: "kbps";
+        window_seconds: 10;
+    }
+
+    SLO "Latency" {
+        metric: "latency_ms";
+        statistic: "p95";
+        operator: LTE;
+        value: 300;
+        unit: "ms";
+        window_seconds: 10;
+    }
+
+    SLO "PacketLoss" {
+        metric: "packet_loss_percent";
+        statistic: "avg";
+        operator: LTE;
+        value: 0.5;
+        unit: "%";
+        window_seconds: 10;
+    }
+
+    SLO "Jitter" {
+        metric: "jitter_ms";
+        statistic: "p95";
+        operator: LTE;
+        value: 100;
+        unit: "ms";
+        window_seconds: 10;
+    }
+}
+
+SLA "L1_GOLD_DNS" {
+    grade: "gold";
+    traffic: "dns";
+    codec: "UDP/TCP DNS";
+    target_bitrate_kbps: 320;
+    min_bitrate_kbps: 320;
+    latency_budget_ms: 30;
+    packet_loss_budget_percent: 0.5;
+    jitter_budget_ms: 10;
+    monitoring_interval_seconds: 1;
+    bitrate_drop_window_seconds: 10;
+
+    SLO "Bitrate" {
+        metric: "bitrate_kbps";
+        statistic: "p95";
+        operator: GTE;
+        value: 320;
+        unit: "kbps";
+        window_seconds: 10;
+    }
+
+    SLO "Latency" {
+        metric: "latency_ms";
+        statistic: "p95";
+        operator: LTE;
+        value: 30;
+        unit: "ms";
+        window_seconds: 10;
+    }
+
+    SLO "PacketLoss" {
+        metric: "packet_loss_percent";
+        statistic: "avg";
+        operator: LTE;
+        value: 0.5;
+        unit: "%";
+        window_seconds: 10;
+    }
+
+    SLO "Jitter" {
+        metric: "jitter_ms";
+        statistic: "p95";
+        operator: LTE;
+        value: 10;
+        unit: "ms";
+        window_seconds: 10;
+    }
+}
+
+SLA "L1_SILVER_BROADCAST_MP3" {
+    grade: "silver";
+    traffic: "broadcast_mp3";
+    codec: "MP3/VLC";
+    target_bitrate_kbps: 128;
+    min_bitrate_kbps: 128;
+    latency_budget_ms: 80;
+    packet_loss_budget_percent: 1.0;
+    jitter_budget_ms: 30;
+    monitoring_interval_seconds: 1;
+    bitrate_drop_window_seconds: 10;
+
+    SLO "Bitrate" {
+        metric: "bitrate_kbps";
+        statistic: "p95";
+        operator: GTE;
+        value: 128;
+        unit: "kbps";
+        window_seconds: 10;
+    }
+
+    SLO "Latency" {
+        metric: "latency_ms";
+        statistic: "p95";
+        operator: LTE;
+        value: 80;
+        unit: "ms";
+        window_seconds: 10;
+    }
+
+    SLO "PacketLoss" {
+        metric: "packet_loss_percent";
+        statistic: "avg";
+        operator: LTE;
+        value: 1.0;
+        unit: "%";
+        window_seconds: 10;
+    }
+
+    SLO "Jitter" {
+        metric: "jitter_ms";
+        statistic: "p95";
+        operator: LTE;
+        value: 30;
+        unit: "ms";
+        window_seconds: 10;
+    }
+}
+
+SLA "L1_SILVER_FTP" {
+    grade: "silver";
+    traffic: "ftp";
+    codec: "TCP/IP";
+    target_bitrate_kbps: 128;
+    min_bitrate_kbps: 128;
+    latency_budget_ms: 300;
+    packet_loss_budget_percent: 1.0;
+    jitter_budget_ms: 100;
+    monitoring_interval_seconds: 1;
+    bitrate_drop_window_seconds: 10;
+
+    SLO "Bitrate" {
+        metric: "bitrate_kbps";
+        statistic: "p95";
+        operator: GTE;
+        value: 128;
+        unit: "kbps";
+        window_seconds: 10;
+    }
+
+    SLO "Latency" {
+        metric: "latency_ms";
+        statistic: "p95";
+        operator: LTE;
+        value: 300;
+        unit: "ms";
+        window_seconds: 10;
+    }
+
+    SLO "PacketLoss" {
+        metric: "packet_loss_percent";
+        statistic: "avg";
+        operator: LTE;
+        value: 1.0;
+        unit: "%";
+        window_seconds: 10;
+    }
+
+    SLO "Jitter" {
+        metric: "jitter_ms";
+        statistic: "p95";
+        operator: LTE;
+        value: 100;
+        unit: "ms";
+        window_seconds: 10;
+    }
+}
+
+SLA "L1_SILVER_DNS" {
+    grade: "silver";
+    traffic: "dns";
+    codec: "UDP/TCP DNS";
+    target_bitrate_kbps: 128;
+    min_bitrate_kbps: 128;
+    latency_budget_ms: 30;
+    packet_loss_budget_percent: 1.0;
+    jitter_budget_ms: 10;
+    monitoring_interval_seconds: 1;
+    bitrate_drop_window_seconds: 10;
+
+    SLO "Bitrate" {
+        metric: "bitrate_kbps";
+        statistic: "p95";
+        operator: GTE;
+        value: 128;
+        unit: "kbps";
+        window_seconds: 10;
+    }
+
+    SLO "Latency" {
+        metric: "latency_ms";
+        statistic: "p95";
+        operator: LTE;
+        value: 30;
+        unit: "ms";
+        window_seconds: 10;
+    }
+
+    SLO "PacketLoss" {
+        metric: "packet_loss_percent";
+        statistic: "avg";
+        operator: LTE;
+        value: 1.0;
+        unit: "%";
+        window_seconds: 10;
+    }
+
+    SLO "Jitter" {
+        metric: "jitter_ms";
+        statistic: "p95";
+        operator: LTE;
+        value: 10;
+        unit: "ms";
+        window_seconds: 10;
+    }
+}
+
+SLA "L1_BRONZE_BROADCAST_MP3" {
+    grade: "bronze";
+    traffic: "broadcast_mp3";
+    codec: "MP3/VLC";
+    target_bitrate_kbps: 64;
+    min_bitrate_kbps: 64;
+    latency_budget_ms: 80;
+    packet_loss_budget_percent: 2.0;
+    jitter_budget_ms: 30;
+    monitoring_interval_seconds: 1;
+    bitrate_drop_window_seconds: 10;
+
+    SLO "Bitrate" {
+        metric: "bitrate_kbps";
+        statistic: "p95";
+        operator: GTE;
+        value: 64;
+        unit: "kbps";
+        window_seconds: 10;
+    }
+
+    SLO "Latency" {
+        metric: "latency_ms";
+        statistic: "p95";
+        operator: LTE;
+        value: 80;
+        unit: "ms";
+        window_seconds: 10;
+    }
+
+    SLO "PacketLoss" {
+        metric: "packet_loss_percent";
+        statistic: "avg";
+        operator: LTE;
+        value: 2.0;
+        unit: "%";
+        window_seconds: 10;
+    }
+
+    SLO "Jitter" {
+        metric: "jitter_ms";
+        statistic: "p95";
+        operator: LTE;
+        value: 30;
+        unit: "ms";
+        window_seconds: 10;
+    }
+}
+
+SLA "L1_BRONZE_FTP" {
+    grade: "bronze";
+    traffic: "ftp";
+    codec: "TCP/IP";
+    target_bitrate_kbps: 64;
+    min_bitrate_kbps: 64;
+    latency_budget_ms: 300;
+    packet_loss_budget_percent: 2.0;
+    jitter_budget_ms: 100;
+    monitoring_interval_seconds: 1;
+    bitrate_drop_window_seconds: 10;
+
+    SLO "Bitrate" {
+        metric: "bitrate_kbps";
+        statistic: "p95";
+        operator: GTE;
+        value: 64;
+        unit: "kbps";
+        window_seconds: 10;
+    }
+
+    SLO "Latency" {
+        metric: "latency_ms";
+        statistic: "p95";
+        operator: LTE;
+        value: 300;
+        unit: "ms";
+        window_seconds: 10;
+    }
+
+    SLO "PacketLoss" {
+        metric: "packet_loss_percent";
+        statistic: "avg";
+        operator: LTE;
+        value: 2.0;
+        unit: "%";
+        window_seconds: 10;
+    }
+
+    SLO "Jitter" {
+        metric: "jitter_ms";
+        statistic: "p95";
+        operator: LTE;
+        value: 100;
+        unit: "ms";
+        window_seconds: 10;
+    }
+}
+
+SLA "L1_BRONZE_DNS" {
+    grade: "bronze";
+    traffic: "dns";
+    codec: "UDP/TCP DNS";
+    target_bitrate_kbps: 64;
+    min_bitrate_kbps: 64;
+    latency_budget_ms: 30;
+    packet_loss_budget_percent: 2.0;
+    jitter_budget_ms: 10;
+    monitoring_interval_seconds: 1;
+    bitrate_drop_window_seconds: 10;
+
+    SLO "Bitrate" {
+        metric: "bitrate_kbps";
+        statistic: "p95";
+        operator: GTE;
+        value: 64;
+        unit: "kbps";
+        window_seconds: 10;
+    }
+
+    SLO "Latency" {
+        metric: "latency_ms";
+        statistic: "p95";
+        operator: LTE;
+        value: 30;
+        unit: "ms";
+        window_seconds: 10;
+    }
+
+    SLO "PacketLoss" {
+        metric: "packet_loss_percent";
+        statistic: "avg";
+        operator: LTE;
+        value: 2.0;
+        unit: "%";
+        window_seconds: 10;
+    }
+
+    SLO "Jitter" {
+        metric: "jitter_ms";
+        statistic: "p95";
+        operator: LTE;
+        value: 10;
+        unit: "ms";
+        window_seconds: 10;
+    }
+}
