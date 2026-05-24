@@ -522,7 +522,7 @@ class GNetBaselineBuilder:
         physical_level: str,
     ) -> None:
         """Add an edge with transport metadata and an edge tensor."""
-        loss_inverse = 0.995 if medium in {"fiber", "ethernet"} else 0.965
+        loss_probability = LINK_LOSS_PROBABILITY.get(medium, 0.001)
         attack_exposure_inverse = {"fiber": 0.88, "ethernet": 0.80, "radio": 0.70, "radio-backhaul": 0.74, "logical-service-binding": 0.92}.get(medium, 0.78)
 
         self.graph.add_edge(
@@ -555,7 +555,7 @@ class GNetBaselineBuilder:
                 {
                     "capacity_mbps": capacity_mbps,
                     "latency_ms": latency_ms,
-                    "loss_probability": 1.0 - loss_inverse,
+                    "loss_probability": loss_probability,
                     "redundancy": redundancy,
                     "utilization": IDEAL_LOAD_FACTOR,
                     "stability_margin": max(0.0, redundancy - IDEAL_LOAD_FACTOR),
@@ -593,6 +593,13 @@ MEDIUM_CODES = {
 NOISE_DB_BY_MEDIUM = {"fiber": 2.0, "ethernet": 8.0, "radio": 22.0, "radio-backhaul": 18.0, "logical-service-binding": 0.0}
 DUCT_USAGE_BY_MEDIUM = {"fiber": 0.55, "ethernet": 0.35, "radio": 0.0, "logical-service-binding": 0.0}
 REPAIR_HOURS_BY_MEDIUM = {"fiber": 6.0, "ethernet": 2.0, "radio": 0.5, "logical-service-binding": 0.0}
+LINK_LOSS_PROBABILITY = {
+    "fiber": 0.00001,
+    "ethernet": 0.00010,
+    "radio": 0.00150,
+    "radio-backhaul": 0.00100,
+    "logical-service-binding": 0.0,
+}
 
 ROLE_STATE_TEMPLATES = {
     "l5_core": {

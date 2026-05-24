@@ -2,9 +2,9 @@
 
 G-Net 9 - исследовательская модель телекоммуникационной сети. Проект строит
 воспроизводимое baseline-состояние `t0`: топологию, абонентов, сервисы,
-телеметрию, d0sl-политики и числовые тензоры состояния для дальнейших
-экспериментов с отказами, атаками, ремаппингом, Koopman/DMD, Hausdorff и
-Lyapunov-анализом.
+телеметрию, d0sl-политики, числовые тензоры состояния и первую дискретную
+динамическую траекторию для будущих экспериментов с отказами, атаками,
+ремаппингом, Koopman/DMD, Hausdorff и Lyapunov-анализом.
 
 ## Быстрый старт
 
@@ -27,6 +27,7 @@ pytest tests/test_topology.py -v
 - `l1_d0sl_profiles.json` - профили абонентов и примененные политики.
 - `l1_d0sl_parsed.json` - уникальные d0sl-политики, реально использованные в baseline.
 - `l2_equipment_profiles.json` - профили L2-оборудования и raw telemetry.
+- `network_dynamics.json` - snapshots сети с шагом 5 секунд.
 - `l1_policies.d0sl` - копия исходного файла политик.
 
 ## Текущая топология
@@ -47,13 +48,42 @@ pytest tests/test_topology.py -v
 - `L6` также добавлен абонентам.
 - `L8` добавлен всем размещенным non-L0 узлам как `l8_tensor`.
 
+## Идеальный baseline t0
+
+Baseline считается healthy, если для всех L1-абонентов выполняются:
+
+- bitrate не ниже `min_bitrate_kbps`;
+- latency не выше `latency_budget_ms`;
+- packet loss не выше `packet_loss_budget_percent`;
+- jitter не выше `jitter_budget_ms`;
+- нет `bitrate_drop_alarm`.
+
+Значения не занулены: задержки, шум и потери оставлены малыми, чтобы состояние
+было реалистичным, но все SLA/SLO/SLI выполнялись с запасом.
+
+## Дискретная динамика
+
+Проект экспортирует первую динамическую траекторию в `output/network_dynamics.json`.
+
+Текущий режим: `stationary_healthy_baseline`.
+
+- шаг симуляции: 5 секунд;
+- длительность: 30 секунд;
+- snapshots: `t = 0, 5, 10, 15, 20, 25, 30`;
+- структура графа не меняется;
+- значения тензоров не деградируют;
+- каждый snapshot содержит узлы, ребра и все найденные `StateTensor`-значения.
+
+Это пока не сценарий отказа и не ремаппинг. Это стабильная траектория хорошей
+сети, которая задает формат входных данных для следующих этапов: Koopman/DMD,
+Hausdorff distance, Lyapunov-анализ, сравнение `baseline -> degraded -> repaired`.
+
 ## Тензоры состояния
 
-Раньше проект использовал фиксированный 5D-тензор `2x2x2x2x2`. Сейчас это
-заменено на более простой и расчетно удобный `StateTensor`: числовой вектор
-с явными `metric_names`, `units`, `metric_index` и `shape`.
+Проект использует `StateTensor`: числовой вектор с явными `metric_names`,
+`units`, `metric_index` и `shape`.
 
-Такой формат проще использовать как вектор состояния для:
+Такой формат удобно использовать как вектор состояния для:
 
 - Koopman/DMD;
 - Lyapunov-функций;
@@ -62,8 +92,6 @@ pytest tests/test_topology.py -v
 - cost-aware remapping и CAPEX/OPEX оценок.
 
 ### L0 - сервисы
-
-Метрики:
 
 - `service_code`
 - `bitrate_mbps`
@@ -76,10 +104,8 @@ pytest tests/test_topology.py -v
 
 ### L1 - абоненты
 
-Метрики:
-
-- `access_type_code` - fixed/mobile.
-- `service_code` - связь с сервисом L0.
+- `access_type_code`
+- `service_code`
 - `request_rate_pps`
 - `response_rate_pps`
 - `traffic_intensity_rho`
@@ -90,8 +116,6 @@ pytest tests/test_topology.py -v
 - `sla_margin`
 
 ### L2 - активное оборудование
-
-Метрики:
 
 - `ram_used_gb`
 - `ram_load_percent`
@@ -128,8 +152,6 @@ pytest tests/test_topology.py -v
 
 ### L5 - протоколы, маршрутизация, ремаппинг
 
-Метрики:
-
 - `protocol_code`
 - `socket_binding_present`
 - `routing_mode_code`
@@ -139,8 +161,6 @@ pytest tests/test_topology.py -v
 
 ### L6 - питание и стоимость
 
-Метрики:
-
 - `power_supply_code`
 - `nominal_power_kw`
 - `backup_autonomy_hours`
@@ -148,8 +168,6 @@ pytest tests/test_topology.py -v
 - `capex_opex_cost`
 
 ### L7 - арбитр
-
-Метрики:
 
 - `hausdorff_distance`
 - `lyapunov_value`
@@ -161,8 +179,6 @@ pytest tests/test_topology.py -v
 
 ### L8 - размещение
 
-Метрики:
-
 - `x`
 - `y`
 - `coordinate_norm`
@@ -173,7 +189,8 @@ pytest tests/test_topology.py -v
 
 - `main.py` - входная точка и экспорт артефактов.
 - `src/gnet9/topology_builder.py` - построение baseline-графа.
-- `src/gnet9/tensors.py` - спецификации `StateTensor` для уровней L0-L8 и EDGE.
+- `src/gnet9/dynamics.py` - дискретная динамика и snapshots.
+- `src/gnet9/tensors.py` - спецификации `StateTensor` для L0-L8 и EDGE.
 - `src/gnet9/models.py` - `StateTensor`, `NetworkModel`, профили сервисов и slices.
 - `src/gnet9/l1_d0sl.py` - парсер d0sl, очереди L1, мониторинг L1.
 - `src/gnet9/l2_equipment.py` - L2-профили оборудования и расчет L2 state metrics.
@@ -187,11 +204,12 @@ pytest tests/test_topology.py -v
 - Воспроизводимая baseline-топология.
 - L0-сервисы, L1-абоненты, L2 core/aggregation routers.
 - d0sl-политики для SLA/SLO/SLI.
-- Синтетический L1-мониторинг.
+- Синтетический L1-мониторинг без baseline-нарушений SLA/SLO.
 - L2 raw telemetry и Cisco-like capacity profiles.
 - Числовые state tensors для всех уровней модели.
+- Стационарная дискретная динамика с шагом 5 секунд.
 - JSON, GraphML, CSV и PNG-экспорт.
-- Базовые тесты структуры и тензоров.
+- Базовые тесты структуры, тензоров и healthy baseline.
 
 ## Что еще не реализовано
 
@@ -202,5 +220,6 @@ pytest tests/test_topology.py -v
 - Lyapunov-анализ деградации и восстановления.
 - SDN orchestration и auto-healing.
 
-Текущая цель проекта - иметь чистый baseline `t0`, от которого можно строить
-сценарии деградации, восстановления и прогнозирования.
+Текущая цель проекта - иметь чистый baseline `t0` и стационарную healthy
+траекторию, от которых можно строить сценарии деградации, восстановления и
+прогнозирования.

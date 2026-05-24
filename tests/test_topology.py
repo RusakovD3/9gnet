@@ -1,3 +1,4 @@
+from src.gnet9.dynamics import simulate_stationary_dynamics
 from src.gnet9.topology_builder import GNetBaselineBuilder
 
 
@@ -100,3 +101,28 @@ def test_service_count() -> None:
 def test_subscriber_count() -> None:
     l1_nodes = [node for node, attrs in MODEL.graph.nodes(data=True) if attrs["level"] == "L1"]
     assert len(l1_nodes) == 240
+
+
+def test_l1_baseline_has_no_sla_violations() -> None:
+    for _, attrs in MODEL.graph.nodes(data=True):
+        if attrs.get("level") != "L1":
+            continue
+
+        for point in attrs["monitoring"]:
+            assert point["bitrate_slo_ok"]
+            assert point["latency_slo_ok"]
+            assert point["loss_slo_ok"]
+            assert point["jitter_slo_ok"]
+            assert not point["bitrate_drop_alarm"]
+
+
+def test_stationary_dynamics_snapshots_every_five_seconds() -> None:
+    dynamics = simulate_stationary_dynamics(MODEL)
+    snapshots = dynamics["snapshots"]
+
+    assert dynamics["mode"] == "stationary_healthy_baseline"
+    assert [snapshot["time_seconds"] for snapshot in snapshots] == [0, 5, 10, 15, 20, 25, 30]
+    assert len(snapshots[0]["nodes"]) == MODEL.graph.number_of_nodes()
+    assert len(snapshots[0]["edges"]) == MODEL.graph.number_of_edges()
+    assert "tensor" in snapshots[0]["nodes"][0]["tensors"]
+    assert "tensor" in snapshots[0]["edges"][0]["tensors"]

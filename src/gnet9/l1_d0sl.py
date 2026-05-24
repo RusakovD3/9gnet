@@ -394,22 +394,28 @@ def simulate_l1_monitoring(
 
 
 def _sample_bitrate(policy: D0SLSubscriberPolicy, rng: np.random.Generator, second: int, degraded: bool) -> float:
+    if not degraded:
+        baseline = policy.target_bitrate_kbps * (1.06 + rng.normal(0.0, 0.008))
+        return float(np.clip(baseline, policy.min_bitrate_kbps * 1.03, policy.target_bitrate_kbps * 1.10))
+
     noise = rng.normal(0.0, 0.025)
     trend = -0.055 * max(0, second - 8) if degraded else 0.0
     return float(policy.target_bitrate_kbps * max(0.25, 1.0 + noise + trend))
 
 
 def _sample_latency(policy: D0SLSubscriberPolicy, queue_model: L1QueueModel, rng: np.random.Generator) -> float:
-    latency_base = min(policy.latency_budget_ms * 0.45, queue_model.mean_system_time_ms + 2.0)
-    return float(max(0.1, latency_base + rng.gamma(shape=1.6, scale=0.9)))
+    latency_base = min(policy.latency_budget_ms * 0.35, queue_model.mean_system_time_ms + 1.5)
+    sample = latency_base + rng.gamma(shape=1.4, scale=max(policy.latency_budget_ms * 0.012, 0.25))
+    return float(np.clip(sample, 0.1, policy.latency_budget_ms * 0.65))
 
 
 def _sample_jitter(policy: D0SLSubscriberPolicy, rng: np.random.Generator) -> float:
-    return float(max(0.05, rng.gamma(shape=1.5, scale=max(policy.jitter_budget_ms / 18.0, 0.2))))
+    sample = rng.gamma(shape=1.4, scale=max(policy.jitter_budget_ms / 28.0, 0.12))
+    return float(np.clip(sample, 0.03, policy.jitter_budget_ms * 0.45))
 
 
 def _sample_packet_loss(policy: D0SLSubscriberPolicy, rng: np.random.Generator) -> float:
-    return float(max(0.0, rng.normal(policy.packet_loss_budget_percent * 0.25, 0.05)))
+    return float(policy.packet_loss_budget_percent * rng.uniform(0.02, 0.12))
 
 
 def build_l1_state_metrics(

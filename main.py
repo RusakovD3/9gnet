@@ -6,6 +6,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from src.gnet9.dynamics import simulate_stationary_dynamics
 from src.gnet9.topology_builder import GNetBaselineBuilder
 from src.gnet9.visualizer import GNetVisualizer
 
@@ -113,6 +114,12 @@ def export_parsed_d0sl_catalog(model, path: Path) -> None:
     path.write_text(json.dumps(list(unique_policies.values()), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def export_stationary_dynamics(model, path: Path) -> None:
+    """Export 5-second stationary snapshots for the healthy baseline."""
+    dynamics = simulate_stationary_dynamics(model)
+    path.write_text(json.dumps(dynamics, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def _l1_export_base(node_id: str, attrs: dict[str, Any]) -> dict[str, Any]:
     """Common L1 fields used by both profile and monitoring exports."""
     return {
@@ -141,6 +148,7 @@ def main() -> None:
         "l2_profiles": output_dir / "l2_equipment_profiles.json",
         "d0sl_parsed": output_dir / "l1_d0sl_parsed.json",
         "d0sl_source": output_dir / "l1_policies.d0sl",
+        "dynamics": output_dir / "network_dynamics.json",
         "network_png": output_dir / "network_logic.png",
         "layers_png": output_dir / "layer_scheme.png",
     }
@@ -156,6 +164,7 @@ def main() -> None:
     export_l1_monitoring(model, artifacts["l1_monitoring"])
     export_l2_equipment_profiles(model, artifacts["l2_profiles"])
     export_parsed_d0sl_catalog(model, artifacts["d0sl_parsed"])
+    export_stationary_dynamics(model, artifacts["dynamics"])
     shutil.copyfile(d0sl_policy_path, artifacts["d0sl_source"])
 
     print("Done.")
