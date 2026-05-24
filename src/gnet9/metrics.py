@@ -30,7 +30,8 @@ def vertex_proximity_index(graph: nx.Graph, nodes: Iterable[str]) -> dict[str, f
     higher its value. In the project this is used as a readable centrality metric
     for core routers.
     """
-    subgraph = graph.subgraph(list(nodes))
+    selected_nodes = list(nodes)
+    subgraph = graph.subgraph(selected_nodes)
     return {node: float(value) for node, value in nx.closeness_centrality(subgraph).items()}
 
 
@@ -40,5 +41,5 @@ def _node_positions(graph: nx.Graph, nodes: Iterable[str]) -> np.ndarray:
 
 def _directed_hausdorff(points_from: np.ndarray, points_to: np.ndarray) -> float:
     """Distance from one point set to another in the Hausdorff sense."""
-    nearest_distances = [np.min(np.linalg.norm(point - points_to, axis=1)) for point in points_from]
-    return float(np.max(nearest_distances))
+    pairwise_distances = np.linalg.norm(points_from[:, None, :] - points_to[None, :, :], axis=2)
+    return float(np.max(np.min(pairwise_distances, axis=1)))

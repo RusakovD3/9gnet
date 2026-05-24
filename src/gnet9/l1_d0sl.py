@@ -56,7 +56,7 @@ class D0SLSubscriberPolicy:
 
     This object is the bridge between the text policy and the generated network.
     The builder uses it to create L1 nodes, queue models, synthetic monitoring
-    samples and L1 tensors.
+    samples and L1 state tensors.
     """
 
     name: str
@@ -412,31 +412,36 @@ def _sample_packet_loss(policy: D0SLSubscriberPolicy, rng: np.random.Generator) 
     return float(max(0.0, rng.normal(policy.packet_loss_budget_percent * 0.25, 0.05)))
 
 
-def l1_tensor_metrics_from_monitoring(
+def build_l1_state_metrics(
     policy: D0SLSubscriberPolicy,
     queue_model: L1QueueModel,
     points: list[L1MonitoringPoint],
+    *,
+    access_kind: str,
 ) -> dict[str, float]:
-    """Convert raw monitoring samples into normalized L1 tensor metrics.
+    """Convert raw monitoring samples into the L1 subscriber state vector.
 
-    The tensor stores compact indicators, not the whole monitoring history.
-    Full history is exported separately to `l1_monitoring.csv`.
+    Categorical values are encoded as stable numeric factors. Raw monitoring
+    remains available in `l1_monitoring.csv`.
     """
     bitrates = np.array([point.bitrate_kbps for point in points], dtype=float)
     latencies = np.array([point.latency_ms for point in points], dtype=float)
     losses = np.array([point.packet_loss_percent for point in points], dtype=float)
-    jitters = np.array([point.jitter_ms for point in points], dtype=float)
+    processing_speed_mbps = _access_processing_speed_mbps(access_kind, policy.grade)
+    response_rate = queue_model.arrival_rate_pps * max(0.0, 1.0 - float(np.mean(losses)) / 100.0)
+    sla_margin = _bounded_ratio(policy.latency_budget_ms, float(np.percentile(latencies, 95)))
 
     return {
-        "sla_grade": _grade_to_value(policy.grade),
-        "slo_bitrate_ratio": _bounded_ratio(np.percentile(bitrates, 5), policy.min_bitrate_kbps),
-        "sli_latency_ratio": _bounded_ratio(policy.latency_budget_ms, np.percentile(latencies, 95)),
-        "sli_loss_ratio": _bounded_ratio(policy.packet_loss_budget_percent, float(np.mean(losses))),
-        "queue_stability": float(np.clip(queue_model.stability_margin, 0.0, 1.0)),
-        "sli_jitter_ratio": _bounded_ratio(policy.jitter_budget_ms, np.percentile(jitters, 95)),
-        "traffic_class": _traffic_to_value(policy.traffic),
-        "monitoring_period": min(1.0, len(points) / L1_MONITORING_SECONDS),
-        "bitrate_drop_alarm": 1.0 if any(point.bitrate_drop_alarm for point in points) else 0.0,
+        "access_type_code": 1.0 if access_kind == "mobile" else 0.0,
+        "service_code": _service_code_for_traffic(policy.traffic),
+        "request_rate_pps": float(queue_model.arrival_rate_pps),
+        "response_rate_pps": float(response_rate),
+        "traffic_intensity_rho": float(queue_model.utilization_rho),
+        "traffic_distribution_cv": _coefficient_of_variation(bitrates),
+        "processing_speed_mbps": processing_speed_mbps,
+        "processing_delay_ms": float(np.percentile(latencies, 95)),
+        "capex_opex_cost": _access_cost(access_kind, policy.grade),
+        "sla_margin": sla_margin,
     }
 
 
@@ -445,9 +450,31 @@ def _bounded_ratio(numerator: float, denominator: float) -> float:
     return float(np.clip(numerator / max(denominator, 1e-9), 0.0, 1.5) / 1.5)
 
 
-def _grade_to_value(grade: SlaGrade) -> float:
-    return {SlaGrade.GOLD: 1.0, SlaGrade.SILVER: 0.72, SlaGrade.BRONZE: 0.45}[grade]
+def _service_code_for_traffic(traffic: TrafficKind) -> float:
+    """Map L1 traffic kinds to stable L0 service codes."""
+    return {
+        TrafficKind.BROADCAST_MP3: 2.0,  # Video/service media stream
+        TrafficKind.FTP: 3.0,
+        TrafficKind.DNS: 4.0,  # Telemetry/control-like service traffic
+    }[traffic]
 
 
-def _traffic_to_value(traffic: TrafficKind) -> float:
-    return {TrafficKind.BROADCAST_MP3: 1.0, TrafficKind.FTP: 0.70, TrafficKind.DNS: 0.85}[traffic]
+def _access_processing_speed_mbps(access_kind: str, grade: SlaGrade) -> float:
+    if access_kind == "fixed":
+        return 100.0
+    if grade == SlaGrade.GOLD:
+        return 400.0
+    return 30.0
+
+
+def _access_cost(access_kind: str, grade: SlaGrade) -> float:
+    if access_kind == "fixed":
+        return 0.46
+    return 0.88 if grade == SlaGrade.GOLD else 0.68
+
+
+def _coefficient_of_variation(values: np.ndarray) -> float:
+    mean = float(np.mean(values))
+    if mean <= 1e-9:
+        return 0.0
+    return float(np.std(values) / mean)

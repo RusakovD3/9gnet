@@ -1,8 +1,8 @@
-"""Tensor templates for G-Net nodes and edges.
+"""Layer tensor specifications for the G-Net baseline.
 
-Every tensor has the same compact shape: 2x2x2x2x2. The project does not try to
-store every possible metric in every cell. Instead, each important metric is
-placed into a named semantic slot. This keeps the model small and explainable.
+The current model uses simple numeric state vectors. This is deliberate:
+Koopman/DMD, Lyapunov checks and distance calculations need stable numeric
+features more than sparse high-order arrays with many empty cells.
 """
 
 from __future__ import annotations
@@ -11,161 +11,254 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .constants import TENSOR_SHAPE
-from .models import Tensor5
+from .models import StateTensor
 
 
 @dataclass(frozen=True)
-class TensorTemplate:
-    """Description of tensor axes and metric coordinates for one layer."""
+class StateTensorSpec:
+    """Named metrics, units and purpose for one layer tensor."""
 
     level: str
-    axis_names: tuple[str, str, str, str, str]
-    metric_slots: dict[str, tuple[int, int, int, int, int]]
+    metric_names: tuple[str, ...]
+    units: dict[str, str]
+    description: str
 
 
-TEMPLATES = {
-    "L0": TensorTemplate(
+STATE_TENSOR_SPECS: dict[str, StateTensorSpec] = {
+    "L0": StateTensorSpec(
         "L0",
-        ("service", "quality", "business", "demand", "time"),
+        (
+            "service_code",
+            "bitrate_mbps",
+            "latency_budget_ms",
+            "jitter_budget_ms",
+            "availability_target",
+            "priority_code",
+            "demand_pressure",
+            "service_health",
+        ),
         {
-            "sla_attainment": (0, 0, 0, 0, 0),
-            "slo_margin": (0, 0, 0, 0, 1),
-            "demand_pressure": (0, 0, 0, 1, 0),
-            "business_value": (0, 1, 0, 0, 0),
-            "service_health": (1, 0, 0, 0, 0),
+            "bitrate_mbps": "Mbps",
+            "latency_budget_ms": "ms",
+            "jitter_budget_ms": "ms",
+            "availability_target": "ratio",
+            "demand_pressure": "ratio",
+            "service_health": "ratio",
         },
+        "L0 service demand and quality target vector.",
     ),
-    "L1": TensorTemplate(
+    "L1": StateTensorSpec(
         "L1",
-        ("sla", "slo", "sli", "queue", "time"),
+        (
+            "access_type_code",
+            "service_code",
+            "request_rate_pps",
+            "response_rate_pps",
+            "traffic_intensity_rho",
+            "traffic_distribution_cv",
+            "processing_speed_mbps",
+            "processing_delay_ms",
+            "capex_opex_cost",
+            "sla_margin",
+        ),
         {
-            "sla_grade": (0, 0, 0, 0, 0),
-            "slo_bitrate_ratio": (0, 0, 0, 0, 1),
-            "sli_latency_ratio": (0, 0, 0, 1, 0),
-            "sli_loss_ratio": (0, 1, 0, 0, 0),
-            "queue_stability": (1, 0, 0, 0, 0),
-            "sli_jitter_ratio": (1, 1, 0, 0, 0),
-            "traffic_class": (1, 0, 1, 0, 0),
-            "monitoring_period": (1, 0, 0, 1, 0),
-            "bitrate_drop_alarm": (1, 0, 0, 0, 1),
+            "request_rate_pps": "packets/s",
+            "response_rate_pps": "packets/s",
+            "traffic_intensity_rho": "ratio",
+            "traffic_distribution_cv": "ratio",
+            "processing_speed_mbps": "Mbps",
+            "processing_delay_ms": "ms",
+            "capex_opex_cost": "normalized",
+            "sla_margin": "ratio",
         },
+        "L1 subscriber request, service, processing, queue and cost state.",
     ),
-    "L2": TensorTemplate(
+    "L2": StateTensorSpec(
         "L2",
-        ("device", "performance", "security", "resilience", "time"),
+        (
+            "ram_used_gb",
+            "ram_load_percent",
+            "cpu_load_percent",
+            "packet_processing_time_ms",
+            "traffic_distribution_code",
+            "port_delay_ms",
+            "port_speed_mbps",
+            "capex_opex_cost",
+            "stability_margin",
+        ),
         {
-            "vitality_V": (0, 0, 0, 0, 0),
-            "immunity_I": (0, 0, 0, 0, 1),
-            "damage_D": (0, 0, 0, 1, 0),
-            "regeneration_R": (0, 1, 0, 0, 0),
-            "attack_surface": (1, 0, 0, 0, 0),
+            "ram_used_gb": "GB",
+            "ram_load_percent": "%",
+            "cpu_load_percent": "%",
+            "packet_processing_time_ms": "ms",
+            "port_delay_ms": "ms",
+            "port_speed_mbps": "Mbps",
+            "capex_opex_cost": "normalized",
+            "stability_margin": "ratio",
         },
+        "L2 equipment load, packet processing, port and stability state.",
     ),
-    "L3": TensorTemplate(
+    "L3": StateTensorSpec(
         "L3",
-        ("channel", "signal", "errors", "forecast", "time"),
+        (
+            "medium_code",
+            "line_rate_mbps",
+            "distance_m",
+            "frequency_mhz",
+            "attenuation_db",
+            "noise_interference_db",
+            "snr_db",
+        ),
         {
-            "snr": (0, 0, 0, 0, 0),
-            "ber_inverse": (0, 0, 0, 0, 1),
-            "interference_margin": (0, 0, 0, 1, 0),
-            "koopman_residual_inverse": (0, 1, 0, 0, 0),
-            "path_stability": (1, 0, 0, 0, 0),
+            "line_rate_mbps": "Mbps",
+            "distance_m": "m",
+            "frequency_mhz": "MHz",
+            "attenuation_db": "dB",
+            "noise_interference_db": "dB",
+            "snr_db": "dB",
         },
+        "L3 transmission medium, attenuation and noise state.",
     ),
-    "L4": TensorTemplate(
+    "L4": StateTensorSpec(
         "L4",
-        ("physical", "redundancy", "repair", "risk", "time"),
+        (
+            "x_mid",
+            "y_mid",
+            "length_m",
+            "cross_connect_present",
+            "duct_capacity_used_ratio",
+            "repair_time_hours",
+        ),
         {
-            "redundancy": (0, 0, 0, 0, 0),
-            "repairability": (0, 0, 0, 0, 1),
-            "link_health": (0, 0, 0, 1, 0),
-            "geo_exposure_inverse": (0, 1, 0, 0, 0),
-            "physical_margin": (1, 0, 0, 0, 0),
+            "x_mid": "model-coordinate",
+            "y_mid": "model-coordinate",
+            "length_m": "m",
+            "cross_connect_present": "boolean",
+            "duct_capacity_used_ratio": "ratio",
+            "repair_time_hours": "hours",
         },
+        "L4 cable duct, spatial placement and repairability state.",
     ),
-    "L5": TensorTemplate(
+    "L5": StateTensorSpec(
         "L5",
-        ("slice", "centrality", "capacity", "remap", "time"),
+        (
+            "protocol_code",
+            "socket_binding_present",
+            "routing_mode_code",
+            "remap_algorithm_code",
+            "percolation_threshold",
+            "reconfiguration_time_s",
+        ),
         {
-            "slice_isolation": (0, 0, 0, 0, 0),
-            "centrality": (0, 0, 0, 0, 1),
-            "congestion_headroom": (0, 0, 0, 1, 0),
-            "remap_readiness": (0, 1, 0, 0, 0),
-            "grade": (1, 0, 0, 0, 0),
+            "socket_binding_present": "boolean",
+            "percolation_threshold": "ratio",
+            "reconfiguration_time_s": "s",
         },
+        "L5 protocol, socket identity, routing and remapping state.",
     ),
-    "L6": TensorTemplate(
+    "L6": StateTensorSpec(
         "L6",
-        ("energy", "backup", "health", "tau", "time"),
+        (
+            "power_supply_code",
+            "nominal_power_kw",
+            "backup_autonomy_hours",
+            "energy_reserve_ratio",
+            "capex_opex_cost",
+        ),
         {
-            "energy_remaining": (0, 0, 0, 0, 0),
-            "backup_margin": (0, 0, 0, 0, 1),
-            "power_health": (0, 0, 0, 1, 0),
-            "tau_normalized": (0, 1, 0, 0, 0),
-            "infra_risk_inverse": (1, 0, 0, 0, 0),
+            "nominal_power_kw": "kW",
+            "backup_autonomy_hours": "hours",
+            "energy_reserve_ratio": "ratio",
+            "capex_opex_cost": "normalized",
         },
+        "L6 power supply and energy cost state.",
     ),
-    "L7": TensorTemplate(
+    "L7": StateTensorSpec(
         "L7",
-        ("decision", "hausdorff", "game", "cost", "time"),
+        (
+            "hausdorff_distance",
+            "lyapunov_value",
+            "lyapunov_delta",
+            "koopman_residual",
+            "remap_pressure",
+            "decision_confidence",
+            "action_cost",
+        ),
         {
-            "decision_confidence": (0, 0, 0, 0, 0),
-            "hausdorff_margin_inverse": (0, 0, 0, 0, 1),
-            "game_value": (0, 0, 0, 1, 0),
-            "action_cost_inverse": (0, 1, 0, 0, 0),
-            "policy_stability": (1, 0, 0, 0, 0),
+            "hausdorff_distance": "model-coordinate",
+            "lyapunov_value": "normalized",
+            "lyapunov_delta": "normalized",
+            "koopman_residual": "normalized",
+            "remap_pressure": "ratio",
+            "decision_confidence": "ratio",
+            "action_cost": "normalized",
         },
+        "L7 arbitrator vector for Koopman, Lyapunov and remapping decisions.",
     ),
-    "L8": TensorTemplate(
+    "L8": StateTensorSpec(
         "L8",
-        ("terrain", "geometry", "los", "placement", "time"),
+        (
+            "x",
+            "y",
+            "coordinate_norm",
+            "placement_role_code",
+            "terrain_risk",
+        ),
         {
-            "terrain_quality": (0, 0, 0, 0, 0),
-            "distance_efficiency": (0, 0, 0, 0, 1),
-            "los_margin": (0, 0, 0, 1, 0),
-            "placement_fitness": (0, 1, 0, 0, 0),
-            "topo_risk_inverse": (1, 0, 0, 0, 0),
+            "x": "model-coordinate",
+            "y": "model-coordinate",
+            "coordinate_norm": "model-coordinate",
+            "terrain_risk": "ratio",
         },
+        "L8 placement coordinates for Hausdorff/topology distance calculations.",
+    ),
+    "EDGE": StateTensorSpec(
+        "EDGE",
+        (
+            "capacity_mbps",
+            "latency_ms",
+            "loss_probability",
+            "redundancy",
+            "utilization",
+            "stability_margin",
+            "attack_exposure",
+        ),
+        {
+            "capacity_mbps": "Mbps",
+            "latency_ms": "ms",
+            "loss_probability": "ratio",
+            "redundancy": "ratio",
+            "utilization": "ratio",
+            "stability_margin": "ratio",
+            "attack_exposure": "ratio",
+        },
+        "Transport edge state for network dynamics and stability calculations.",
     ),
 }
 
-EDGE_TEMPLATE = TensorTemplate(
-    "EDGE",
-    ("transport", "performance", "security", "resilience", "time"),
-    {
-        "capacity_headroom": (0, 0, 0, 0, 0),
-        "latency_inverse": (0, 0, 0, 0, 1),
-        "loss_inverse": (0, 0, 0, 1, 0),
-        "redundancy": (0, 1, 0, 0, 0),
-        "attack_exposure_inverse": (1, 0, 0, 0, 0),
-    },
-)
+
+def build_layer_tensor(level: str, metrics: dict[str, float]) -> StateTensor:
+    """Build a layer state vector from named metrics."""
+    return _build_from_spec(STATE_TENSOR_SPECS[level], metrics)
 
 
-def build_tensor(level: str, metrics: dict[str, float]) -> Tensor5:
-    """Create a node tensor for a given G-Net level.
-
-    Missing metrics are written as zero. This is intentional: a zero means that
-    the metric was not provided for this particular object.
-    """
-    return _build_from_template(TEMPLATES[level], metrics)
+def build_transport_tensor(metrics: dict[str, float]) -> StateTensor:
+    """Build the common transport edge state vector."""
+    return _build_from_spec(STATE_TENSOR_SPECS["EDGE"], metrics)
 
 
-def build_edge_tensor(metrics: dict[str, float]) -> Tensor5:
-    """Create a tensor for an edge/communication channel."""
-    return _build_from_template(EDGE_TEMPLATE, metrics)
+def _build_from_spec(spec: StateTensorSpec, metrics: dict[str, float]) -> StateTensor:
+    unknown = sorted(set(metrics) - set(spec.metric_names))
+    if unknown:
+        raise ValueError(f"Unknown {spec.level} tensor metrics: {', '.join(unknown)}")
 
-
-def _build_from_template(template: TensorTemplate, metrics: dict[str, float]) -> Tensor5:
-    data = np.zeros(TENSOR_SHAPE, dtype=float)
-    for metric_name, slot in template.metric_slots.items():
-        data[slot] = float(metrics.get(metric_name, 0.0))
-
-    return Tensor5(
-        level=template.level,
-        axis_names=template.axis_names,
-        metric_names=tuple(template.metric_slots.keys()),
+    data = np.array([float(metrics.get(name, 0.0)) for name in spec.metric_names], dtype=float)
+    return StateTensor(
+        level=spec.level,
+        axes=("metric",),
+        metric_names=spec.metric_names,
+        metric_index={name: (index,) for index, name in enumerate(spec.metric_names)},
+        units=spec.units,
+        description=spec.description,
         data=data,
-        metric_slots=template.metric_slots,
     )

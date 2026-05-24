@@ -53,18 +53,18 @@ CRITICALITY_COLORS = {
 }
 
 # L0 service baseline: normal t0 state, no attack and no overload.
-DEFAULT_SERVICES = [
+DEFAULT_SERVICES = (
     ServiceTemplate("Voice", 0.128, 50.0, 10.0, 0.9995, "gold"),
     ServiceTemplate("Video", 8.0, 80.0, 20.0, 0.9990, "gold"),
     ServiceTemplate("FTP", 25.0, 300.0, 100.0, 0.9950, "silver"),
     ServiceTemplate("Telemetry", 0.256, 30.0, 5.0, 0.9999, "gold"),
-]
+)
 
 # L1 subscriber generation settings.
 MOBILE_SUBSCRIBERS_PER_AGG = 40
 FIXED_SUBSCRIBERS_PER_AGG = 40
-AGGREGATION_MOBILE = ["A1", "A3", "A5"]
-AGGREGATION_FIXED = ["A2", "A4", "A6"]
+AGGREGATION_MOBILE = ("A1", "A3", "A5")
+AGGREGATION_FIXED = ("A2", "A4", "A6")
 
 # L2 active equipment: 12 core routers + 6 aggregation routers.
 AGGREGATION_COUNT = 6
@@ -72,12 +72,7 @@ CORE_COUNT = 12
 L2_NODE_COUNT = CORE_COUNT + AGGREGATION_COUNT
 
 # Baseline normalization constants.
-IDEAL_SLA = 0.999
 IDEAL_LOAD_FACTOR = 0.55
-ENERGY_RESERVE = 0.85
-
-# Compact 5th-order tensor. Each axis has two states, so the tensor has 32 cells.
-TENSOR_SHAPE = (2, 2, 2, 2, 2)
 
 # Monitoring length used for L1 synthetic observations.
 L1_MONITORING_SECONDS = 30

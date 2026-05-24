@@ -1,28 +1,14 @@
 """Entry point for generating the G-Net baseline artifacts."""
 
-from pathlib import Path
 import csv
 import json
 import shutil
+from pathlib import Path
 from typing import Any
 
 from src.gnet9.topology_builder import GNetBaselineBuilder
 from src.gnet9.visualizer import GNetVisualizer
 
-
-L1_PROFILE_FIELDS = [
-    "subscriber_id",
-    "role",
-    "home_access",
-    "sla_grade",
-    "traffic_kind",
-    "codec",
-    "target_bitrate_kbps",
-    "min_bitrate_kbps",
-    "latency_budget_ms",
-    "d0sl_policy",
-    "kendall_queue",
-]
 
 L1_MONITORING_FIELDS = [
     "subscriber_id",
@@ -46,24 +32,27 @@ L1_MONITORING_FIELDS = [
 ]
 
 
-def iter_l1_nodes(model):
-    """Yield only L1 subscriber nodes from the generated graph."""
-    for node_id, attrs in model.graph.nodes(data=True):
-        if attrs.get("level") == "L1":
-            yield node_id, attrs
+def iter_nodes_by_level(model, level: str):
+    """Yield graph nodes for one G-Net level."""
+    return (
+        (node_id, attrs)
+        for node_id, attrs in model.graph.nodes(data=True)
+        if attrs.get("level") == level
+    )
 
 
-def iter_l2_nodes(model):
-    """Yield only L2 active equipment nodes from the generated graph."""
-    for node_id, attrs in model.graph.nodes(data=True):
-        if attrs.get("level") == "L2":
-            yield node_id, attrs
+def iter_l1_subscribers(model):
+    return iter_nodes_by_level(model, "L1")
+
+
+def iter_l2_equipment(model):
+    return iter_nodes_by_level(model, "L2")
 
 
 def export_l2_equipment_profiles(model, path: Path) -> None:
     """Export Cisco-like L2 equipment profiles and baseline raw telemetry."""
     rows = []
-    for node_id, attrs in iter_l2_nodes(model):
+    for node_id, attrs in iter_l2_equipment(model):
         rows.append(
             {
                 "node_id": node_id,
@@ -81,10 +70,11 @@ def export_l2_equipment_profiles(model, path: Path) -> None:
         )
     path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
 
+
 def export_l1_monitoring(model, path: Path) -> None:
     """Export full second-by-second L1 monitoring history to CSV."""
     rows: list[dict[str, Any]] = []
-    for node_id, attrs in iter_l1_nodes(model):
+    for node_id, attrs in iter_l1_subscribers(model):
         base = _l1_export_base(node_id, attrs)
         for point in attrs.get("monitoring", []):
             rows.append({**base, **point})
@@ -97,9 +87,15 @@ def export_l1_monitoring(model, path: Path) -> None:
 
 def export_l1_profiles(model, path: Path) -> None:
     """Export compact L1 subscriber profiles to JSON."""
-    profile_keys = ["target_bitrate_kbps", "min_bitrate_kbps", "latency_budget_ms", "d0sl_policy", "kendall_queue"]
+    profile_keys = [
+        "target_bitrate_kbps",
+        "min_bitrate_kbps",
+        "latency_budget_ms",
+        "d0sl_policy",
+        "kendall_queue",
+    ]
     profiles = []
-    for node_id, attrs in iter_l1_nodes(model):
+    for node_id, attrs in iter_l1_subscribers(model):
         profile = _l1_export_base(node_id, attrs)
         profile.update({key: attrs.get(key) for key in profile_keys})
         profiles.append(profile)
@@ -109,7 +105,7 @@ def export_l1_profiles(model, path: Path) -> None:
 def export_parsed_d0sl_catalog(model, path: Path) -> None:
     """Export unique d0sl policies that were actually used by L1 nodes."""
     unique_policies = {}
-    for _, attrs in iter_l1_nodes(model):
+    for _, attrs in iter_l1_subscribers(model):
         policy = attrs.get("d0sl_policy")
         if policy:
             unique_policies[policy["name"]] = policy
@@ -136,19 +132,31 @@ def main() -> None:
 
     d0sl_policy_path = project_root / "policies" / "l1_policies.d0sl"
     model = GNetBaselineBuilder(d0sl_policy_path=d0sl_policy_path).build()
+    artifacts = {
+        "json": output_dir / "baseline_topology.json",
+        "graphml": output_dir / "baseline_topology.graphml",
+        "summary": output_dir / "baseline_summary.txt",
+        "l1_profiles": output_dir / "l1_d0sl_profiles.json",
+        "l1_monitoring": output_dir / "l1_monitoring.csv",
+        "l2_profiles": output_dir / "l2_equipment_profiles.json",
+        "d0sl_parsed": output_dir / "l1_d0sl_parsed.json",
+        "d0sl_source": output_dir / "l1_policies.d0sl",
+        "network_png": output_dir / "network_logic.png",
+        "layers_png": output_dir / "layer_scheme.png",
+    }
 
     visualizer = GNetVisualizer(model)
-    visualizer.draw_network_logic(output_dir / "network_logic.png")
-    visualizer.draw_layer_scheme(output_dir / "layer_scheme.png")
+    visualizer.draw_network_logic(artifacts["network_png"])
+    visualizer.draw_layer_scheme(artifacts["layers_png"])
 
-    model.export_json(output_dir / "baseline_topology.json")
-    model.export_graphml(output_dir / "baseline_topology.graphml")
-    model.export_summary(output_dir / "baseline_summary.txt")
-    export_l1_profiles(model, output_dir / "l1_d0sl_profiles.json")
-    export_l1_monitoring(model, output_dir / "l1_monitoring.csv")
-    export_l2_equipment_profiles(model, output_dir / "l2_equipment_profiles.json")
-    export_parsed_d0sl_catalog(model, output_dir / "l1_d0sl_parsed.json")
-    shutil.copyfile(d0sl_policy_path, output_dir / "l1_policies.d0sl")
+    model.export_json(artifacts["json"])
+    model.export_graphml(artifacts["graphml"])
+    model.export_summary(artifacts["summary"])
+    export_l1_profiles(model, artifacts["l1_profiles"])
+    export_l1_monitoring(model, artifacts["l1_monitoring"])
+    export_l2_equipment_profiles(model, artifacts["l2_profiles"])
+    export_parsed_d0sl_catalog(model, artifacts["d0sl_parsed"])
+    shutil.copyfile(d0sl_policy_path, artifacts["d0sl_source"])
 
     print("Done.")
     print(f"Artifacts saved to: {output_dir}")

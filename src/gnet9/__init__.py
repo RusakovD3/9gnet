@@ -1,1 +1,1 @@
-"""G-Net 9-level baseline prototype."""
+"""G-Net 9 baseline topology model."""

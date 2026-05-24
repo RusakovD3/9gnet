@@ -1,17 +1,9 @@
 """Cisco-like L2 active equipment model for G-Net.
 
-This module turns active network equipment into an engineering 5D state tensor.
 The numbers are intentionally vendor-realistic, not device-emulator-exact: they
 come from Cisco public datasheets / architecture papers and are used as capacity
-ceilings for a reproducible baseline model.
-
-Tensor shape per device:
-    [resource][time][security_state][traffic_class][metric]
-
-Metric index:
-    0 - utilization ratio, 0..1
-    1 - headroom ratio, 0..1
-    2 - risk ratio, 0..1
+ceilings for a reproducible baseline model. The tensor layer consumes this data
+as a compact L2 state vector.
 """
 
 from __future__ import annotations
@@ -21,8 +13,6 @@ from enum import Enum
 from typing import Any
 
 import numpy as np
-
-from .models import Tensor5
 
 
 class L2Resource(str, Enum):
@@ -36,34 +26,6 @@ class L2Resource(str, Enum):
     CRYPTO = "crypto_util"
     CONTROL_PLANE = "control_plane_load"
     TEMPERATURE = "temperature"
-
-
-class L2SecurityState(str, Enum):
-    NORMAL = "NORMAL"
-    SCAN = "SCAN"
-    DOS = "DOS"
-    EXPLOIT = "EXPLOIT"
-    COMPROMISED = "COMPROMISED"
-    RECOVERY = "RECOVERY"
-
-
-class L2TrafficClass(str, Enum):
-    BE = "BE"
-    VOICE = "VOICE"
-    VIDEO = "VIDEO"
-    CONTROL = "CONTROL"
-    MGMT = "MGMT"
-
-
-L2_RESOURCES = tuple(item.value for item in L2Resource)
-L2_SECURITY_STATES = tuple(item.value for item in L2SecurityState)
-L2_TRAFFIC_CLASSES = tuple(item.value for item in L2TrafficClass)
-L2_TENSOR_METRICS = ("utilization", "headroom", "risk")
-L2_TENSOR_AXIS_NAMES = ("resource", "time", "security_state", "traffic_class", "metric")
-
-# 30 seconds is enough for baseline and first degradation experiments without
-# exploding exported JSON size.
-L2_TELEMETRY_STEPS = 30
 
 
 @dataclass(frozen=True)
@@ -165,7 +127,7 @@ def build_l2_raw_baseline(profile: L2EquipmentProfile, *, role: str, criticality
     """Return baseline raw telemetry values for one active device.
 
     Raw values use real units where possible: Gbps, Mpps, routes, entries, MB,
-    sessions and Celsius. The tensor receives normalized versions of these values.
+    sessions and Celsius. The tensor receives selected raw and normalized values.
     """
     role_factor = 0.46 if role == "core-router" else 0.38
     grade_factor = 1.08 if criticality == "gold" else 1.0
@@ -202,44 +164,32 @@ def build_l2_summary_metrics(raw: dict[str, float], profile: L2EquipmentProfile)
     }
 
 
-def build_l2_equipment_tensor(profile: L2EquipmentProfile, raw_baseline: dict[str, float], *, steps: int = L2_TELEMETRY_STEPS) -> Tensor5:
-    """Build a 5D L2 tensor: resource x time x security_state x traffic_class x metric."""
-    resources = L2_RESOURCES
-    states = L2_SECURITY_STATES
-    classes = L2_TRAFFIC_CLASSES
-    metrics = L2_TENSOR_METRICS
-    data = np.zeros((len(resources), steps, len(states), len(classes), len(metrics)), dtype=float)
-    base = _normalized_ratios(raw_baseline, profile)
+def build_l2_state_metrics(
+    raw: dict[str, float],
+    profile: L2EquipmentProfile,
+    *,
+    role: str,
+    port_speed_mbps: float,
+    port_delay_ms: float,
+) -> dict[str, float]:
+    """Return the L2 equipment state vector used by the G-Net layer model."""
+    mtu_bytes = 1500
+    packet_processing_time_ms = mtu_bytes * 8.0 / max(port_speed_mbps * 1_000_000.0, 1e-9) * 1000.0
+    ram_load_percent = raw[L2Resource.RAM.value] / max(profile.dram_gb, 1e-9) * 100.0
+    cost = 0.90 if role == "core-router" else 0.64
+    stability_margin = (80.0 - max(raw[L2Resource.CPU.value], ram_load_percent)) / 80.0
 
-    for r_idx, resource in enumerate(resources):
-        for t_idx in range(steps):
-            wave = 1.0 + 0.025 * np.sin((t_idx + r_idx) / 4.0)
-            for s_idx, state in enumerate(states):
-                state_factor = _security_state_factor(resource, state)
-                for c_idx, traffic_class in enumerate(classes):
-                    class_factor = _traffic_class_factor(resource, traffic_class)
-                    utilization = float(np.clip(base[resource] * wave * state_factor * class_factor, 0.0, 1.0))
-                    headroom = 1.0 - utilization
-                    risk = float(np.clip(utilization * _risk_weight(resource, state), 0.0, 1.0))
-                    data[r_idx, t_idx, s_idx, c_idx, 0] = utilization
-                    data[r_idx, t_idx, s_idx, c_idx, 1] = headroom
-                    data[r_idx, t_idx, s_idx, c_idx, 2] = risk
-
-    slots = {
-        "cpu_normal_mgmt_utilization": (L2_RESOURCES.index(L2Resource.CPU.value), 0, L2_SECURITY_STATES.index(L2SecurityState.NORMAL.value), L2_TRAFFIC_CLASSES.index(L2TrafficClass.MGMT.value), 0),
-        "throughput_normal_be_utilization": (L2_RESOURCES.index(L2Resource.THROUGHPUT.value), 0, L2_SECURITY_STATES.index(L2SecurityState.NORMAL.value), L2_TRAFFIC_CLASSES.index(L2TrafficClass.BE.value), 0),
-        "pps_dos_be_risk": (L2_RESOURCES.index(L2Resource.PPS.value), 0, L2_SECURITY_STATES.index(L2SecurityState.DOS.value), L2_TRAFFIC_CLASSES.index(L2TrafficClass.BE.value), 2),
-        "control_plane_scan_mgmt_risk": (L2_RESOURCES.index(L2Resource.CONTROL_PLANE.value), 0, L2_SECURITY_STATES.index(L2SecurityState.SCAN.value), L2_TRAFFIC_CLASSES.index(L2TrafficClass.MGMT.value), 2),
-        "tcam_exploit_control_headroom": (L2_RESOURCES.index(L2Resource.TCAM.value), 0, L2_SECURITY_STATES.index(L2SecurityState.EXPLOIT.value), L2_TRAFFIC_CLASSES.index(L2TrafficClass.CONTROL.value), 1),
+    return {
+        "ram_used_gb": float(raw[L2Resource.RAM.value]),
+        "ram_load_percent": float(ram_load_percent),
+        "cpu_load_percent": float(raw[L2Resource.CPU.value]),
+        "packet_processing_time_ms": float(packet_processing_time_ms),
+        "traffic_distribution_code": 0.72 if role == "core-router" else 0.58,
+        "port_delay_ms": float(port_delay_ms),
+        "port_speed_mbps": float(port_speed_mbps),
+        "capex_opex_cost": cost,
+        "stability_margin": float(np.clip(stability_margin, 0.0, 1.0)),
     }
-
-    return Tensor5(
-        level="L2",
-        axis_names=L2_TENSOR_AXIS_NAMES,
-        metric_names=resources + metrics,
-        data=data,
-        metric_slots=slots,
-    )
 
 
 def _normalized_ratios(raw: dict[str, float], profile: L2EquipmentProfile) -> dict[str, float]:
@@ -256,51 +206,3 @@ def _normalized_ratios(raw: dict[str, float], profile: L2EquipmentProfile) -> di
         L2Resource.TEMPERATURE.value: max(profile.operating_temp_c, 1.0),
     }
     return {name: float(np.clip(raw.get(name, 0.0) / limit, 0.0, 1.0)) for name, limit in limits.items()}
-
-
-def _security_state_factor(resource: str, state: str) -> float:
-    if state == L2SecurityState.NORMAL.value:
-        return 1.0
-    if state == L2SecurityState.SCAN.value:
-        return 1.65 if resource in {L2Resource.CPU.value, L2Resource.CONTROL_PLANE.value} else 1.10
-    if state == L2SecurityState.DOS.value:
-        return 2.20 if resource in {L2Resource.PPS.value, L2Resource.THROUGHPUT.value, L2Resource.QUEUE.value, L2Resource.CPU.value} else 1.20
-    if state == L2SecurityState.EXPLOIT.value:
-        return 1.80 if resource in {L2Resource.CPU.value, L2Resource.RAM.value, L2Resource.CONTROL_PLANE.value, L2Resource.TCAM.value} else 1.25
-    if state == L2SecurityState.COMPROMISED.value:
-        return 2.00 if resource in {L2Resource.CONTROL_PLANE.value, L2Resource.CPU.value, L2Resource.RAM.value} else 1.45
-    if state == L2SecurityState.RECOVERY.value:
-        return 0.78
-    return 1.0
-
-
-def _traffic_class_factor(resource: str, traffic_class: str) -> float:
-    if traffic_class == L2TrafficClass.CONTROL.value:
-        return 1.55 if resource in {L2Resource.CONTROL_PLANE.value, L2Resource.CPU.value, L2Resource.FIB.value, L2Resource.TCAM.value} else 0.72
-    if traffic_class == L2TrafficClass.MGMT.value:
-        return 1.70 if resource in {L2Resource.CONTROL_PLANE.value, L2Resource.CPU.value, L2Resource.CRYPTO.value} else 0.45
-    if traffic_class == L2TrafficClass.VOICE.value:
-        return 1.18 if resource == L2Resource.QUEUE.value else 0.68
-    if traffic_class == L2TrafficClass.VIDEO.value:
-        return 1.45 if resource in {L2Resource.THROUGHPUT.value, L2Resource.QUEUE.value} else 0.85
-    return 1.0
-
-
-def _risk_weight(resource: str, state: str) -> float:
-    base = {
-        L2Resource.CPU.value: 0.72,
-        L2Resource.RAM.value: 0.50,
-        L2Resource.FIB.value: 0.78,
-        L2Resource.TCAM.value: 0.86,
-        L2Resource.PPS.value: 0.82,
-        L2Resource.THROUGHPUT.value: 0.70,
-        L2Resource.QUEUE.value: 0.88,
-        L2Resource.CRYPTO.value: 0.76,
-        L2Resource.CONTROL_PLANE.value: 0.92,
-        L2Resource.TEMPERATURE.value: 0.65,
-    }.get(resource, 0.70)
-    if state in {L2SecurityState.EXPLOIT.value, L2SecurityState.COMPROMISED.value}:
-        return base * 1.35
-    if state == L2SecurityState.DOS.value:
-        return base * 1.20
-    return base
