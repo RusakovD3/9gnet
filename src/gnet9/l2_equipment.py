@@ -2,8 +2,8 @@
 
 The numbers are intentionally vendor-realistic, not device-emulator-exact: they
 come from Cisco public datasheets / architecture papers and are used as capacity
-ceilings for a reproducible baseline model. The tensor layer consumes this data
-as a compact L2 state vector.
+ceilings and exported raw telemetry for the reproducible baseline model. The
+human-readable L2 tensor operating point lives in `baseline.py`.
 """
 
 from __future__ import annotations
@@ -161,34 +161,6 @@ def build_l2_summary_metrics(raw: dict[str, float], profile: L2EquipmentProfile)
         "l2_mgmt_pressure": round(mgmt_pressure, 4),
         "l2_thermal_pressure": round(thermal_pressure, 4),
         "l2_health_index": round(health, 4),
-    }
-
-
-def build_l2_state_metrics(
-    raw: dict[str, float],
-    profile: L2EquipmentProfile,
-    *,
-    role: str,
-    port_speed_mbps: float,
-    port_delay_ms: float,
-) -> dict[str, float]:
-    """Return the L2 equipment state vector used by the G-Net layer model."""
-    mtu_bytes = 1500
-    packet_processing_time_ms = mtu_bytes * 8.0 / max(port_speed_mbps * 1_000_000.0, 1e-9) * 1000.0
-    ram_load_percent = raw[L2Resource.RAM.value] / max(profile.dram_gb, 1e-9) * 100.0
-    cost = 0.90 if role == "core-router" else 0.64
-    stability_margin = (80.0 - max(raw[L2Resource.CPU.value], ram_load_percent)) / 80.0
-
-    return {
-        "ram_used_gb": float(raw[L2Resource.RAM.value]),
-        "ram_load_percent": float(ram_load_percent),
-        "cpu_load_percent": float(raw[L2Resource.CPU.value]),
-        "packet_processing_time_ms": float(packet_processing_time_ms),
-        "traffic_distribution_code": 0.72 if role == "core-router" else 0.58,
-        "port_delay_ms": float(port_delay_ms),
-        "port_speed_mbps": float(port_speed_mbps),
-        "capex_opex_cost": cost,
-        "stability_margin": float(np.clip(stability_margin, 0.0, 1.0)),
     }
 
 

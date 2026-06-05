@@ -1,225 +1,259 @@
 # G-Net 9
 
 G-Net 9 - исследовательская модель телекоммуникационной сети. Проект строит
-воспроизводимое baseline-состояние `t0`: топологию, абонентов, сервисы,
-телеметрию, d0sl-политики, числовые тензоры состояния и первую дискретную
-динамическую траекторию для будущих экспериментов с отказами, атаками,
-ремаппингом, Koopman/DMD, Hausdorff и Lyapunov-анализом.
+воспроизводимое здоровое baseline-состояние `t0`, а затем может "оживлять" сеть
+дискретными шагами по 5 секунд: сохранять состояния тензоров, имитировать
+TCP/IP-трафик внутри Python и передавать агрегированное состояние L7-арбитратору.
 
-## Быстрый старт
+Модель не отправляет реальные пакеты в операционную систему. Packet simulation
+строит детерминированные Ethernet/IPv4/TCP/UDP события в памяти.
 
-```bash
+## Быстрый Старт
+
+```powershell
 pip install -r requirements.txt
 python main.py
-pytest tests/test_topology.py -v
 ```
 
-`python main.py` создает артефакты в `output/`.
+Сгенерировать 12 шагов динамики после `t0`:
 
-## Что генерируется
+```powershell
+python main.py --dynamics-steps 12
+```
 
-- `baseline_topology.json` - полный граф NetworkX с атрибутами и тензорами.
-- `baseline_topology.graphml` - GraphML для внешних инструментов.
-- `baseline_summary.txt` - краткая сводка уровней, сервисов и slices.
-- `network_logic.png` - визуализация логической сети.
-- `layer_scheme.png` - схема уровней G-Net.
-- `l1_monitoring.csv` - 240 абонентов x 30 секунд мониторинга.
-- `l1_d0sl_profiles.json` - профили абонентов и примененные политики.
-- `l1_d0sl_parsed.json` - уникальные d0sl-политики, реально использованные в baseline.
-- `l2_equipment_profiles.json` - профили L2-оборудования и raw telemetry.
-- `network_dynamics.json` - snapshots сети с шагом 5 секунд.
-- `l1_policies.d0sl` - копия исходного файла политик.
+Сгенерировать компактную динамику для длинного анализа:
 
-## Текущая топология
+```powershell
+python main.py --dynamics-steps 100 --snapshot-detail summary --packet-detail summary
+```
 
-Модель содержит 270 узлов и 274 ребра:
+## Основная Идея
+
+Проект разделен на несколько простых слоев ответственности:
+
+- `topology_builder.py` строит форму сети: узлы, связи, уровни и роли.
+- `baseline.py` явно задает здоровые начальные значения тензоров `t0`.
+- `tensors.py` описывает имена метрик, единицы измерения и порядок числовых векторов.
+- `dynamics.py` двигает время шагами по 5 секунд и сохраняет snapshots.
+- `packet_simulator.py` имитирует TCP/IP flow и representative packets.
+- `arbitrator.py` читает тензоры всех уровней, строит агрегаты и готовит решение по remapping.
+
+Так проще объяснять проект: топология отдельно, идеальное состояние отдельно,
+динамика отдельно, анализ сети отдельно.
+
+## Текущая Топология
+
+Baseline содержит 270 узлов и 274 ребра:
 
 - `L0`: 4 сервиса: Voice, Video, FTP, Telemetry.
 - `L1`: 240 абонентов: 120 mobile и 120 fixed.
-- `L2`: 18 active equipment nodes: 12 core routers и 6 aggregation routers.
+- `L2`: 18 активных устройств: 12 core routers и 6 aggregation routers.
 - `L7`: 1 arbitrator node.
 - `L8`: 7 terrain anchors.
 
-Важная модельная договоренность: `L3`, `L4`, `L5`, `L6` сейчас не являются
-отдельными узлами графа. Они представлены тензорами на существующих объектах:
+`L3`, `L4`, `L5`, `L6` не являются отдельными узлами графа:
 
-- `L3` и `L4` лежат на ребрах как `l3_tensor` и `l4_tensor`.
-- `L5` и `L6` лежат на L2-оборудовании.
-- `L6` также добавлен абонентам.
-- `L8` добавлен всем размещенным non-L0 узлам как `l8_tensor`.
+- `L3` и `L4` хранятся на ребрах как `l3_tensor` и `l4_tensor`.
+- `L5` и `L6` хранятся на L2-оборудовании.
+- `L6` также хранится на L1-абонентах.
+- `L8` хранится на размещенных non-L0 узлах как `l8_tensor`.
 
-## Идеальный baseline t0
+Граф построен как `networkx.Graph`, поэтому связи неориентированные: ребро между
+двумя узлами читается в обе стороны и не дублируется.
 
-Baseline считается healthy, если для всех L1-абонентов выполняются:
+## Тензоры
 
-- bitrate не ниже `min_bitrate_kbps`;
-- latency не выше `latency_budget_ms`;
-- packet loss не выше `packet_loss_budget_percent`;
-- jitter не выше `jitter_budget_ms`;
-- нет `bitrate_drop_alarm`.
+Каждый `StateTensor` - это числовой вектор с явными `metric_names`, `units`,
+`metric_index` и `vector`. Это сделано намеренно: для Koopman/DMD, Lyapunov,
+remapping и сравнения состояний удобнее иметь компактные числовые признаки,
+чем большой разреженный многомерный массив.
 
-Значения не занулены: задержки, шум и потери оставлены малыми, чтобы состояние
-было реалистичным, но все SLA/SLO/SLI выполнялись с запасом.
+Где задаются значения:
 
-## Дискретная динамика
+- `baseline.py` - человекочитаемые значения здорового `t0`.
+- `tensors.py` - порядок метрик и единицы измерения.
+- `topology_builder.py` - прикрепление тензоров к узлам и ребрам.
+- `dynamics.py` - сохранение тензоров на каждом шаге.
 
-Проект экспортирует первую динамическую траекторию в `output/network_dynamics.json`.
+## Динамика
 
-Текущий режим: `stationary_healthy_baseline`.
+Текущий режим динамики называется `stationary_healthy_baseline`.
 
-- шаг симуляции: 5 секунд;
-- длительность: 30 секунд;
-- snapshots: `t = 0, 5, 10, 15, 20, 25, 30`;
-- структура графа не меняется;
+Это означает:
+
+- сеть живет во времени;
+- шаг по умолчанию равен 5 секундам;
+- число шагов задается через `DynamicsConfig.step_count` или `--dynamics-steps`;
+- топология не меняется;
 - значения тензоров не деградируют;
-- каждый snapshot содержит узлы, ребра и все найденные `StateTensor`-значения.
+- SLA/SLO не нарушаются;
+- пакеты имитируются, но реальные сетевые сокеты не используются.
 
-Это пока не сценарий отказа и не ремаппинг. Это стабильная траектория хорошей
-сети, которая задает формат входных данных для следующих этапов: Koopman/DMD,
-Hausdorff distance, Lyapunov-анализ, сравнение `baseline -> degraded -> repaired`.
+По умолчанию экспортируются snapshots:
 
-## Тензоры состояния
+```text
+t = 0, 5, 10, 15, 20, 25, 30
+```
 
-Проект использует `StateTensor`: числовой вектор с явными `metric_names`,
-`units`, `metric_index` и `shape`.
+Если задать `--dynamics-steps 12`, будут шаги от `t=0` до `t=60`.
 
-Такой формат удобно использовать как вектор состояния для:
+## Режимы Экспорта Динамики
 
-- Koopman/DMD;
-- Lyapunov-функций;
-- сравнения baseline/degraded/repaired состояний;
-- Hausdorff distance по координатам L8;
-- cost-aware remapping и CAPEX/OPEX оценок.
+`--snapshot-detail` управляет размером snapshot:
 
-### L0 - сервисы
+- `full` - полный режим по умолчанию: узлы, ребра, все тензоры, арбитратор, traffic.
+- `tensor` - без списков узлов и ребер, но со всеми тензорами в `tensor_state.by_level`.
+- `summary` - компактный режим: counts, state vector, арбитратор и traffic summary.
 
-- `service_code`
-- `bitrate_mbps`
-- `latency_budget_ms`
-- `jitter_budget_ms`
-- `availability_target`
-- `priority_code`
-- `demand_pressure`
-- `service_health`
+`--packet-detail` управляет детализацией имитации трафика:
 
-### L1 - абоненты
+- `summary` - только aggregate-счетчики: число flow, packet count, latency, drops.
+- `flows` - summary плюс 240 flow records, по одному на L1-абонента.
+- `sample` - summary, flows и representative packet headers.
 
-- `access_type_code`
-- `service_code`
-- `request_rate_pps`
-- `response_rate_pps`
-- `traffic_intensity_rho`
-- `traffic_distribution_cv`
-- `processing_speed_mbps`
-- `processing_delay_ms`
-- `capex_opex_cost`
-- `sla_margin`
+Для длинных прогонов лучше использовать:
 
-### L2 - активное оборудование
+```powershell
+python main.py --dynamics-steps 100 --snapshot-detail summary --packet-detail summary
+```
 
-- `ram_used_gb`
-- `ram_load_percent`
-- `cpu_load_percent`
-- `packet_processing_time_ms`
-- `traffic_distribution_code`
-- `port_delay_ms`
-- `port_speed_mbps`
-- `capex_opex_cost`
-- `stability_margin`
+Для демонстрации TCP/IP headers лучше использовать default `full/sample`.
 
-### L3 - среда передачи
+## Формат Snapshot
 
-Метрики на ребрах:
+В полном режиме один snapshot содержит:
 
-- `medium_code`
-- `line_rate_mbps`
-- `distance_m`
-- `frequency_mhz`
-- `attenuation_db`
-- `noise_interference_db`
-- `snr_db`
+```json
+{
+  "step_index": 0,
+  "time_seconds": 0,
+  "level_summary": {},
+  "nodes": [],
+  "edges": [],
+  "tensor_state": {},
+  "state_vector": {},
+  "arbitrator": {},
+  "traffic": {}
+}
+```
 
-### L4 - кабельная канализация / физический путь
+`tensor_state` собирает все тензоры по уровням:
 
-Метрики на ребрах:
+```json
+{
+  "levels": ["L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8", "EDGE"],
+  "counts": {"L1": 240, "EDGE": 274},
+  "by_level": {
+    "L1": [{"node_id": "M1_01", "metrics": {}}],
+    "EDGE": [{"source": "A1", "target": "M1_01", "metrics": {}}]
+  }
+}
+```
 
-- `x_mid`
-- `y_mid`
-- `length_m`
-- `cross_connect_present`
-- `duct_capacity_used_ratio`
-- `repair_time_hours`
+`state_vector` - компактный числовой вектор для будущего Koopman/DMD и Lyapunov:
 
-### L5 - протоколы, маршрутизация, ремаппинг
+```json
+{
+  "metric_names": ["L1.sla_margin.min", "EDGE.stability_margin.min"],
+  "vector": [0.68, 0.45]
+}
+```
 
-- `protocol_code`
-- `socket_binding_present`
-- `routing_mode_code`
-- `remap_algorithm_code`
-- `percolation_threshold`
-- `reconfiguration_time_s`
+## Арбитратор
 
-### L6 - питание и стоимость
+`arbitrator.py` получает `tensor_state` каждого шага и строит:
 
-- `power_supply_code`
-- `nominal_power_kw`
-- `backup_autonomy_hours`
-- `energy_reserve_ratio`
-- `capex_opex_cost`
+- агрегаты по уровням: min/max/mean для выбранных метрик;
+- компактный `state_vector`;
+- baseline-оценки `lyapunov_value`, `koopman_residual`, `remap_pressure`;
+- решение `remap`.
 
-### L7 - арбитр
+В здоровом baseline арбитратор должен выдавать:
 
-- `hausdorff_distance`
-- `lyapunov_value`
-- `lyapunov_delta`
-- `koopman_residual`
-- `remap_pressure`
-- `decision_confidence`
-- `action_cost`
+```json
+{
+  "remap": {
+    "needed": false,
+    "action": "NO_REMAP"
+  }
+}
+```
 
-### L8 - размещение
+Позже, когда появятся атаки, перегрузки или отказы, тот же арбитратор сможет
+использовать измененные тензоры и начать выдавать `PLAN_REMAP`.
 
-- `x`
-- `y`
-- `coordinate_norm`
-- `placement_role_code`
-- `terrain_risk`
+## Packet Simulation
 
-## Основные файлы
+`packet_simulator.py` моделирует:
 
-- `main.py` - входная точка и экспорт артефактов.
-- `src/gnet9/topology_builder.py` - построение baseline-графа.
-- `src/gnet9/dynamics.py` - дискретная динамика и snapshots.
-- `src/gnet9/tensors.py` - спецификации `StateTensor` для L0-L8 и EDGE.
-- `src/gnet9/models.py` - `StateTensor`, `NetworkModel`, профили сервисов и slices.
-- `src/gnet9/l1_d0sl.py` - парсер d0sl, очереди L1, мониторинг L1.
-- `src/gnet9/l2_equipment.py` - L2-профили оборудования и расчет L2 state metrics.
-- `src/gnet9/metrics.py` - Hausdorff distance и centrality.
-- `src/gnet9/visualizer.py` - PNG-визуализации.
-- `policies/l1_policies.d0sl` - политики SLA/SLO для L1.
-- `tests/test_topology.py` - базовые структурные проверки.
+- deterministic private IPv4 и MAC для узлов;
+- Ethernet MTU 1500;
+- IPv4 header;
+- TCP handshake на `t0`;
+- TCP FTP data flow;
+- UDP DNS query/response;
+- UDP RTP-like media stream для `broadcast_mp3`;
+- shortest path по latency;
+- per-hop MAC rewrite;
+- TTL decrement;
+- serialization delay;
+- expected path loss.
 
-## Что уже реализовано
+В healthy baseline:
+
+- `observed_dropped_packets = 0`;
+- `observed_retransmissions = 0`;
+- `observed_loss_ratio = 0.0`.
+
+## Основные Артефакты
+
+`python main.py` пишет в `output/`:
+
+- `baseline_topology.json` - полный граф с тензорами.
+- `baseline_topology.graphml` - GraphML для внешних инструментов.
+- `baseline_summary.txt` - краткая сводка уровней.
+- `network_dynamics.json` - snapshots динамики.
+- `l1_monitoring.csv` - синтетический L1-мониторинг.
+- `l1_d0sl_profiles.json` - профили L1-абонентов.
+- `l1_d0sl_parsed.json` - использованные d0sl-политики.
+- `l2_equipment_profiles.json` - L2-профили и raw telemetry.
+- `network_logic.png` и `layer_scheme.png` - визуализации.
+
+## Что Уже Реализовано
 
 - Воспроизводимая baseline-топология.
-- L0-сервисы, L1-абоненты, L2 core/aggregation routers.
-- d0sl-политики для SLA/SLO/SLI.
-- Синтетический L1-мониторинг без baseline-нарушений SLA/SLO.
-- L2 raw telemetry и Cisco-like capacity profiles.
-- Числовые state tensors для всех уровней модели.
-- Стационарная дискретная динамика с шагом 5 секунд.
-- JSON, GraphML, CSV и PNG-экспорт.
-- Базовые тесты структуры, тензоров и healthy baseline.
+- Явные здоровые значения тензоров в `baseline.py`.
+- d0sl-политики SLA/SLO для L1.
+- Синтетический L1-мониторинг без baseline-нарушений.
+- L2 Cisco-like capacity profiles.
+- Динамика шагами по 5 секунд.
+- Сохранение тензоров всех уровней на каждом шаге.
+- Компактный state vector для будущего анализа.
+- L7-арбитратор, который читает тензоры и пока принимает `NO_REMAP`.
+- In-memory TCP/IP packet simulation.
+- Режимы компактного и полного экспорта.
 
-## Что еще не реализовано
+## Что Пока Не Реализовано
 
 - Реальные сценарии атак и отказов.
-- Полный decision engine для L7.
-- Автоматический ремаппинг маршрутов и slices.
+- Изменение тензоров во времени при деградации.
+- Реальный remapping маршрутов и slices.
 - Koopman/DMD pipeline по временным рядам.
-- Lyapunov-анализ деградации и восстановления.
+- Lyapunov-анализ восстановления.
 - SDN orchestration и auto-healing.
 
-Текущая цель проекта - иметь чистый baseline `t0` и стационарную healthy
-траекторию, от которых можно строить сценарии деградации, восстановления и
-прогнозирования.
+## Тесты
+
+```powershell
+pytest tests/test_topology.py -v
+```
+
+Тесты проверяют:
+
+- количество L0/L1/L2 узлов;
+- наличие тензоров всех уровней;
+- здоровый baseline;
+- snapshots по 5 секунд;
+- режимы детализации dynamics;
+- работу арбитратора;
+- in-memory TCP/IP headers.

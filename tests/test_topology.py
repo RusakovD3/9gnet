@@ -1,4 +1,4 @@
-from src.gnet9.dynamics import simulate_stationary_dynamics
+from src.gnet9.dynamics import DynamicsConfig, simulate_stationary_dynamics, validate_healthy_baseline
 from src.gnet9.topology_builder import GNetBaselineBuilder
 
 
@@ -116,13 +116,149 @@ def test_l1_baseline_has_no_sla_violations() -> None:
             assert not point["bitrate_drop_alarm"]
 
 
+def test_healthy_baseline_validation_passes() -> None:
+    health = validate_healthy_baseline(MODEL)
+
+    assert health["ok"]
+    assert health["checked_l1_points"] == 240 * 30
+    assert health["checked_l2_nodes"] == 18
+    assert health["checked_edges"] == MODEL.graph.number_of_edges()
+    assert health["violation_count"] == 0
+
+
 def test_stationary_dynamics_snapshots_every_five_seconds() -> None:
     dynamics = simulate_stationary_dynamics(MODEL)
     snapshots = dynamics["snapshots"]
 
     assert dynamics["mode"] == "stationary_healthy_baseline"
+    assert dynamics["config"]["step_count"] == 6
+    assert dynamics["config"]["duration_seconds"] == 30
+    assert dynamics["health"]["ok"]
     assert [snapshot["time_seconds"] for snapshot in snapshots] == [0, 5, 10, 15, 20, 25, 30]
     assert len(snapshots[0]["nodes"]) == MODEL.graph.number_of_nodes()
     assert len(snapshots[0]["edges"]) == MODEL.graph.number_of_edges()
     assert "tensor" in snapshots[0]["nodes"][0]["tensors"]
     assert "tensor" in snapshots[0]["edges"][0]["tensors"]
+    assert set(snapshots[0]["tensor_state"]["levels"]) == {"L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8", "EDGE"}
+    assert all(snapshots[0]["tensor_state"]["counts"][level] > 0 for level in snapshots[0]["tensor_state"]["levels"])
+    assert snapshots[0]["state_vector"]["metric_names"]
+    assert len(snapshots[0]["state_vector"]["metric_names"]) == len(snapshots[0]["state_vector"]["vector"])
+    assert snapshots[0]["traffic"]["summary"]["flow_count"] == 240
+    assert snapshots[0]["traffic"]["summary"]["observed_dropped_packets"] == 0
+    assert snapshots[0]["traffic"]["summary"]["observed_retransmissions"] == 0
+
+
+def test_stationary_dynamics_uses_configurable_step_count() -> None:
+    dynamics = simulate_stationary_dynamics(MODEL, DynamicsConfig(step_seconds=5, step_count=3))
+
+    assert dynamics["config"]["step_count"] == 3
+    assert dynamics["config"]["duration_seconds"] == 15
+    assert [snapshot["time_seconds"] for snapshot in dynamics["snapshots"]] == [0, 5, 10, 15]
+
+
+def test_stationary_dynamics_can_disable_packet_simulation() -> None:
+    dynamics = simulate_stationary_dynamics(
+        MODEL,
+        DynamicsConfig(step_seconds=5, step_count=1, include_packet_simulation=False),
+    )
+
+    assert "traffic" not in dynamics["snapshots"][0]
+
+
+def test_stationary_dynamics_summary_detail_is_compact() -> None:
+    dynamics = simulate_stationary_dynamics(
+        MODEL,
+        DynamicsConfig(
+            step_seconds=5,
+            step_count=1,
+            snapshot_detail="summary",
+            packet_detail="summary",
+        ),
+    )
+    snapshot = dynamics["snapshots"][0]
+
+    assert "nodes" not in snapshot
+    assert "edges" not in snapshot
+    assert "by_level" not in snapshot["tensor_state"]
+    assert "state_vector" in snapshot
+    assert "flows" not in snapshot["traffic"]
+    assert "packet_sample" not in snapshot["traffic"]
+    assert snapshot["traffic"]["summary"]["flow_count"] == 240
+
+
+def test_stationary_dynamics_tensor_detail_keeps_tensor_values_without_graph_lists() -> None:
+    dynamics = simulate_stationary_dynamics(
+        MODEL,
+        DynamicsConfig(step_seconds=5, step_count=1, snapshot_detail="tensor", include_packet_simulation=False),
+    )
+    snapshot = dynamics["snapshots"][0]
+
+    assert "nodes" not in snapshot
+    assert "edges" not in snapshot
+    assert "by_level" in snapshot["tensor_state"]
+    assert snapshot["tensor_state"]["by_level"]["L1"]
+
+
+def test_arbitrator_observes_tensor_state_and_keeps_no_remap_baseline() -> None:
+    dynamics = simulate_stationary_dynamics(
+        MODEL,
+        DynamicsConfig(step_seconds=5, step_count=1, include_packet_simulation=False),
+    )
+    snapshot = dynamics["snapshots"][0]
+    arbitrator = snapshot["arbitrator"]
+
+    assert arbitrator["node_id"] == "ARB"
+    assert arbitrator["input_tensor_counts"] == snapshot["tensor_state"]["counts"]
+    assert arbitrator["input_tensor_counts"]["L1"] == 240
+    assert arbitrator["input_tensor_counts"]["EDGE"] == MODEL.graph.number_of_edges()
+    assert "sla_margin" in arbitrator["level_metric_aggregates"]["L1"]["metrics"]
+    assert "stability_margin" in arbitrator["level_metric_aggregates"]["EDGE"]["metrics"]
+    assert arbitrator["state_vector"] == snapshot["state_vector"]
+    assert arbitrator["analysis"]["remap_pressure"] == 0.0
+    assert arbitrator["remap"]["needed"] is False
+    assert arbitrator["remap"]["action"] == "NO_REMAP"
+
+
+def test_packet_sample_limit_is_configurable() -> None:
+    dynamics = simulate_stationary_dynamics(
+        MODEL,
+        DynamicsConfig(step_seconds=5, step_count=1, packet_sample_limit=5),
+    )
+
+    assert len(dynamics["snapshots"][0]["traffic"]["packet_sample"]) == 5
+
+
+def test_packet_flow_detail_omits_representative_packet_samples() -> None:
+    dynamics = simulate_stationary_dynamics(
+        MODEL,
+        DynamicsConfig(step_seconds=5, step_count=1, packet_detail="flows"),
+    )
+    traffic = dynamics["snapshots"][0]["traffic"]
+
+    assert "flows" in traffic
+    assert "packet_sample" not in traffic
+    assert len(traffic["flows"]) == 240
+
+
+def test_packet_simulation_builds_realistic_in_memory_headers() -> None:
+    dynamics = simulate_stationary_dynamics(MODEL, DynamicsConfig(step_seconds=5, step_count=1))
+    traffic = dynamics["snapshots"][0]["traffic"]
+    summary = traffic["summary"]
+    packets = traffic["packet_sample"]
+
+    assert summary["flow_count"] == 240
+    assert summary["tcp_flow_count"] > 0
+    assert summary["udp_flow_count"] > 0
+    assert summary["observed_loss_ratio"] == 0.0
+    assert packets
+
+    protocols = {packet["ipv4"]["protocol"] for packet in packets}
+    roles = {packet["packet_role"] for packet in packets}
+    assert {"TCP", "UDP"}.issubset(protocols)
+    assert {"tcp_syn", "tcp_data", "dns_query", "udp_media"}.issubset(roles)
+
+    routed_packet = next(packet for packet in packets if len(packet["route"]) > 2)
+    hop_frames = routed_packet["ethernet"]["hop_frames"]
+    assert len(hop_frames) == len(routed_packet["route"]) - 1
+    assert routed_packet["ipv4"]["ttl_at_destination"] < routed_packet["ipv4"]["ttl_start"]
+    assert hop_frames[0]["dst_mac"] != hop_frames[-1]["dst_mac"]

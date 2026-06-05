@@ -1,12 +1,13 @@
 """Entry point for generating the G-Net baseline artifacts."""
 
+import argparse
 import csv
 import json
 import shutil
 from pathlib import Path
 from typing import Any
 
-from src.gnet9.dynamics import simulate_stationary_dynamics
+from src.gnet9.dynamics import DynamicsConfig, simulate_stationary_dynamics
 from src.gnet9.topology_builder import GNetBaselineBuilder
 from src.gnet9.visualizer import GNetVisualizer
 
@@ -114,9 +115,9 @@ def export_parsed_d0sl_catalog(model, path: Path) -> None:
     path.write_text(json.dumps(list(unique_policies.values()), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def export_stationary_dynamics(model, path: Path) -> None:
-    """Export 5-second stationary snapshots for the healthy baseline."""
-    dynamics = simulate_stationary_dynamics(model)
+def export_stationary_dynamics(model, path: Path, config: DynamicsConfig | None = None) -> None:
+    """Export stationary snapshots for the healthy baseline."""
+    dynamics = simulate_stationary_dynamics(model, config)
     path.write_text(json.dumps(dynamics, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -132,7 +133,42 @@ def _l1_export_base(node_id: str, attrs: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate G-Net 9 baseline artifacts.")
+    parser.add_argument(
+        "--dynamics-steps",
+        type=int,
+        default=None,
+        help="Number of 5-second dynamics transitions after t0. Default comes from constants.py.",
+    )
+    parser.add_argument(
+        "--packet-sample-limit",
+        type=int,
+        default=48,
+        help="Representative simulated packet events to store per dynamics snapshot.",
+    )
+    parser.add_argument(
+        "--snapshot-detail",
+        choices=("full", "tensor", "summary"),
+        default="full",
+        help="Dynamics snapshot detail: full graph, tensor-only, or compact summary.",
+    )
+    parser.add_argument(
+        "--packet-detail",
+        choices=("summary", "flows", "sample"),
+        default="sample",
+        help="Traffic export detail inside each dynamics snapshot.",
+    )
+    parser.add_argument(
+        "--no-packet-simulation",
+        action="store_true",
+        help="Export dynamics snapshots without in-memory TCP/IP packet events.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     project_root = Path(__file__).resolve().parent
     output_dir = project_root / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -164,11 +200,25 @@ def main() -> None:
     export_l1_monitoring(model, artifacts["l1_monitoring"])
     export_l2_equipment_profiles(model, artifacts["l2_profiles"])
     export_parsed_d0sl_catalog(model, artifacts["d0sl_parsed"])
-    export_stationary_dynamics(model, artifacts["dynamics"])
+    dynamics_config = DynamicsConfig(
+        step_count=args.dynamics_steps if args.dynamics_steps is not None else DynamicsConfig().step_count,
+        packet_sample_limit=args.packet_sample_limit,
+        include_packet_simulation=not args.no_packet_simulation,
+        snapshot_detail=args.snapshot_detail,
+        packet_detail=args.packet_detail,
+    )
+    export_stationary_dynamics(model, artifacts["dynamics"], dynamics_config)
     shutil.copyfile(d0sl_policy_path, artifacts["d0sl_source"])
 
     print("Done.")
     print(f"Artifacts saved to: {output_dir}")
+    print(
+        "Dynamics: "
+        f"{dynamics_config.step_count} steps x {dynamics_config.step_seconds}s, "
+        f"snapshot_detail={dynamics_config.snapshot_detail}, "
+        f"packet_simulation={dynamics_config.include_packet_simulation}, "
+        f"packet_detail={dynamics_config.packet_detail}"
+    )
 
 
 if __name__ == "__main__":

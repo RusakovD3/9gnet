@@ -22,7 +22,6 @@ from .constants import (
     CRITICALITY_COLORS,
     DEFAULT_SERVICES,
     FIXED_SUBSCRIBERS_PER_AGG,
-    IDEAL_LOAD_FACTOR,
     L2_NODE_COUNT,
     L1_MONITORING_SECONDS,
     MOBILE_SUBSCRIBERS_PER_AGG,
@@ -30,16 +29,26 @@ from .constants import (
 from .l1_d0sl import (
     TrafficKind,
     build_l1_queue_model,
-    build_l1_state_metrics,
     load_l1_d0sl_catalog,
     simulate_l1_monitoring,
+)
+from .baseline import (
+    edge_transport_tensor,
+    l0_service_tensor,
+    l1_subscriber_tensor,
+    l2_equipment_tensor,
+    l3_medium_tensor,
+    l4_infrastructure_tensor,
+    l5_role_tensor,
+    l6_power_tensor,
+    l7_arbitrator_tensor,
+    l8_placement_tensor,
 )
 from .metrics import vertex_proximity_index
 from .models import NetworkModel, ServiceProfile, SliceProfile
 from .tensors import build_layer_tensor, build_transport_tensor
 from .l2_equipment import (
     build_l2_raw_baseline,
-    build_l2_state_metrics,
     build_l2_summary_metrics,
     l2_profile_for_role,
 )
@@ -121,7 +130,7 @@ class GNetBaselineBuilder:
                 pos=pos,
                 color="#d9d9d9",
                 visible_in_logic=False,
-                tensor=build_layer_tensor("L8", _l8_metrics(pos, "terrain-anchor")),
+                tensor=build_layer_tensor("L8", l8_placement_tensor(pos, "terrain-anchor")),
             )
 
     # ---------------------------------------------------------------------
@@ -256,18 +265,9 @@ class GNetBaselineBuilder:
             l2_raw_baseline=raw_l2,
             **summary_l2,
             **extra_attrs,
-            tensor=build_layer_tensor(
-                "L2",
-                build_l2_state_metrics(
-                    raw_l2,
-                    profile,
-                    role=role,
-                    port_speed_mbps=port_speed_mbps,
-                    port_delay_ms=port_delay_ms,
-                ),
-            ),
-            l5_tensor=build_layer_tensor("L5", _l5_state_for_role(role)),
-            l6_tensor=build_layer_tensor("L6", _l6_power_state_for_role(role)),
+            tensor=build_layer_tensor("L2", l2_equipment_tensor(role, criticality, port_speed_mbps, port_delay_ms)),
+            l5_tensor=build_layer_tensor("L5", l5_role_tensor(role)),
+            l6_tensor=build_layer_tensor("L6", l6_power_tensor(role)),
         )
 
     def _connect_core_to_aggregation(self) -> None:
@@ -392,16 +392,8 @@ class GNetBaselineBuilder:
                 monitoring=[point.to_dict() for point in monitoring],
                 visible_in_logic=subscriber_index <= visible_limit,
                 color=color,
-                l6_tensor=build_layer_tensor("L6", _l6_power_state_for_role(role)),
-                tensor=build_layer_tensor(
-                    "L1",
-                    build_l1_state_metrics(
-                        policy,
-                        queue_model,
-                        monitoring,
-                        access_kind="mobile" if prefix == "M" else "fixed",
-                    ),
-                ),
+                l6_tensor=build_layer_tensor("L6", l6_power_tensor(role)),
+                tensor=build_layer_tensor("L1", l1_subscriber_tensor(policy, "mobile" if prefix == "M" else "fixed")),
             )
 
             self._connect_subscriber(aggregation_node, node_id, policy, medium)
@@ -461,7 +453,7 @@ class GNetBaselineBuilder:
                 pos=pos,
                 visible_in_logic=True,
                 color="#d8f3dc",
-                tensor=build_layer_tensor("L0", _l0_service_metrics(profile)),
+                tensor=build_layer_tensor("L0", l0_service_tensor(profile)),
             )
             self._add_transport_edge(
                 service_id,
@@ -495,7 +487,7 @@ class GNetBaselineBuilder:
             color="#f4a261",
             tensor=build_layer_tensor(
                 "L7",
-                _l7_metrics(),
+                l7_arbitrator_tensor(),
             ),
         )
 
@@ -504,7 +496,7 @@ class GNetBaselineBuilder:
         for node_id, attrs in self.graph.nodes(data=True):
             if attrs.get("level") == "L0" or "pos" not in attrs:
                 continue
-            l8_tensor = build_layer_tensor("L8", _l8_metrics(attrs["pos"], attrs.get("role", "")))
+            l8_tensor = build_layer_tensor("L8", l8_placement_tensor(attrs["pos"], attrs.get("role", "")))
             attrs["l8_tensor"] = l8_tensor
             if attrs.get("level") == "L8":
                 attrs["tensor"] = l8_tensor
@@ -522,9 +514,6 @@ class GNetBaselineBuilder:
         physical_level: str,
     ) -> None:
         """Add an edge with transport metadata and an edge tensor."""
-        loss_probability = LINK_LOSS_PROBABILITY.get(medium, 0.001)
-        attack_exposure_inverse = {"fiber": 0.88, "ethernet": 0.80, "radio": 0.70, "radio-backhaul": 0.74, "logical-service-binding": 0.92}.get(medium, 0.78)
-
         self.graph.add_edge(
             source,
             target,
@@ -536,7 +525,7 @@ class GNetBaselineBuilder:
             redundancy=redundancy,
             l3_tensor=build_layer_tensor(
                 "L3",
-                _l3_medium_state(
+                l3_medium_tensor(
                     medium,
                     capacity_mbps,
                     self.graph.nodes[source].get("pos", (0.0, 0.0)),
@@ -545,23 +534,13 @@ class GNetBaselineBuilder:
             ),
             l4_tensor=build_layer_tensor(
                 "L4",
-                _l4_cable_state(
+                l4_infrastructure_tensor(
+                    medium,
                     self.graph.nodes[source].get("pos", (0.0, 0.0)),
                     self.graph.nodes[target].get("pos", (0.0, 0.0)),
-                    medium,
                 ),
             ),
-            tensor=build_transport_tensor(
-                {
-                    "capacity_mbps": capacity_mbps,
-                    "latency_ms": latency_ms,
-                    "loss_probability": loss_probability,
-                    "redundancy": redundancy,
-                    "utilization": IDEAL_LOAD_FACTOR,
-                    "stability_margin": max(0.0, redundancy - IDEAL_LOAD_FACTOR),
-                    "attack_exposure": 1.0 - attack_exposure_inverse,
-                }
-            ),
+            tensor=build_transport_tensor(edge_transport_tensor(medium, capacity_mbps, latency_ms, redundancy)),
         )
 
     def _validate(self) -> None:
@@ -571,184 +550,3 @@ class GNetBaselineBuilder:
             raise ValueError(f"L2 node count is not equal to {L2_NODE_COUNT}.")
         if not nx.is_connected(self.graph.subgraph(l2_nodes)):
             raise ValueError("L2 graph must be connected.")
-
-
-# Numeric category codes are stable inputs for downstream matrix/vector models.
-SERVICE_CODES = {"Voice": 1.0, "Video": 2.0, "FTP": 3.0, "Telemetry": 4.0}
-PLACEMENT_ROLE_CODES = {
-    "terrain-anchor": 0.0,
-    "mobile-subscriber": 1.0,
-    "fixed-subscriber": 2.0,
-    "aggregation-router": 3.0,
-    "core-router": 4.0,
-    "arbitrator": 7.0,
-}
-MEDIUM_CODES = {
-    "logical-service-binding": 0.0,
-    "fiber": 1.0,
-    "ethernet": 2.0,
-    "radio": 4.0,
-    "radio-backhaul": 4.5,
-}
-NOISE_DB_BY_MEDIUM = {"fiber": 2.0, "ethernet": 8.0, "radio": 22.0, "radio-backhaul": 18.0, "logical-service-binding": 0.0}
-DUCT_USAGE_BY_MEDIUM = {"fiber": 0.55, "ethernet": 0.35, "radio": 0.0, "logical-service-binding": 0.0}
-REPAIR_HOURS_BY_MEDIUM = {"fiber": 6.0, "ethernet": 2.0, "radio": 0.5, "logical-service-binding": 0.0}
-LINK_LOSS_PROBABILITY = {
-    "fiber": 0.00001,
-    "ethernet": 0.00010,
-    "radio": 0.00150,
-    "radio-backhaul": 0.00100,
-    "logical-service-binding": 0.0,
-}
-
-ROLE_STATE_TEMPLATES = {
-    "l5_core": {
-        "protocol_code": 3.0,
-        "socket_binding_present": 1.0,
-        "routing_mode_code": 1.0,
-        "remap_algorithm_code": 2.0,
-        "percolation_threshold": 0.72,
-        "reconfiguration_time_s": 12.0,
-    },
-    "l5_aggregation": {
-        "protocol_code": 2.0,
-        "socket_binding_present": 1.0,
-        "routing_mode_code": 1.0,
-        "remap_algorithm_code": 1.0,
-        "percolation_threshold": 0.64,
-        "reconfiguration_time_s": 20.0,
-    },
-    "l6_core": {
-        "power_supply_code": 3.0,
-        "nominal_power_kw": 0.85,
-        "backup_autonomy_hours": 4.0,
-        "energy_reserve_ratio": 0.85,
-        "capex_opex_cost": 0.92,
-    },
-    "l6_aggregation": {
-        "power_supply_code": 2.0,
-        "nominal_power_kw": 0.45,
-        "backup_autonomy_hours": 2.0,
-        "energy_reserve_ratio": 0.82,
-        "capex_opex_cost": 0.66,
-    },
-    "l6_mobile": {
-        "power_supply_code": 1.0,
-        "nominal_power_kw": 0.005,
-        "backup_autonomy_hours": 8.0,
-        "energy_reserve_ratio": 0.70,
-        "capex_opex_cost": 0.18,
-    },
-    "l6_fixed": {
-        "power_supply_code": 2.0,
-        "nominal_power_kw": 0.03,
-        "backup_autonomy_hours": 0.5,
-        "energy_reserve_ratio": 0.60,
-        "capex_opex_cost": 0.12,
-    },
-}
-
-
-def _l5_state_for_role(role: str) -> dict[str, float]:
-    if role == "core-router":
-        return ROLE_STATE_TEMPLATES["l5_core"]
-    return ROLE_STATE_TEMPLATES["l5_aggregation"]
-
-
-def _l6_power_state_for_role(role: str) -> dict[str, float]:
-    if role == "core-router":
-        return ROLE_STATE_TEMPLATES["l6_core"]
-    if role == "mobile-subscriber":
-        return ROLE_STATE_TEMPLATES["l6_mobile"]
-    if role == "fixed-subscriber":
-        return ROLE_STATE_TEMPLATES["l6_fixed"]
-    return ROLE_STATE_TEMPLATES["l6_aggregation"]
-
-
-def _l3_medium_state(
-    medium: str,
-    capacity_mbps: float,
-    source_pos: tuple[float, float],
-    target_pos: tuple[float, float],
-) -> dict[str, float]:
-    distance_m = _distance_m(source_pos, target_pos)
-    frequency_mhz = 2400.0 if medium in {"radio", "radio-backhaul"} else 0.0
-    attenuation_db = _attenuation_db(medium, distance_m, frequency_mhz)
-    noise_db = NOISE_DB_BY_MEDIUM.get(medium, 10.0)
-    snr_db = max(0.0, 100.0 - attenuation_db - noise_db)
-
-    return {
-        "medium_code": MEDIUM_CODES.get(medium, 9.0),
-        "line_rate_mbps": capacity_mbps,
-        "distance_m": distance_m,
-        "frequency_mhz": frequency_mhz,
-        "attenuation_db": attenuation_db,
-        "noise_interference_db": noise_db,
-        "snr_db": snr_db,
-    }
-
-
-def _l4_cable_state(source_pos: tuple[float, float], target_pos: tuple[float, float], medium: str) -> dict[str, float]:
-    source = np.array(source_pos, dtype=float)
-    target = np.array(target_pos, dtype=float)
-    midpoint = (source + target) / 2.0
-    return {
-        "x_mid": float(midpoint[0]),
-        "y_mid": float(midpoint[1]),
-        "length_m": _distance_m(source_pos, target_pos),
-        "cross_connect_present": 1.0 if medium in {"fiber", "ethernet"} else 0.0,
-        "duct_capacity_used_ratio": DUCT_USAGE_BY_MEDIUM.get(medium, 0.25),
-        "repair_time_hours": REPAIR_HOURS_BY_MEDIUM.get(medium, 3.0),
-    }
-
-
-def _l7_metrics() -> dict[str, float]:
-    return {
-        "hausdorff_distance": 0.0,
-        "lyapunov_value": 0.12,
-        "lyapunov_delta": -0.04,
-        "koopman_residual": 0.02,
-        "remap_pressure": 0.0,
-        "decision_confidence": 0.91,
-        "action_cost": 0.18,
-    }
-
-
-def _l8_metrics(pos: tuple[float, float], role: str) -> dict[str, float]:
-    x, y = pos
-    return {
-        "x": float(x),
-        "y": float(y),
-        "coordinate_norm": float(np.linalg.norm([x, y])),
-        "placement_role_code": PLACEMENT_ROLE_CODES.get(role, 9.0),
-        "terrain_risk": 0.15 if role == "terrain-anchor" else 0.08,
-    }
-
-
-def _l0_service_metrics(profile: ServiceProfile) -> dict[str, float]:
-    return {
-        "service_code": SERVICE_CODES[profile.name],
-        "bitrate_mbps": profile.bitrate_mbps,
-        "latency_budget_ms": profile.latency_ms_max,
-        "jitter_budget_ms": profile.jitter_ms_max,
-        "availability_target": profile.availability_target,
-        "priority_code": 1.0 if profile.priority == "gold" else 0.6,
-        "demand_pressure": IDEAL_LOAD_FACTOR,
-        "service_health": 0.97,
-    }
-
-
-def _distance_m(source_pos: tuple[float, float], target_pos: tuple[float, float]) -> float:
-    return float(np.linalg.norm(np.array(source_pos, dtype=float) - np.array(target_pos, dtype=float)) * 100.0)
-
-
-def _attenuation_db(medium: str, distance_m: float, frequency_mhz: float) -> float:
-    if medium in {"radio", "radio-backhaul"}:
-        # Free-space path loss approximation for the baseline radio model.
-        distance_km = max(distance_m / 1000.0, 0.001)
-        return float(32.44 + 20.0 * np.log10(distance_km) + 20.0 * np.log10(max(frequency_mhz, 1.0)))
-    if medium == "fiber":
-        return float(0.35 * distance_m / 1000.0)
-    if medium == "ethernet":
-        return float(6.0 * distance_m / 100.0)
-    return 0.0

@@ -76,3 +76,9 @@ IDEAL_LOAD_FACTOR = 0.55
 
 # Monitoring length used for L1 synthetic observations.
 L1_MONITORING_SECONDS = 30
+
+# Discrete dynamics defaults. DYNAMICS_STEPS is the number of transitions after
+# t0; with include_t0=True the exported trajectory has DYNAMICS_STEPS + 1
+# snapshots.
+DYNAMICS_STEP_SECONDS = 5
+DYNAMICS_STEPS = 6
