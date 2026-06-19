@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
+import networkx as nx
+
 from .arbitrator import build_arbitrator_view, tensor_metrics
 from .constants import DYNAMICS_STEP_SECONDS, DYNAMICS_STEPS
 from .models import NetworkModel, StateTensor
@@ -59,12 +61,127 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
         for step_index in range(start_step, config.step_count + 1)
     ]
 
+    ideal_t0 = validate_ideal_t0(model, snapshots[0] if config.include_t0 and snapshots else None)
+    if not ideal_t0["ok"]:
+        raise ValueError(f"t0 is not ideal: {ideal_t0['violation_count']} violations")
+
     return {
         "mode": "stationary_healthy_baseline",
         "config": config.to_dict(),
         "health": health,
+        "ideal_t0": ideal_t0,
         "snapshot_count": len(snapshots),
         "snapshots": snapshots,
+    }
+
+
+def validate_ideal_t0(model: NetworkModel, snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Проверить, что t0 структурно идеален и имеет реалистичный запас по SLA."""
+    violations: list[dict[str, Any]] = []
+    operational_nodes = [
+        node_id for node_id, attrs in model.graph.nodes(data=True) if attrs.get("level") in {"L0", "L1", "L2"}
+    ]
+    operational_graph_connected = nx.is_connected(model.graph.subgraph(operational_nodes))
+    metrics: dict[str, Any] = {
+        "operational_graph_connected": operational_graph_connected,
+        "subscriber_count": 0,
+        "aggregation_switch_count": 0,
+        "core_router_count": 0,
+        "service_count": 0,
+        "minimum_bitrate_headroom_ratio": float("inf"),
+        "maximum_latency_budget_ratio": 0.0,
+        "maximum_jitter_budget_ratio": 0.0,
+        "maximum_loss_budget_ratio": 0.0,
+        "maximum_l2_cpu_percent": 0.0,
+        "maximum_l2_ram_percent": 0.0,
+        "maximum_planned_link_utilization": 0.0,
+        "minimum_link_stability_margin": 1.0,
+    }
+    if not operational_graph_connected:
+        violations.append({"scope": "TOPOLOGY", "reason": "operational_graph_disconnected"})
+
+    for node_id, attrs in model.graph.nodes(data=True):
+        level, role = attrs.get("level"), attrs.get("role")
+        if level == "L1":
+            metrics["subscriber_count"] += 1
+            neighbors = list(model.graph.neighbors(node_id))
+            if len(neighbors) != 1 or neighbors[0] != attrs.get("home_access"):
+                violations.append({"scope": "L1", "node": node_id, "reason": "invalid_access_attachment"})
+            policy = attrs.get("d0sl_policy", {})
+            min_bitrate = max(float(attrs.get("min_bitrate_kbps", 0.0)), 1e-9)
+            latency_budget = max(float(policy.get("latency_budget_ms", 0.0)), 1e-9)
+            jitter_budget = max(float(policy.get("jitter_budget_ms", 0.0)), 1e-9)
+            loss_budget = max(float(policy.get("packet_loss_budget_percent", 0.0)), 1e-9)
+            for point in attrs.get("monitoring", []):
+                bitrate_ratio = float(point.get("bitrate_kbps", 0.0)) / min_bitrate
+                latency_ratio = float(point.get("latency_ms", 0.0)) / latency_budget
+                jitter_ratio = float(point.get("jitter_ms", 0.0)) / jitter_budget
+                loss_ratio = float(point.get("packet_loss_percent", 0.0)) / loss_budget
+                metrics["minimum_bitrate_headroom_ratio"] = min(metrics["minimum_bitrate_headroom_ratio"], bitrate_ratio)
+                metrics["maximum_latency_budget_ratio"] = max(metrics["maximum_latency_budget_ratio"], latency_ratio)
+                metrics["maximum_jitter_budget_ratio"] = max(metrics["maximum_jitter_budget_ratio"], jitter_ratio)
+                metrics["maximum_loss_budget_ratio"] = max(metrics["maximum_loss_budget_ratio"], loss_ratio)
+                if bitrate_ratio < 1.0 or latency_ratio > 0.80 or jitter_ratio > 0.80 or loss_ratio > 0.50:
+                    violations.append({"scope": "L1", "node": node_id, "second": point.get("second"), "reason": "insufficient_sla_headroom"})
+
+        elif role == "aggregation-switch":
+            metrics["aggregation_switch_count"] += 1
+            neighbors = list(model.graph.neighbors(node_id))
+            clients = [node for node in neighbors if model.graph.nodes[node].get("level") == "L1"]
+            core_links = [node for node in neighbors if model.graph.nodes[node].get("role") == "core-router"]
+            if len(clients) != 40 or len(core_links) < 2:
+                violations.append({"scope": "L2", "node": node_id, "reason": "aggregation_redundancy_or_client_count"})
+        elif role == "core-router":
+            metrics["core_router_count"] += 1
+            core_neighbors = [node for node in model.graph.neighbors(node_id) if model.graph.nodes[node].get("role") == "core-router"]
+            if len(core_neighbors) < 2:
+                violations.append({"scope": "L2", "node": node_id, "reason": "core_ring_not_redundant"})
+        elif level == "L0":
+            metrics["service_count"] += 1
+            if model.graph.degree(node_id) != 1:
+                violations.append({"scope": "L0", "node": node_id, "reason": "invalid_service_attachment"})
+
+        if level == "L2" and isinstance(attrs.get("tensor"), StateTensor):
+            values = tensor_metrics(attrs["tensor"])
+            metrics["maximum_l2_cpu_percent"] = max(metrics["maximum_l2_cpu_percent"], values.get("cpu_load_percent", 0.0))
+            metrics["maximum_l2_ram_percent"] = max(metrics["maximum_l2_ram_percent"], values.get("ram_load_percent", 0.0))
+
+    for source, target, attrs in model.graph.edges(data=True):
+        tensor = attrs.get("tensor")
+        if not isinstance(tensor, StateTensor):
+            continue
+        values = tensor_metrics(tensor)
+        utilization = values.get("utilization", 0.0)
+        stability = values.get("stability_margin", 0.0)
+        metrics["maximum_planned_link_utilization"] = max(metrics["maximum_planned_link_utilization"], utilization)
+        metrics["minimum_link_stability_margin"] = min(metrics["minimum_link_stability_margin"], stability)
+        if utilization > 0.25 or stability < 0.70:
+            violations.append({"scope": "EDGE", "edge": [source, target], "reason": "insufficient_capacity_reserve"})
+
+    if metrics["maximum_l2_cpu_percent"] > 50.0 or metrics["maximum_l2_ram_percent"] > 60.0:
+        violations.append({"scope": "L2", "reason": "insufficient_equipment_headroom"})
+
+    if snapshot is not None:
+        remap = snapshot.get("arbitrator", {}).get("remap", {})
+        analysis = snapshot.get("arbitrator", {}).get("analysis", {})
+        if remap.get("action") != "NO_REMAP" or analysis.get("remap_pressure", 1.0) > 0.05 or analysis.get("decision_confidence", 0.0) < 0.80:
+            violations.append({"scope": "L7", "reason": "baseline_requires_remap"})
+        metrics["l7_decision"] = remap.get("action")
+        if "traffic" in snapshot:
+            traffic = snapshot["traffic"].get("summary", {})
+            if traffic.get("observed_dropped_packets", 0) or traffic.get("observed_retransmissions", 0) or traffic.get("observed_loss_ratio", 0.0):
+                violations.append({"scope": "TRAFFIC", "reason": "observed_loss_or_retransmission"})
+            metrics["observed_loss_ratio"] = float(traffic.get("observed_loss_ratio", 0.0))
+            metrics["observed_retransmissions"] = int(traffic.get("observed_retransmissions", 0))
+
+    if metrics["minimum_bitrate_headroom_ratio"] == float("inf"):
+        metrics["minimum_bitrate_headroom_ratio"] = 0.0
+    return {
+        "ok": not violations,
+        "status": "IDEAL_REALISTIC_BASELINE" if not violations else "INVALID_BASELINE",
+        "violation_count": len(violations),
+        "metrics": metrics,
+        "violations": violations[:100],
     }
 
 

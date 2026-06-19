@@ -58,8 +58,8 @@ class GNetBaselineBuilder:
     """Build a readable and future-ready baseline topology.
 
     Important modeling decision: L2 contains only active network equipment
-    from the 9-level model: core and aggregation routers. Subscribers are L1 and
-    connect directly to aggregation routers. There are no fake access-layer nodes.
+    from the 9-level model: core routers and aggregation switches. Subscribers are L1 and
+    connect directly to aggregation switches. There are no synthetic access-layer devices.
     """
 
     def __init__(self, d0sl_policy_path: Path | None = None) -> None:
@@ -95,15 +95,15 @@ class GNetBaselineBuilder:
 
     def _build_notes(self) -> list[str]:
         return [
-            "Topology is generated as t0 ideal baseline for future Koopman/Lyapunov experiments.",
-            "L2 contains only core and aggregation nodes from the 9-level model.",
-            "Layer tensors are numeric state vectors with explicit metric names and units.",
-            "Subscribers are connected directly to aggregation nodes.",
-            f"L1 subscribers use executable d0sl SLA/SLO/SLI policies from {self.d0sl_policy_path}.",
-            "L1 traffic classes: broadcast MP3, FTP and DNS.",
-            "L3/L4 tensors are attached to transport edges; L5/L6 tensors are attached to equipment and subscribers where relevant.",
-            "L7 tensor stores baseline Koopman/Lyapunov/Hausdorff decision features.",
-            "L8 tensors store coordinates for physical/user placement and Hausdorff distance calculations.",
+            "Топология создана как идеальное эталонное состояние t0 для будущих экспериментов Koopman/Lyapunov.",
+            "L2 содержит только узлы ядра и агрегации девятиуровневой модели.",
+            "Тензоры уровней — числовые векторы состояния с явными именами и единицами метрик.",
+            "Абоненты подключены непосредственно к агрегирующим коммутаторам.",
+            f"Абоненты L1 используют исполняемые политики d0sl SLA/SLO/SLI из {self.d0sl_policy_path}.",
+            "Классы трафика L1: голос Opus, аудиовещание MP3, FTP и DNS.",
+            "Тензоры L3/L4 закреплены за транспортными связями; L5/L6 — за оборудованием и абонентами, где это применимо.",
+            "Тензор L7 хранит эталонные признаки решения Koopman/Lyapunov/Hausdorff.",
+            "Тензоры L8 хранят координаты размещения и данные для расчёта расстояния Хаусдорфа.",
         ]
 
     # ---------------------------------------------------------------------
@@ -213,7 +213,7 @@ class GNetBaselineBuilder:
         )
 
     def _add_aggregation_routers(self) -> None:
-        """Add 6 aggregation routers."""
+        """Add six aggregation switches."""
         aggregation_positions = {
             "A1": (-5.8, -1.2),
             "A2": (-3.2, -1.2),
@@ -226,7 +226,7 @@ class GNetBaselineBuilder:
         for node_id, pos in aggregation_positions.items():
             self._add_l2_router(
                 node_id,
-                role="aggregation-router",
+                role="aggregation-switch",
                 pos=pos,
                 criticality="silver",
                 port_speed_mbps=100_000.0,
@@ -271,7 +271,7 @@ class GNetBaselineBuilder:
         )
 
     def _connect_core_to_aggregation(self) -> None:
-        """Connect every aggregation router to primary and secondary core routers."""
+        """Connect every aggregation switch to primary and secondary core routers."""
         connections = [
             ("A1", "C1", 100_000.0, 0.90, "C6", 40_000.0, 0.82),
             ("A2", "C3", 100_000.0, 0.90, "C8", 40_000.0, 0.82),
@@ -358,7 +358,12 @@ class GNetBaselineBuilder:
         visible_limit: int,
         seed_base: int,
     ) -> None:
-        traffic_cycle = [TrafficKind.BROADCAST_MP3.value, TrafficKind.FTP.value, TrafficKind.DNS.value]
+        traffic_cycle = [
+            TrafficKind.VOICE.value,
+            TrafficKind.BROADCAST_MP3.value,
+            TrafficKind.FTP.value,
+            TrafficKind.DNS.value,
+        ]
         x0, y0 = self.graph.nodes[aggregation_node]["pos"]
 
         for subscriber_index, angle_deg in enumerate(angles_deg, start=1):
@@ -435,13 +440,13 @@ class GNetBaselineBuilder:
     def _add_services(self) -> None:
         service_positions = {
             "SVC_VOICE": (-6.4, 5.5),
-            "SVC_VIDEO": (-2.2, 6.3),
+            "SVC_AUDIO": (-2.2, 6.3),
             "SVC_FTP": (2.2, 6.3),
-            "SVC_TELEM": (6.4, 5.5),
+            "SVC_DNS": (6.4, 5.5),
         }
-        service_to_core = {"SVC_VOICE": "C1", "SVC_VIDEO": "C5", "SVC_FTP": "C8", "SVC_TELEM": "C9"}
+        service_to_core = {"SVC_VOICE": "C1", "SVC_AUDIO": "C5", "SVC_FTP": "C8", "SVC_DNS": "C9"}
         profiles = {service.name.lower(): service for service in self.services}
-        profile_map = {"SVC_VOICE": profiles["voice"], "SVC_VIDEO": profiles["video"], "SVC_FTP": profiles["ftp"], "SVC_TELEM": profiles["telemetry"]}
+        profile_map = {"SVC_VOICE": profiles["voice"], "SVC_AUDIO": profiles["audio"], "SVC_FTP": profiles["ftp"], "SVC_DNS": profiles["dns"]}
 
         for service_id, pos in service_positions.items():
             profile = profile_map[service_id]

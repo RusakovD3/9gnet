@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from src.gnet9.dynamics import DynamicsConfig, simulate_stationary_dynamics
+from src.gnet9.dynamics_charts import export_dynamics_charts
+from src.gnet9.flow_visualizer import draw_service_flow_map, show_service_flow_window
 from src.gnet9.topology_builder import GNetBaselineBuilder
 from src.gnet9.visualizer import GNetVisualizer
 
@@ -52,7 +54,7 @@ def iter_l2_equipment(model):
 
 
 def export_l2_equipment_profiles(model, path: Path) -> None:
-    """Export Cisco-like L2 equipment profiles and baseline raw telemetry."""
+    """Export Cisco L2 profiles, provenance and synthetic baseline telemetry."""
     rows = []
     for node_id, attrs in iter_l2_equipment(model):
         rows.append(
@@ -115,10 +117,11 @@ def export_parsed_d0sl_catalog(model, path: Path) -> None:
     path.write_text(json.dumps(list(unique_policies.values()), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def export_stationary_dynamics(model, path: Path, config: DynamicsConfig | None = None) -> None:
+def export_stationary_dynamics(model, path: Path, config: DynamicsConfig | None = None) -> dict[str, Any]:
     """Export stationary snapshots for the healthy baseline."""
     dynamics = simulate_stationary_dynamics(model, config)
     path.write_text(json.dumps(dynamics, ensure_ascii=False, indent=2), encoding="utf-8")
+    return dynamics
 
 
 def _l1_export_base(node_id: str, attrs: dict[str, Any]) -> dict[str, Any]:
@@ -134,35 +137,40 @@ def _l1_export_base(node_id: str, attrs: dict[str, Any]) -> dict[str, Any]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate G-Net 9 baseline artifacts.")
+    parser = argparse.ArgumentParser(description="Создать артефакты эталонного состояния G-Net 9.")
     parser.add_argument(
         "--dynamics-steps",
         type=int,
         default=None,
-        help="Number of 5-second dynamics transitions after t0. Default comes from constants.py.",
+        help="Число пятисекундных переходов после t0. По умолчанию берётся из constants.py.",
     )
     parser.add_argument(
         "--packet-sample-limit",
         type=int,
         default=48,
-        help="Representative simulated packet events to store per dynamics snapshot.",
+        help="Число показательных пакетных событий в каждом снимке динамики.",
     )
     parser.add_argument(
         "--snapshot-detail",
         choices=("full", "tensor", "summary"),
         default="full",
-        help="Dynamics snapshot detail: full graph, tensor-only, or compact summary.",
+        help="Детализация снимка: полный граф, только тензоры или краткая сводка.",
     )
     parser.add_argument(
         "--packet-detail",
         choices=("summary", "flows", "sample"),
         default="sample",
-        help="Traffic export detail inside each dynamics snapshot.",
+        help="Детализация трафика внутри каждого снимка динамики.",
     )
     parser.add_argument(
         "--no-packet-simulation",
         action="store_true",
-        help="Export dynamics snapshots without in-memory TCP/IP packet events.",
+        help="Экспортировать снимки динамики без пакетных событий TCP/IP.",
+    )
+    parser.add_argument(
+        "--show-window",
+        action="store_true",
+        help="После экспорта открыть интерактивное окно с анимацией сервисных потоков.",
     )
     return parser.parse_args()
 
@@ -185,8 +193,10 @@ def main() -> None:
         "d0sl_parsed": output_dir / "l1_d0sl_parsed.json",
         "d0sl_source": output_dir / "l1_policies.d0sl",
         "dynamics": output_dir / "network_dynamics.json",
+        "charts_dir": output_dir / "charts",
         "network_png": output_dir / "network_logic.png",
         "layers_png": output_dir / "layer_scheme.png",
+        "flows_png": output_dir / "service_flows.png",
     }
 
     visualizer = GNetVisualizer(model)
@@ -207,18 +217,43 @@ def main() -> None:
         snapshot_detail=args.snapshot_detail,
         packet_detail=args.packet_detail,
     )
-    export_stationary_dynamics(model, artifacts["dynamics"], dynamics_config)
+    dynamics = export_stationary_dynamics(model, artifacts["dynamics"], dynamics_config)
+    flow_snapshots = dynamics["snapshots"]
+    if not flow_snapshots or not flow_snapshots[0].get("traffic", {}).get("flows"):
+        flow_dynamics = simulate_stationary_dynamics(
+            model,
+            DynamicsConfig(
+                step_count=dynamics_config.step_count,
+                step_seconds=dynamics_config.step_seconds,
+                snapshot_detail="summary",
+                packet_detail="flows",
+            ),
+        )
+        flow_snapshots = flow_dynamics["snapshots"]
+    draw_service_flow_map(model, flow_snapshots[0]["traffic"]["flows"], artifacts["flows_png"])
+    chart_paths = export_dynamics_charts(
+        dynamics,
+        artifacts["charts_dir"],
+        model=model,
+        flow_snapshots=flow_snapshots,
+    )
     shutil.copyfile(d0sl_policy_path, artifacts["d0sl_source"])
 
-    print("Done.")
-    print(f"Artifacts saved to: {output_dir}")
+    print("Готово.")
+    print(f"Артефакты сохранены в: {output_dir}")
     print(
-        "Dynamics: "
-        f"{dynamics_config.step_count} steps x {dynamics_config.step_seconds}s, "
-        f"snapshot_detail={dynamics_config.snapshot_detail}, "
-        f"packet_simulation={dynamics_config.include_packet_simulation}, "
-        f"packet_detail={dynamics_config.packet_detail}"
+        "Динамика: "
+        f"{dynamics_config.step_count} шагов по {dynamics_config.step_seconds} с, "
+        f"детализация снимка={dynamics_config.snapshot_detail}, "
+        f"пакетная симуляция={dynamics_config.include_packet_simulation}, "
+        f"детализация пакетов={dynamics_config.packet_detail}"
     )
+    print("Графики динамики:")
+    for path in chart_paths.values():
+        print(f"  - {path}")
+    print(f"Карта сервисных потоков: {artifacts['flows_png']}")
+    if args.show_window:
+        show_service_flow_window(model, flow_snapshots)
 
 
 if __name__ == "__main__":

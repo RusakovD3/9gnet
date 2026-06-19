@@ -1,4 +1,5 @@
 from src.gnet9.dynamics import DynamicsConfig, simulate_stationary_dynamics, validate_healthy_baseline
+from src.gnet9.dynamics_charts import extract_application_series, extract_dynamics_chart_series
 from src.gnet9.topology_builder import GNetBaselineBuilder
 
 
@@ -7,14 +8,16 @@ MODEL = GNetBaselineBuilder().build()
 
 def test_l2_count() -> None:
     l2_nodes = [node for node, attrs in MODEL.graph.nodes(data=True) if attrs["level"] == "L2"]
-    assert len(l2_nodes) == 18  # 12 core + 6 aggregation routers
+    assert len(l2_nodes) == 18  # 12 core routers + 6 aggregation switches
 
 
-def test_l2_has_cisco_like_profiles() -> None:
+def test_l2_has_cisco_profiles_with_provenance() -> None:
     l2_nodes = [(node, attrs) for node, attrs in MODEL.graph.nodes(data=True) if attrs["level"] == "L2"]
-    assert all(attrs["platform_family"] in {"NCS 5501", "Catalyst 9500", "ASR 1001-X"} for _, attrs in l2_nodes)
+    assert all(attrs["platform_family"] in {"NCS 5501", "Catalyst C9500-24Y4C"} for _, attrs in l2_nodes)
     assert all("l2_raw_baseline" in attrs for _, attrs in l2_nodes)
     assert all("l2_health_index" in attrs for _, attrs in l2_nodes)
+    assert all(attrs["l2_profile"]["verified_fields"] for _, attrs in l2_nodes)
+    assert all(attrs["l2_profile"]["assumed_fields"] for _, attrs in l2_nodes)
 
 
 def test_tensor_is_state_vector() -> None:
@@ -25,7 +28,7 @@ def test_tensor_is_state_vector() -> None:
 
 
 def test_l0_service_tensor_metrics() -> None:
-    tensor = MODEL.graph.nodes["SVC_VIDEO"]["tensor"]
+    tensor = MODEL.graph.nodes["SVC_AUDIO"]["tensor"]
     assert tensor.metric_names == (
         "service_code",
         "bitrate_mbps",
@@ -131,10 +134,19 @@ def test_stationary_dynamics_snapshots_every_five_seconds() -> None:
     snapshots = dynamics["snapshots"]
 
     assert dynamics["mode"] == "stationary_healthy_baseline"
-    assert dynamics["config"]["step_count"] == 6
-    assert dynamics["config"]["duration_seconds"] == 30
+    assert dynamics["config"]["step_count"] == 10
+    assert dynamics["config"]["duration_seconds"] == 50
     assert dynamics["health"]["ok"]
-    assert [snapshot["time_seconds"] for snapshot in snapshots] == [0, 5, 10, 15, 20, 25, 30]
+    assert dynamics["ideal_t0"]["ok"]
+    assert dynamics["ideal_t0"]["status"] == "IDEAL_REALISTIC_BASELINE"
+    assert dynamics["ideal_t0"]["metrics"]["subscriber_count"] == 240
+    assert dynamics["ideal_t0"]["metrics"]["aggregation_switch_count"] == 6
+    assert dynamics["ideal_t0"]["metrics"]["core_router_count"] == 12
+    assert dynamics["ideal_t0"]["metrics"]["service_count"] == 4
+    assert dynamics["ideal_t0"]["metrics"]["maximum_planned_link_utilization"] <= 0.12
+    assert dynamics["ideal_t0"]["metrics"]["minimum_link_stability_margin"] >= 0.88
+    assert dynamics["ideal_t0"]["metrics"]["l7_decision"] == "NO_REMAP"
+    assert [snapshot["time_seconds"] for snapshot in snapshots] == list(range(0, 51, 5))
     assert len(snapshots[0]["nodes"]) == MODEL.graph.number_of_nodes()
     assert len(snapshots[0]["edges"]) == MODEL.graph.number_of_edges()
     assert "tensor" in snapshots[0]["nodes"][0]["tensors"]
@@ -250,6 +262,10 @@ def test_packet_simulation_builds_realistic_in_memory_headers() -> None:
     assert summary["tcp_flow_count"] > 0
     assert summary["udp_flow_count"] > 0
     assert summary["observed_loss_ratio"] == 0.0
+    assert set(summary["applications"]) == {"DNS", "FTP_DATA", "RTP_MP3", "RTP_OPUS"}
+    assert sum(item["flow_count"] for item in summary["applications"].values()) == 240
+    assert summary["offered_rate_mbps"] > 0.0
+    assert 0.0 < summary["protocol_efficiency_ratio"] < 1.0
     assert packets
 
     protocols = {packet["ipv4"]["protocol"] for packet in packets}
@@ -262,3 +278,19 @@ def test_packet_simulation_builds_realistic_in_memory_headers() -> None:
     assert len(hop_frames) == len(routed_packet["route"]) - 1
     assert routed_packet["ipv4"]["ttl_at_destination"] < routed_packet["ipv4"]["ttl_start"]
     assert hop_frames[0]["dst_mac"] != hop_frames[-1]["dst_mac"]
+
+
+def test_dynamics_chart_series_exposes_sla_traffic_and_arbitrator_metrics() -> None:
+    dynamics = simulate_stationary_dynamics(MODEL, DynamicsConfig(step_seconds=5, step_count=1))
+    series = extract_dynamics_chart_series(dynamics)
+
+    assert series["time_seconds"] == [0.0, 5.0]
+    assert len(series["sla_margin_min"]) == 2
+    assert min(series["sla_margin_min"]) > 0.0
+    assert len(series["packet_count"]) == 2
+    assert min(series["packet_count"]) > 0.0
+    assert min(series["traffic_rate_mbps"]) > 0.0
+    assert series["remap_pressure"] == [0.0, 0.0]
+    applications = extract_application_series(dynamics)
+    assert set(applications) == {"DNS", "FTP_DATA", "RTP_MP3", "RTP_OPUS"}
+    assert all(len(values["offered_rate_mbps"]) == 2 for values in applications.values())

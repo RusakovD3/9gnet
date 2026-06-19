@@ -19,9 +19,16 @@ from .models import NetworkModel, StateTensor
 
 ETHERNET_HEADER_BYTES = 14
 ETHERNET_FCS_BYTES = 4
+ETHERNET_PREAMBLE_SFD_BYTES = 8
+ETHERNET_INTER_PACKET_GAP_BYTES = 12
 IPV4_HEADER_BYTES = 20
 TCP_HEADER_BYTES = 20
 UDP_HEADER_BYTES = 8
+RTP_HEADER_BYTES = 12
+ETHERNET_OVERHEAD_BYTES = ETHERNET_HEADER_BYTES + ETHERNET_FCS_BYTES
+ETHERNET_WIRE_OVERHEAD_BYTES = (
+    ETHERNET_OVERHEAD_BYTES + ETHERNET_PREAMBLE_SFD_BYTES + ETHERNET_INTER_PACKET_GAP_BYTES
+)
 ETHERNET_MTU_BYTES = 1500
 TCP_MSS_BYTES = ETHERNET_MTU_BYTES - IPV4_HEADER_BYTES - TCP_HEADER_BYTES
 UDP_PAYLOAD_BYTES = 1180
@@ -30,10 +37,16 @@ PacketDetail = Literal["summary", "flows", "sample"]
 
 
 TRAFFIC_APPS = {
+    "voice": {
+        "application": "RTP_OPUS",
+        "transport": "UDP",
+        "service_node": "SVC_VOICE",
+        "server_port": 5002,
+    },
     "broadcast_mp3": {
         "application": "RTP_MP3",
         "transport": "UDP",
-        "service_node": "SVC_VIDEO",
+        "service_node": "SVC_AUDIO",
         "server_port": 5004,
         "payload_unit_bytes": UDP_PAYLOAD_BYTES,
     },
@@ -47,7 +60,7 @@ TRAFFIC_APPS = {
     "dns": {
         "application": "DNS",
         "transport": "UDP",
-        "service_node": "SVC_TELEM",
+        "service_node": "SVC_DNS",
         "server_port": 53,
         "query_payload_bytes": 52,
         "response_payload_bytes": 180,
@@ -66,6 +79,24 @@ class NetworkIdentity:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class FlowContext:
+    """All stable inputs needed to build one subscriber traffic flow."""
+
+    model: NetworkModel
+    identities: dict[str, NetworkIdentity]
+    subscriber_id: str
+    attrs: dict[str, Any]
+    app: dict[str, Any]
+    service_node: str
+    client_port: int
+    step_index: int
+    time_seconds: int
+    step_seconds: int
+    payload_bps: float
+    flow_id: str
 
 
 def build_network_identities(model: NetworkModel) -> dict[str, NetworkIdentity]:
@@ -140,236 +171,220 @@ def _build_flow(
     service_node = app["service_node"]
     client_port = _client_port(subscriber_id, flow_index)
     payload_bps = _payload_bps(attrs, time_seconds)
+    flow_id = f"{subscriber_id}-{app['application']}-{step_index}"
+    context = FlowContext(
+        model=model,
+        identities=identities,
+        subscriber_id=subscriber_id,
+        attrs=attrs,
+        app=app,
+        service_node=service_node,
+        client_port=client_port,
+        step_index=step_index,
+        time_seconds=time_seconds,
+        step_seconds=step_seconds,
+        payload_bps=payload_bps,
+        flow_id=flow_id,
+    )
 
     if app["transport"] == "TCP":
-        return _build_tcp_flow(
-            model,
-            identities,
-            subscriber_id,
-            service_node,
-            attrs,
-            app,
-            flow_index,
-            step_index,
-            time_seconds,
-            step_seconds,
-            client_port,
-            payload_bps,
-        )
+        return _build_tcp_flow(context)
+
+    if traffic_kind == "voice":
+        return _build_voice_flow(context)
 
     if traffic_kind == "dns":
-        return _build_dns_flow(
-            model,
-            identities,
-            subscriber_id,
-            service_node,
-            attrs,
-            app,
-            flow_index,
-            step_index,
-            time_seconds,
-            step_seconds,
-            client_port,
-        )
+        return _build_dns_flow(context)
 
-    return _build_udp_media_flow(
-        model,
-        identities,
-        subscriber_id,
-        service_node,
-        attrs,
-        app,
-        flow_index,
-        step_index,
-        time_seconds,
-        step_seconds,
-        client_port,
-        payload_bps,
+    return _build_udp_media_flow(context)
+
+
+def _build_voice_flow(context: FlowContext) -> dict[str, Any]:
+    """Build a mono Opus/RTP stream with one packet every 20 milliseconds."""
+    route = _route(context.model, context.service_node, context.subscriber_id)
+    policy = context.attrs.get("d0sl_policy", {})
+    packetization_ms = int(policy.get("packetization_ms") or 20)
+    rtp_clock_rate_hz = int(policy.get("rtp_clock_rate_hz") or 48_000)
+    rtp_payload_type = int(policy.get("rtp_payload_type") or 111)
+    channels = int(policy.get("channels") or 1)
+    packets_per_second = 1000 // packetization_ms
+    datagrams = packets_per_second * context.step_seconds
+    codec_payload_bytes = max(1, int(round(context.payload_bps * context.step_seconds / 8.0)))
+    codec_bytes_per_packet = max(1, int(round(codec_payload_bytes / datagrams)))
+    wire_bytes = codec_payload_bytes + datagrams * (
+        RTP_HEADER_BYTES + UDP_HEADER_BYTES + IPV4_HEADER_BYTES + ETHERNET_WIRE_OVERHEAD_BYTES
+    )
+    ip_packet_bytes = IPV4_HEADER_BYTES + UDP_HEADER_BYTES + RTP_HEADER_BYTES + codec_bytes_per_packet
+    network_latency_ms = _path_latency_ms(context.model, route, ip_packet_bytes)
+    # 20 ms framing plus the Opus look-ahead approximates the endpoint contribution.
+    one_way_latency_ms = network_latency_ms + packetization_ms + 6.5
+    expected_loss = _path_expected_loss(context.model, route)
+
+    return _flow_record(
+        context,
+        transport="UDP",
+        route=route,
+        reverse_route=list(reversed(route)),
+        packet_count=datagrams,
+        payload_bytes=codec_payload_bytes,
+        wire_bytes=wire_bytes,
+        one_way_latency_ms=one_way_latency_ms,
+        rtt_ms=None,
+        expected_loss=expected_loss,
+        extra={
+            "rtp_packets": datagrams,
+            "packetization_ms": packetization_ms,
+            "packets_per_second": packets_per_second,
+            "codec_payload_bytes_per_packet": codec_bytes_per_packet,
+            "codec_bitrate_kbps": round(context.payload_bps / 1000.0, 3),
+            "line_bitrate_kbps": round(wire_bytes * 8.0 / context.step_seconds / 1000.0, 3),
+            "rtp_header_bytes": RTP_HEADER_BYTES,
+            "rtp_clock_rate_hz": rtp_clock_rate_hz,
+            "rtp_payload_type": rtp_payload_type,
+            "channels": channels,
+            "dtx_enabled": policy.get("dtx") == "enabled",
+            "inband_fec_enabled": policy.get("inband_fec") == "enabled",
+        },
     )
 
 
-def _build_tcp_flow(
-    model: NetworkModel,
-    identities: dict[str, NetworkIdentity],
-    subscriber_id: str,
-    service_node: str,
-    attrs: dict[str, Any],
-    app: dict[str, Any],
-    flow_index: int,
-    step_index: int,
-    time_seconds: int,
-    step_seconds: int,
-    client_port: int,
-    payload_bps: float,
-) -> dict[str, Any]:
-    data_route = _route(model, service_node, subscriber_id)
+def _build_tcp_flow(context: FlowContext) -> dict[str, Any]:
+    data_route = _route(context.model, context.service_node, context.subscriber_id)
     ack_route = list(reversed(data_route))
-    payload_bytes = max(TCP_MSS_BYTES, int(payload_bps * step_seconds / 8.0))
+    payload_bytes = _payload_bytes(context.payload_bps, context.step_seconds, TCP_MSS_BYTES)
     data_segments = math.ceil(payload_bytes / TCP_MSS_BYTES)
     ack_segments = math.ceil(data_segments / 2)
-    handshake_packets = 3 if step_index == 0 else 0
+    handshake_packets = 3 if context.step_index == 0 else 0
     tcp_packets = handshake_packets + data_segments + ack_segments
-    wire_bytes = (
-        payload_bytes
-        + tcp_packets * (ETHERNET_HEADER_BYTES + ETHERNET_FCS_BYTES + IPV4_HEADER_BYTES + TCP_HEADER_BYTES)
+    wire_bytes = _wire_bytes(payload_bytes, tcp_packets, TCP_HEADER_BYTES)
+    one_way_latency_ms = _path_latency_ms(context.model, data_route, TCP_MSS_BYTES + IPV4_HEADER_BYTES + TCP_HEADER_BYTES)
+    rtt_ms = one_way_latency_ms + _path_latency_ms(context.model, ack_route, IPV4_HEADER_BYTES + TCP_HEADER_BYTES)
+    expected_loss = _path_expected_loss(context.model, data_route)
+
+    return _flow_record(
+        context,
+        transport="TCP",
+        route=data_route,
+        reverse_route=ack_route,
+        packet_count=tcp_packets,
+        payload_bytes=payload_bytes,
+        wire_bytes=wire_bytes,
+        one_way_latency_ms=one_way_latency_ms,
+        rtt_ms=rtt_ms,
+        expected_loss=expected_loss,
+        extra={
+            "tcp_state": "ESTABLISHED",
+            "handshake_packets": handshake_packets,
+            "data_segments": data_segments,
+            "ack_segments": ack_segments,
+            "mss_bytes": TCP_MSS_BYTES,
+        },
     )
-    one_way_latency_ms = _path_latency_ms(model, data_route, TCP_MSS_BYTES + IPV4_HEADER_BYTES + TCP_HEADER_BYTES)
-    rtt_ms = one_way_latency_ms + _path_latency_ms(model, ack_route, IPV4_HEADER_BYTES + TCP_HEADER_BYTES)
-    expected_loss = _path_expected_loss(model, data_route)
-
-    flow_id = f"{subscriber_id}-{app['application']}-{step_index}"
-    return {
-        "flow_id": flow_id,
-        "step_index": step_index,
-        "time_seconds": time_seconds,
-        "application": app["application"],
-        "transport": "TCP",
-        "client_node": subscriber_id,
-        "server_node": service_node,
-        "client_ip": identities[subscriber_id].ip,
-        "server_ip": identities[service_node].ip,
-        "client_port": client_port,
-        "server_port": app["server_port"],
-        "tcp_state": "ESTABLISHED",
-        "handshake_packets": handshake_packets,
-        "data_segments": data_segments,
-        "ack_segments": ack_segments,
-        "packet_count": tcp_packets,
-        "payload_bytes": payload_bytes,
-        "wire_bytes": wire_bytes,
-        "mss_bytes": TCP_MSS_BYTES,
-        "mtu_bytes": ETHERNET_MTU_BYTES,
-        "route": data_route,
-        "reverse_route": ack_route,
-        "hop_count": max(0, len(data_route) - 1),
-        "one_way_latency_ms": round(one_way_latency_ms, 4),
-        "rtt_ms": round(rtt_ms, 4),
-        "expected_loss_ratio": round(expected_loss, 8),
-        "observed_dropped_packets": 0,
-        "observed_retransmissions": 0,
-        "sla_grade": attrs.get("sla_grade"),
-        "traffic_kind": attrs.get("traffic_kind"),
-        "sequence_base": _sequence_base(flow_id),
-    }
 
 
-def _build_udp_media_flow(
-    model: NetworkModel,
-    identities: dict[str, NetworkIdentity],
-    subscriber_id: str,
-    service_node: str,
-    attrs: dict[str, Any],
-    app: dict[str, Any],
-    flow_index: int,
-    step_index: int,
-    time_seconds: int,
-    step_seconds: int,
-    client_port: int,
-    payload_bps: float,
-) -> dict[str, Any]:
-    route = _route(model, service_node, subscriber_id)
-    payload_unit = app["payload_unit_bytes"]
-    payload_bytes = max(payload_unit, int(payload_bps * step_seconds / 8.0))
+def _build_udp_media_flow(context: FlowContext) -> dict[str, Any]:
+    route = _route(context.model, context.service_node, context.subscriber_id)
+    payload_unit = context.app["payload_unit_bytes"]
+    payload_bytes = _payload_bytes(context.payload_bps, context.step_seconds, payload_unit)
     datagrams = math.ceil(payload_bytes / payload_unit)
-    wire_bytes = (
-        payload_bytes
-        + datagrams * (ETHERNET_HEADER_BYTES + ETHERNET_FCS_BYTES + IPV4_HEADER_BYTES + UDP_HEADER_BYTES)
+    wire_bytes = _wire_bytes(payload_bytes, datagrams, UDP_HEADER_BYTES)
+    one_way_latency_ms = _path_latency_ms(context.model, route, payload_unit + IPV4_HEADER_BYTES + UDP_HEADER_BYTES)
+    expected_loss = _path_expected_loss(context.model, route)
+
+    return _flow_record(
+        context,
+        transport="UDP",
+        route=route,
+        reverse_route=list(reversed(route)),
+        packet_count=datagrams,
+        payload_bytes=payload_bytes,
+        wire_bytes=wire_bytes,
+        one_way_latency_ms=one_way_latency_ms,
+        rtt_ms=None,
+        expected_loss=expected_loss,
+        extra={
+            "udp_datagrams": datagrams,
+        },
     )
-    one_way_latency_ms = _path_latency_ms(model, route, payload_unit + IPV4_HEADER_BYTES + UDP_HEADER_BYTES)
-    expected_loss = _path_expected_loss(model, route)
-
-    flow_id = f"{subscriber_id}-{app['application']}-{step_index}"
-    return {
-        "flow_id": flow_id,
-        "step_index": step_index,
-        "time_seconds": time_seconds,
-        "application": app["application"],
-        "transport": "UDP",
-        "client_node": subscriber_id,
-        "server_node": service_node,
-        "client_ip": identities[subscriber_id].ip,
-        "server_ip": identities[service_node].ip,
-        "client_port": client_port,
-        "server_port": app["server_port"],
-        "udp_datagrams": datagrams,
-        "packet_count": datagrams,
-        "payload_bytes": payload_bytes,
-        "wire_bytes": wire_bytes,
-        "mtu_bytes": ETHERNET_MTU_BYTES,
-        "route": route,
-        "reverse_route": list(reversed(route)),
-        "hop_count": max(0, len(route) - 1),
-        "one_way_latency_ms": round(one_way_latency_ms, 4),
-        "rtt_ms": None,
-        "expected_loss_ratio": round(expected_loss, 8),
-        "observed_dropped_packets": 0,
-        "observed_retransmissions": 0,
-        "sla_grade": attrs.get("sla_grade"),
-        "traffic_kind": attrs.get("traffic_kind"),
-        "sequence_base": _sequence_base(flow_id),
-    }
 
 
-def _build_dns_flow(
-    model: NetworkModel,
-    identities: dict[str, NetworkIdentity],
-    subscriber_id: str,
-    service_node: str,
-    attrs: dict[str, Any],
-    app: dict[str, Any],
-    flow_index: int,
-    step_index: int,
-    time_seconds: int,
-    step_seconds: int,
-    client_port: int,
-) -> dict[str, Any]:
-    query_route = _route(model, subscriber_id, service_node)
+def _build_dns_flow(context: FlowContext) -> dict[str, Any]:
+    query_route = _route(context.model, context.subscriber_id, context.service_node)
     response_route = list(reversed(query_route))
-    request_rate = _tensor_metric(attrs.get("tensor"), "request_rate_pps", default=1.0)
-    query_count = max(1, int(round(request_rate * step_seconds)))
-    query_bytes = int(app["query_payload_bytes"])
-    response_bytes = int(app["response_payload_bytes"])
+    request_rate = _tensor_metric(context.attrs.get("tensor"), "request_rate_pps", default=1.0)
+    query_count = max(1, int(round(request_rate * context.step_seconds)))
+    query_bytes = int(context.app["query_payload_bytes"])
+    response_bytes = int(context.app["response_payload_bytes"])
     payload_bytes = query_count * (query_bytes + response_bytes)
     packet_count = query_count * 2
-    wire_bytes = (
-        payload_bytes
-        + packet_count * (ETHERNET_HEADER_BYTES + ETHERNET_FCS_BYTES + IPV4_HEADER_BYTES + UDP_HEADER_BYTES)
-    )
-    query_latency_ms = _path_latency_ms(model, query_route, query_bytes + IPV4_HEADER_BYTES + UDP_HEADER_BYTES)
-    response_latency_ms = _path_latency_ms(model, response_route, response_bytes + IPV4_HEADER_BYTES + UDP_HEADER_BYTES)
-    expected_loss = 1.0 - (1.0 - _path_expected_loss(model, query_route)) * (1.0 - _path_expected_loss(model, response_route))
+    wire_bytes = _wire_bytes(payload_bytes, packet_count, UDP_HEADER_BYTES)
+    query_latency_ms = _path_latency_ms(context.model, query_route, query_bytes + IPV4_HEADER_BYTES + UDP_HEADER_BYTES)
+    response_latency_ms = _path_latency_ms(context.model, response_route, response_bytes + IPV4_HEADER_BYTES + UDP_HEADER_BYTES)
+    expected_loss = _round_trip_expected_loss(context.model, query_route, response_route)
 
-    flow_id = f"{subscriber_id}-{app['application']}-{step_index}"
-    return {
-        "flow_id": flow_id,
-        "step_index": step_index,
-        "time_seconds": time_seconds,
-        "application": app["application"],
-        "transport": "UDP",
-        "client_node": subscriber_id,
-        "server_node": service_node,
-        "client_ip": identities[subscriber_id].ip,
-        "server_ip": identities[service_node].ip,
-        "client_port": client_port,
-        "server_port": app["server_port"],
-        "dns_queries": query_count,
-        "dns_responses": query_count,
+    return _flow_record(
+        context,
+        transport="UDP",
+        route=query_route,
+        reverse_route=response_route,
+        packet_count=packet_count,
+        payload_bytes=payload_bytes,
+        wire_bytes=wire_bytes,
+        one_way_latency_ms=query_latency_ms,
+        rtt_ms=query_latency_ms + response_latency_ms,
+        expected_loss=expected_loss,
+        extra={
+            "dns_queries": query_count,
+            "dns_responses": query_count,
+        },
+    )
+
+
+def _flow_record(
+    context: FlowContext,
+    *,
+    transport: str,
+    route: list[str],
+    reverse_route: list[str],
+    packet_count: int,
+    payload_bytes: int,
+    wire_bytes: int,
+    one_way_latency_ms: float,
+    rtt_ms: float | None,
+    expected_loss: float,
+    extra: dict[str, Any],
+) -> dict[str, Any]:
+    record = {
+        "flow_id": context.flow_id,
+        "step_index": context.step_index,
+        "time_seconds": context.time_seconds,
+        "interval_seconds": context.step_seconds,
+        "application": context.app["application"],
+        "transport": transport,
+        "client_node": context.subscriber_id,
+        "server_node": context.service_node,
+        "client_ip": context.identities[context.subscriber_id].ip,
+        "server_ip": context.identities[context.service_node].ip,
+        "client_port": context.client_port,
+        "server_port": context.app["server_port"],
         "packet_count": packet_count,
         "payload_bytes": payload_bytes,
         "wire_bytes": wire_bytes,
         "mtu_bytes": ETHERNET_MTU_BYTES,
-        "route": query_route,
-        "reverse_route": response_route,
-        "hop_count": max(0, len(query_route) - 1),
-        "one_way_latency_ms": round(query_latency_ms, 4),
-        "rtt_ms": round(query_latency_ms + response_latency_ms, 4),
+        "route": route,
+        "reverse_route": reverse_route,
+        "hop_count": max(0, len(route) - 1),
+        "one_way_latency_ms": round(one_way_latency_ms, 4),
+        "rtt_ms": None if rtt_ms is None else round(rtt_ms, 4),
         "expected_loss_ratio": round(expected_loss, 8),
         "observed_dropped_packets": 0,
         "observed_retransmissions": 0,
-        "sla_grade": attrs.get("sla_grade"),
-        "traffic_kind": attrs.get("traffic_kind"),
-        "sequence_base": _sequence_base(flow_id),
+        "sla_grade": context.attrs.get("sla_grade"),
+        "traffic_kind": context.attrs.get("traffic_kind"),
+        "sequence_base": _sequence_base(context.flow_id),
     }
+    record.update(extra)
+    return record
 
 
 def _sample_packets_for_flow(
@@ -386,6 +401,9 @@ def _sample_packets_for_flow(
 
     if flow["application"] == "DNS":
         return _dns_packet_samples(flow, identities, model, limit)
+
+    if flow["application"] == "RTP_OPUS":
+        return _voice_packet_samples(flow, identities, model, limit)
 
     return [
         _packet_event(
@@ -404,6 +422,46 @@ def _sample_packets_for_flow(
             sequence_number=flow["sequence_base"],
         )
     ][:limit]
+
+
+def _voice_packet_samples(
+    flow: dict[str, Any],
+    identities: dict[str, NetworkIdentity],
+    model: NetworkModel,
+    limit: int,
+) -> list[dict[str, Any]]:
+    codec_bytes = int(flow["codec_payload_bytes_per_packet"])
+    udp_payload_bytes = RTP_HEADER_BYTES + codec_bytes
+    event = _packet_event(
+        model,
+        identities,
+        flow=flow,
+        packet_role="rtp_voice",
+        route=flow["route"],
+        src_node=flow["server_node"],
+        dst_node=flow["client_node"],
+        protocol="UDP",
+        src_port=flow["server_port"],
+        dst_port=flow["client_port"],
+        payload_bytes=udp_payload_bytes,
+        udp_length_bytes=UDP_HEADER_BYTES + udp_payload_bytes,
+        sequence_number=flow["sequence_base"],
+    )
+    event["rtp"] = {
+        "version": 2,
+        "payload_type": flow["rtp_payload_type"],
+        "marker": False,
+        "sequence_number": flow["sequence_base"] & 0xFFFF,
+        "timestamp": (flow["time_seconds"] * flow["rtp_clock_rate_hz"]) & 0xFFFFFFFF,
+        "ssrc": flow["sequence_base"],
+        "clock_rate_hz": flow["rtp_clock_rate_hz"],
+        "packetization_ms": flow["packetization_ms"],
+        "codec": "Opus",
+        "channels": flow["channels"],
+        "header_bytes": RTP_HEADER_BYTES,
+        "codec_payload_bytes": codec_bytes,
+    }
+    return [event][:limit]
 
 
 def _tcp_packet_samples(
@@ -598,6 +656,8 @@ def _packet_event(
             "mtu_bytes": ETHERNET_MTU_BYTES,
             "frame_header_bytes": ETHERNET_HEADER_BYTES,
             "frame_fcs_bytes": ETHERNET_FCS_BYTES,
+            "preamble_sfd_bytes": ETHERNET_PREAMBLE_SFD_BYTES,
+            "inter_packet_gap_bytes": ETHERNET_INTER_PACKET_GAP_BYTES,
             "hop_frames": _hop_frames(model, identities, route),
         },
         "ipv4": {
@@ -678,6 +738,23 @@ def _traffic_summary(flows: list[dict[str, Any]]) -> dict[str, Any]:
     tcp_flows = sum(1 for flow in flows if flow["transport"] == "TCP")
     udp_flows = sum(1 for flow in flows if flow["transport"] == "UDP")
     latencies = [float(flow["one_way_latency_ms"]) for flow in flows]
+    interval_seconds = int(flows[0].get("interval_seconds", 0)) if flows else 0
+    applications: dict[str, dict[str, Any]] = {}
+    for application in sorted({str(flow["application"]) for flow in flows}):
+        app_flows = [flow for flow in flows if flow["application"] == application]
+        app_payload = sum(int(flow["payload_bytes"]) for flow in app_flows)
+        app_wire = sum(int(flow["wire_bytes"]) for flow in app_flows)
+        app_latencies = [float(flow["one_way_latency_ms"]) for flow in app_flows]
+        applications[application] = {
+            "flow_count": len(app_flows),
+            "packet_count": sum(int(flow["packet_count"]) for flow in app_flows),
+            "payload_bytes": app_payload,
+            "wire_bytes": app_wire,
+            "offered_rate_mbps": round(app_wire * 8.0 / max(interval_seconds, 1) / 1_000_000.0, 4),
+            "protocol_efficiency_ratio": round(app_payload / max(app_wire, 1), 6),
+            "mean_one_way_latency_ms": round(sum(app_latencies) / max(len(app_latencies), 1), 4),
+            "max_one_way_latency_ms": round(max(app_latencies, default=0.0), 4),
+        }
 
     return {
         "flow_count": len(flows),
@@ -691,6 +768,10 @@ def _traffic_summary(flows: list[dict[str, Any]]) -> dict[str, Any]:
         "observed_loss_ratio": 0.0 if packet_count == 0 else dropped / packet_count,
         "mean_one_way_latency_ms": round(sum(latencies) / max(len(latencies), 1), 4),
         "max_one_way_latency_ms": round(max(latencies, default=0.0), 4),
+        "interval_seconds": interval_seconds,
+        "offered_rate_mbps": round(wire_bytes * 8.0 / max(interval_seconds, 1) / 1_000_000.0, 4),
+        "protocol_efficiency_ratio": round(payload_bytes / max(wire_bytes, 1), 6),
+        "applications": applications,
     }
 
 
@@ -723,6 +804,20 @@ def _path_expected_loss(model: NetworkModel, route: list[str]) -> float:
     return 1.0 - survival
 
 
+def _round_trip_expected_loss(model: NetworkModel, outbound_route: list[str], return_route: list[str]) -> float:
+    outbound_success = 1.0 - _path_expected_loss(model, outbound_route)
+    return_success = 1.0 - _path_expected_loss(model, return_route)
+    return 1.0 - outbound_success * return_success
+
+
+def _payload_bytes(payload_bps: float, step_seconds: int, minimum_payload_bytes: int) -> int:
+    return max(minimum_payload_bytes, int(payload_bps * step_seconds / 8.0))
+
+
+def _wire_bytes(payload_bytes: int, packet_count: int, transport_header_bytes: int) -> int:
+    return payload_bytes + packet_count * (ETHERNET_WIRE_OVERHEAD_BYTES + IPV4_HEADER_BYTES + transport_header_bytes)
+
+
 def _payload_bps(attrs: dict[str, Any], time_seconds: int) -> float:
     monitoring = attrs.get("monitoring", [])
     if monitoring:
@@ -742,7 +837,7 @@ def _ip_for_node(node_id: str, attrs: dict[str, Any], fallback_index: int) -> st
     role = attrs.get("role")
 
     if level == "L0":
-        service_octet = {"SVC_VOICE": 10, "SVC_VIDEO": 20, "SVC_FTP": 30, "SVC_TELEM": 40}.get(node_id, fallback_index)
+        service_octet = {"SVC_VOICE": 10, "SVC_AUDIO": 20, "SVC_FTP": 30, "SVC_DNS": 40}.get(node_id, fallback_index)
         return f"10.0.0.{service_octet}"
 
     if level == "L2":

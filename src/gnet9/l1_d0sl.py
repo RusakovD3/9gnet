@@ -32,6 +32,7 @@ class TrafficKind(str, Enum):
     BROADCAST_MP3 = "broadcast_mp3"
     FTP = "ftp"
     DNS = "dns"
+    VOICE = "voice"
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,12 @@ class D0SLSubscriberPolicy:
     monitoring_interval_seconds: int
     bitrate_drop_window_seconds: int
     slo: tuple[D0SLSlo, ...]
+    packetization_ms: int | None = None
+    rtp_clock_rate_hz: int | None = None
+    rtp_payload_type: int | None = None
+    channels: int | None = None
+    inband_fec: str | None = None
+    dtx: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -221,6 +228,12 @@ def _parse_sla_block(name: str, body: str) -> D0SLSubscriberPolicy:
         monitoring_interval_seconds=_read_int_field(scalar_body, "monitoring_interval_seconds"),
         bitrate_drop_window_seconds=_read_int_field(scalar_body, "bitrate_drop_window_seconds"),
         slo=tuple(_parse_slo_block(slo_name, slo_body) for slo_name, slo_body in slo_blocks),
+        packetization_ms=_read_optional_int_field(scalar_body, "packetization_ms"),
+        rtp_clock_rate_hz=_read_optional_int_field(scalar_body, "rtp_clock_rate_hz"),
+        rtp_payload_type=_read_optional_int_field(scalar_body, "rtp_payload_type"),
+        channels=_read_optional_int_field(scalar_body, "channels"),
+        inband_fec=_read_optional_string_field(scalar_body, "inband_fec"),
+        dtx=_read_optional_string_field(scalar_body, "dtx"),
     )
 
 
@@ -283,8 +296,25 @@ def _read_int_field(body: str, field: str) -> int:
     return _read_field(body, field, "int")
 
 
-def build_l1_queue_model(policy: D0SLSubscriberPolicy, *, packet_size_bytes: int = 1200) -> L1QueueModel:
+def _read_optional_int_field(body: str, field: str) -> int | None:
+    match = re.search(rf'\b{field}\s*:\s*([0-9]+)\s*;', body)
+    return int(match.group(1)) if match else None
+
+
+def _read_optional_string_field(body: str, field: str) -> str | None:
+    match = re.search(rf'\b{field}\s*:\s*"([^"]+)"\s*;', body)
+    return match.group(1) if match else None
+
+
+def build_l1_queue_model(policy: D0SLSubscriberPolicy, *, packet_size_bytes: int | None = None) -> L1QueueModel:
     """Build M/M/1/K/FIFO queue parameters for one subscriber flow."""
+    if packet_size_bytes is None:
+        # Opus uses one codec payload per 20 ms RTP packet (50 packets/s).
+        packet_size_bytes = (
+            max(1, round(policy.target_bitrate_kbps * float(policy.packetization_ms or 20) / 8.0))
+            if policy.traffic is TrafficKind.VOICE
+            else 1200
+        )
     bits_per_packet = packet_size_bytes * 8
     arrival_rate = max(0.1, policy.target_bitrate_kbps * 1000.0 / bits_per_packet)
 

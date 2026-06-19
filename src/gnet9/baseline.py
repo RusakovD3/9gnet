@@ -9,31 +9,32 @@ from __future__ import annotations
 
 import numpy as np
 
-from .constants import IDEAL_LOAD_FACTOR
+from .constants import BASELINE_LINK_UTILIZATION, SERVICE_DEMAND_PRESSURE
 from .l1_d0sl import D0SLSubscriberPolicy, SlaGrade, TrafficKind
 from .models import ServiceProfile
 
 
 # Stable numeric category codes used by tensor vectors.
-SERVICE_CODES = {"Voice": 1.0, "Video": 2.0, "FTP": 3.0, "Telemetry": 4.0}
+SERVICE_CODES = {"Voice": 1.0, "Audio": 2.0, "FTP": 3.0, "DNS": 4.0}
 TRAFFIC_TO_SERVICE_CODE = {
-    TrafficKind.BROADCAST_MP3: SERVICE_CODES["Video"],
+    TrafficKind.VOICE: SERVICE_CODES["Voice"],
+    TrafficKind.BROADCAST_MP3: SERVICE_CODES["Audio"],
     TrafficKind.FTP: SERVICE_CODES["FTP"],
-    TrafficKind.DNS: SERVICE_CODES["Telemetry"],
+    TrafficKind.DNS: SERVICE_CODES["DNS"],
 }
 ACCESS_TYPE_CODES = {"fixed": 0.0, "mobile": 1.0}
 PLACEMENT_ROLE_CODES = {
     "terrain-anchor": 0.0,
     "mobile-subscriber": 1.0,
     "fixed-subscriber": 2.0,
-    "aggregation-router": 3.0,
+    "aggregation-switch": 3.0,
     "core-router": 4.0,
     "arbitrator": 7.0,
 }
 
 
 # L0 tensors are service intent: requested traffic and quality target.
-SERVICE_HEALTH = 0.97
+SERVICE_HEALTH = 0.99
 SERVICE_PRIORITY_CODES = {"gold": 1.0, "silver": 0.6, "bronze": 0.3}
 
 
@@ -85,36 +86,38 @@ L1_ACCESS_GRADE_BASELINE = {
 }
 
 L1_PROCESSING_DELAY_MS = {
+    ("mobile", TrafficKind.VOICE): 18.0,
     ("mobile", TrafficKind.BROADCAST_MP3): 24.0,
     ("mobile", TrafficKind.FTP): 55.0,
     ("mobile", TrafficKind.DNS): 12.0,
     ("fixed", TrafficKind.BROADCAST_MP3): 10.0,
     ("fixed", TrafficKind.FTP): 22.0,
     ("fixed", TrafficKind.DNS): 3.0,
+    ("fixed", TrafficKind.VOICE): 7.0,
 }
 
 
 # L2 tensors are explicit healthy operating points for active equipment.
 L2_EQUIPMENT_BASELINE = {
     "core-router": {
-        "ram_used_gb": 12.8,
-        "ram_load_percent": 40.0,
-        "cpu_load_percent": 24.0,
+        "ram_used_gb": 11.2,
+        "ram_load_percent": 35.0,
+        "cpu_load_percent": 16.0,
         "traffic_distribution_code": 0.72,
         "capex_opex_cost": 0.90,
         "stability_margin": 0.70,
     },
-    "aggregation-router": {
-        "ram_used_gb": 5.44,
-        "ram_load_percent": 34.0,
-        "cpu_load_percent": 18.0,
+    "aggregation-switch": {
+        "ram_used_gb": 4.8,
+        "ram_load_percent": 30.0,
+        "cpu_load_percent": 12.0,
         "traffic_distribution_code": 0.58,
         "capex_opex_cost": 0.64,
         "stability_margin": 0.78,
     },
 }
 
-L2_GOLD_CPU_LOAD_PERCENT = 26.0
+L2_GOLD_CPU_LOAD_PERCENT = 16.8
 
 
 # L3/L4/EDGE values combine explicit medium assumptions with link geometry.
@@ -182,7 +185,7 @@ L5_BY_ROLE = {
         "percolation_threshold": 0.72,
         "reconfiguration_time_s": 12.0,
     },
-    "aggregation-router": {
+    "aggregation-switch": {
         "protocol_code": 2.0,
         "socket_binding_present": 1.0,
         "routing_mode_code": 1.0,
@@ -200,7 +203,7 @@ L6_BY_ROLE = {
         "energy_reserve_ratio": 0.85,
         "capex_opex_cost": 0.92,
     },
-    "aggregation-router": {
+    "aggregation-switch": {
         "power_supply_code": 2.0,
         "nominal_power_kw": 0.45,
         "backup_autonomy_hours": 2.0,
@@ -245,7 +248,7 @@ def l0_service_tensor(profile: ServiceProfile) -> dict[str, float]:
         "jitter_budget_ms": profile.jitter_ms_max,
         "availability_target": profile.availability_target,
         "priority_code": SERVICE_PRIORITY_CODES[profile.priority],
-        "demand_pressure": IDEAL_LOAD_FACTOR,
+        "demand_pressure": SERVICE_DEMAND_PRESSURE,
         "service_health": SERVICE_HEALTH,
     }
 
@@ -322,7 +325,7 @@ def l4_infrastructure_tensor(
 
 
 def l5_role_tensor(role: str) -> dict[str, float]:
-    return L5_BY_ROLE["core-router" if role == "core-router" else "aggregation-router"]
+    return L5_BY_ROLE["core-router" if role == "core-router" else "aggregation-switch"]
 
 
 def l6_power_tensor(role: str) -> dict[str, float]:
@@ -346,13 +349,14 @@ def l8_placement_tensor(pos: tuple[float, float], role: str) -> dict[str, float]
 
 def edge_transport_tensor(medium: str, capacity_mbps: float, latency_ms: float, redundancy: float) -> dict[str, float]:
     baseline = MEDIUM_BASELINE[medium]
+    utilization = BASELINE_LINK_UTILIZATION[medium]
     return {
         "capacity_mbps": capacity_mbps,
         "latency_ms": latency_ms,
         "loss_probability": baseline["loss_probability"],
         "redundancy": redundancy,
-        "utilization": IDEAL_LOAD_FACTOR,
-        "stability_margin": 1.0 - IDEAL_LOAD_FACTOR,
+        "utilization": utilization,
+        "stability_margin": 1.0 - utilization,
         "attack_exposure": baseline["attack_exposure"],
     }
 

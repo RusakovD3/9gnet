@@ -22,15 +22,15 @@ class ServiceTemplate:
 
 # Human-readable names of the 9 G-Net layers.
 LEVEL_NAMES = {
-    "L0": "Services",
-    "L1": "Subscribers",
-    "L2": "Active equipment",
-    "L3": "Medium",
-    "L4": "Linear infrastructure",
-    "L5": "Core / slicing",
-    "L6": "Infrastructure / power",
-    "L7": "Arbitrator",
-    "L8": "Topo-base",
+    "L0": "Сервисы",
+    "L1": "Абоненты",
+    "L2": "Активное оборудование",
+    "L3": "Среда передачи",
+    "L4": "Линейная инфраструктура",
+    "L5": "Ядро и срезы",
+    "L6": "Инфраструктура и питание",
+    "L7": "Арбитратор",
+    "L8": "Топооснова",
 }
 
 # Colors are used only by the visualizer. They do not affect calculations.
@@ -52,13 +52,23 @@ CRITICALITY_COLORS = {
     "bronze": "#90be6d",
 }
 
-# L0 service baseline: normal t0 state, no attack and no overload.
+# L0 service catalogue.  Bitrate is a representative planning demand for the
+# service class, not a codec/chassis limit and not the sum of all L1 flows.
 DEFAULT_SERVICES = (
-    ServiceTemplate("Voice", 0.128, 50.0, 10.0, 0.9995, "gold"),
-    ServiceTemplate("Video", 8.0, 80.0, 20.0, 0.9990, "gold"),
-    ServiceTemplate("FTP", 25.0, 300.0, 100.0, 0.9950, "silver"),
-    ServiceTemplate("Telemetry", 0.256, 30.0, 5.0, 0.9999, "gold"),
+    ServiceTemplate("Voice", 0.032, 80.0, 20.0, 0.9995, "gold"),
+    ServiceTemplate("Audio", 0.320, 80.0, 20.0, 0.9990, "gold"),
+    ServiceTemplate("FTP", 4.096, 300.0, 120.0, 0.9950, "silver"),
+    ServiceTemplate("DNS", 0.064, 30.0, 10.0, 0.9999, "gold"),
 )
+
+# Localized names are used only in human-facing reports and visualizations.
+# Stable English service identifiers remain unchanged in JSON and code.
+SERVICE_DISPLAY_NAMES = {
+    "Voice": "Голос",
+    "Audio": "Аудио",
+    "FTP": "FTP",
+    "DNS": "DNS",
+}
 
 # L1 subscriber generation settings.
 MOBILE_SUBSCRIBERS_PER_AGG = 40
@@ -66,13 +76,21 @@ FIXED_SUBSCRIBERS_PER_AGG = 40
 AGGREGATION_MOBILE = ("A1", "A3", "A5")
 AGGREGATION_FIXED = ("A2", "A4", "A6")
 
-# L2 active equipment: 12 core routers + 6 aggregation routers.
+# L2 active equipment: 12 core routers + 6 aggregation switches.
 AGGREGATION_COUNT = 6
 CORE_COUNT = 12
 L2_NODE_COUNT = CORE_COUNT + AGGREGATION_COUNT
 
-# Baseline normalization constants.
-IDEAL_LOAD_FACTOR = 0.55
+# Реалистичная плановая нагрузка идеального t0. Значения не подменяют
+# фактическую пакетную загрузку, которая отдельно рассчитывается по потокам.
+SERVICE_DEMAND_PRESSURE = 0.20
+BASELINE_LINK_UTILIZATION = {
+    "logical-service-binding": 0.08,
+    "fiber": 0.06,
+    "ethernet": 0.08,
+    "radio": 0.12,
+    "radio-backhaul": 0.08,
+}
 
 # Monitoring length used for L1 synthetic observations.
 L1_MONITORING_SECONDS = 30
@@ -81,4 +99,4 @@ L1_MONITORING_SECONDS = 30
 # t0; with include_t0=True the exported trajectory has DYNAMICS_STEPS + 1
 # snapshots.
 DYNAMICS_STEP_SECONDS = 5
-DYNAMICS_STEPS = 6
+DYNAMICS_STEPS = 10

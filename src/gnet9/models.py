@@ -10,6 +10,8 @@ from typing import Any
 import networkx as nx
 import numpy as np
 
+from .constants import SERVICE_DISPLAY_NAMES
+
 
 @dataclass
 class StateTensor:
@@ -142,36 +144,45 @@ class NetworkModel:
 
     def export_summary(self, path: Path) -> None:
         lines = [
-            "Baseline G-Net 9-level topology summary",
+            "Сводка эталонной девятиуровневой топологии G-Net",
             "=" * 40,
             "",
-            "Levels:",
+            "Уровни:",
         ]
         for level, count in sorted(self.level_summary.items()):
             lines.append(f"  {level}: {count}")
 
-        lines.extend(["", "Services:"])
+        lines.extend(["", "Сервисы:"])
         for service in self.services:
+            display_name = SERVICE_DISPLAY_NAMES.get(service.name, service.name)
             lines.append(
-                f"  - {service.name}: {service.bitrate_mbps} Mbps, "
-                f"latency <= {service.latency_ms_max} ms, "
-                f"availability {service.availability_target:.4f}"
+                f"  - {display_name}: {service.bitrate_mbps} Мбит/с, "
+                f"задержка <= {service.latency_ms_max} мс, "
+                f"доступность {service.availability_target:.4f}"
             )
 
-        lines.extend(["", "Slices:"])
+        slice_names = {
+            "GoldBackbone": "Золотой магистральный",
+            "SilverEnterprise": "Серебряный корпоративный",
+            "BronzeBestEffort": "Бронзовый без гарантий",
+        }
+        priority_names = {"gold": "золотой", "silver": "серебряный", "bronze": "бронзовый"}
+        lines.extend(["", "Сетевые срезы:"])
         for slice_profile in self.slices:
+            slice_name = slice_names.get(slice_profile.name, slice_profile.name)
+            priority = priority_names.get(slice_profile.priority, slice_profile.priority)
             lines.append(
-                f"  - {slice_profile.name}: priority={slice_profile.priority}, "
-                f"nodes={len(slice_profile.node_ids)}, reserve={slice_profile.capacity_reserve_ratio:.2f}"
+                f"  - {slice_name}: приоритет={priority}, "
+                f"узлов={len(slice_profile.node_ids)}, резерв={slice_profile.capacity_reserve_ratio:.2f}"
             )
 
         lines.extend(
             [
                 "",
-                f"Total graph nodes: {self.graph.number_of_nodes()}",
-                f"Total graph edges: {self.graph.number_of_edges()}",
+                f"Всего узлов графа: {self.graph.number_of_nodes()}",
+                f"Всего связей графа: {self.graph.number_of_edges()}",
                 "",
-                "Notes:",
+                "Примечания:",
             ]
         )
         lines.extend(f"  - {note}" for note in self.notes)

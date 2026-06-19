@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle, FancyArrowPatch, FancyBboxPatch
 import numpy as np
 
-from .constants import LEVEL_COLORS
+from .constants import LEVEL_COLORS, SERVICE_DISPLAY_NAMES
 
 # Visualization constants
 MEDIUM_COLORS = {
@@ -243,13 +243,13 @@ class GNetVisualizer:
         ax.text(3.55, 12.58, "L8 топооснова", fontsize=10.4, fontweight="bold", color="#606060")
 
         topo_labels = {
-            "TERRAIN_NW": "NW",
-            "TERRAIN_NE": "NE",
-            "TERRAIN_W": "W",
-            "TERRAIN_C": "C",
-            "TERRAIN_E": "E",
-            "TERRAIN_SW": "SW",
-            "TERRAIN_SE": "SE",
+            "TERRAIN_NW": "СЗ",
+            "TERRAIN_NE": "СВ",
+            "TERRAIN_W": "З",
+            "TERRAIN_C": "Ц",
+            "TERRAIN_E": "В",
+            "TERRAIN_SW": "ЮЗ",
+            "TERRAIN_SE": "ЮВ",
         }
         for node_id, text in topo_labels.items():
             x0, y0 = pos[node_id]
@@ -279,9 +279,9 @@ class GNetVisualizer:
 
     def _draw_logic_l5_rings(self, ax) -> None:
         rings = [
-            (7.3, 8.1, 2.55, "RING A / L5", "#f4a261"),
-            (11.0, 8.1, 2.55, "RING B / L5", "#e9c46a"),
-            (14.7, 8.1, 2.55, "RING C / L5", "#8ecae6"),
+            (7.3, 8.1, 2.55, "КОЛЬЦО A / L5", "#f4a261"),
+            (11.0, 8.1, 2.55, "КОЛЬЦО B / L5", "#e9c46a"),
+            (14.7, 8.1, 2.55, "КОЛЬЦО C / L5", "#8ecae6"),
         ]
         for x, y, radius, text, color in rings:
             circle = Circle(
@@ -345,18 +345,18 @@ class GNetVisualizer:
             x, y = pos[node_id]
             level = attrs["level"]
             if level == "L1":
-                label = "M" if attrs["role"] == "mobile-subscriber" else "PC"
+                label = "М" if attrs["role"] == "mobile-subscriber" else "Ф"
                 fontsize = FONTSIZE_CONFIGS["label_l1"]
             else:
-                label = attrs["label"]
+                label = SERVICE_DISPLAY_NAMES.get(attrs["label"], attrs["label"])
                 fontsize = FONTSIZE_CONFIGS["label_default"]
             ax.text(x, y, label, ha="center", va="center", fontsize=fontsize, fontweight="bold", zorder=6)
 
         area_badges = [
             (6.95, 12.05, "L0 сервисы", "#d8f3dc"),
-            (10.8, 7.05, "L2 активка", "#a9def9"),
-            (5.10, 3.05, "L1 mobile → A1/A3/A5", "#b7e4c7"),
-            (13.40, 3.05, "L1 fixed → A2/A4/A6", "#b7e4c7"),
+            (10.8, 7.05, "L2 активное оборудование", "#a9def9"),
+            (5.10, 3.05, "L1 мобильные → A1/A3/A5", "#b7e4c7"),
+            (13.40, 3.05, "L1 фиксированные → A2/A4/A6", "#b7e4c7"),
         ]
         for x, y, text, color in area_badges:
             ax.text(
