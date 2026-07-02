@@ -4,7 +4,7 @@
 SLA "L1_GOLD_BROADCAST_MP3" {
     grade: "gold";
     traffic: "broadcast_mp3";
-    codec: "MP3/VLC";
+    codec: "Legacy VLC / MP3 audio over RTP/UDP";
     target_bitrate_kbps: 320;
     min_bitrate_kbps: 320;
     latency_budget_ms: 80;
@@ -50,14 +50,101 @@ SLA "L1_GOLD_BROADCAST_MP3" {
     }
 }
 
+// VLC is the delivery platform, not a codec. The requested 320/128/64 kbit/s
+// values describe the Opus audio component. H.264 video is budgeted separately.
+SLA "L1_GOLD_VLC_AV" {
+    grade: "gold"; traffic: "vlc_av"; codec: "VLC / Opus + H.264/AVC over RTP/UDP";
+    audio_bitrate_kbps: 320; video_bitrate_kbps: 4000;
+    target_bitrate_kbps: 4320; min_bitrate_kbps: 3500;
+    latency_budget_ms: 150; packet_loss_budget_percent: 0.5; jitter_budget_ms: 30;
+    monitoring_interval_seconds: 1; bitrate_drop_window_seconds: 10;
+    SLO "Latency" { metric: "latency_ms"; statistic: "p95"; operator: LTE; value: 150; unit: "ms"; window_seconds: 10; }
+}
+
+SLA "L1_SILVER_VLC_AV" {
+    grade: "silver"; traffic: "vlc_av"; codec: "VLC / Opus + H.264/AVC over RTP/UDP";
+    audio_bitrate_kbps: 128; video_bitrate_kbps: 2000;
+    target_bitrate_kbps: 2128; min_bitrate_kbps: 1600;
+    latency_budget_ms: 250; packet_loss_budget_percent: 1.0; jitter_budget_ms: 50;
+    monitoring_interval_seconds: 1; bitrate_drop_window_seconds: 10;
+    SLO "Latency" { metric: "latency_ms"; statistic: "p95"; operator: LTE; value: 250; unit: "ms"; window_seconds: 10; }
+}
+
+SLA "L1_BRONZE_VLC_AV" {
+    grade: "bronze"; traffic: "vlc_av"; codec: "VLC / Opus + H.264/AVC over RTP/UDP";
+    audio_bitrate_kbps: 64; video_bitrate_kbps: 1000;
+    target_bitrate_kbps: 1064; min_bitrate_kbps: 700;
+    latency_budget_ms: 400; packet_loss_budget_percent: 2.0; jitter_budget_ms: 80;
+    monitoring_interval_seconds: 1; bitrate_drop_window_seconds: 10;
+    SLO "Latency" { metric: "latency_ms"; statistic: "p95"; operator: LTE; value: 400; unit: "ms"; window_seconds: 10; }
+}
+
+// Interactive conference profile. Video and audio have separate budgets;
+// latency_budget_ms is the stricter video value used by generic L1 monitoring.
+SLA "L1_GOLD_VIDEO_CONFERENCE" {
+    grade: "gold"; traffic: "video_conference"; codec: "WebRTC-compatible / Opus + H.264/AVC";
+    target_bitrate_kbps: 4096; min_bitrate_kbps: 3000;
+    latency_budget_ms: 70; video_latency_budget_ms: 70; audio_latency_budget_ms: 150; failure_latency_ms: 600;
+    packet_loss_budget_percent: 0.3; jitter_budget_ms: 20;
+    monitoring_interval_seconds: 1; bitrate_drop_window_seconds: 10;
+    SLO "VideoLatency" { metric: "latency_ms"; statistic: "p95"; operator: LTE; value: 70; unit: "ms"; window_seconds: 10; }
+}
+
+SLA "L1_SILVER_VIDEO_CONFERENCE" {
+    grade: "silver"; traffic: "video_conference"; codec: "WebRTC-compatible / Opus + H.264/AVC";
+    target_bitrate_kbps: 2048; min_bitrate_kbps: 1500;
+    latency_budget_ms: 150; video_latency_budget_ms: 150; audio_latency_budget_ms: 300; failure_latency_ms: 600;
+    packet_loss_budget_percent: 1.0; jitter_budget_ms: 30;
+    monitoring_interval_seconds: 1; bitrate_drop_window_seconds: 10;
+    SLO "VideoLatency" { metric: "latency_ms"; statistic: "p95"; operator: LTE; value: 150; unit: "ms"; window_seconds: 10; }
+}
+
+SLA "L1_BRONZE_VIDEO_CONFERENCE" {
+    grade: "bronze"; traffic: "video_conference"; codec: "WebRTC-compatible / Opus + H.264/AVC";
+    target_bitrate_kbps: 1024; min_bitrate_kbps: 700;
+    latency_budget_ms: 250; video_latency_budget_ms: 250; audio_latency_budget_ms: 400; failure_latency_ms: 600;
+    packet_loss_budget_percent: 2.0; jitter_budget_ms: 50;
+    monitoring_interval_seconds: 1; bitrate_drop_window_seconds: 10;
+    SLO "VideoLatency" { metric: "latency_ms"; statistic: "p95"; operator: LTE; value: 250; unit: "ms"; window_seconds: 10; }
+}
+
+// Low-latency live streaming is classified in seconds, not milliseconds.
+SLA "L1_GOLD_LIVE_STREAMING" {
+    grade: "gold"; traffic: "live_streaming"; codec: "Low-Latency HLS / AAC-LC + H.264/AVC";
+    target_bitrate_kbps: 6000; min_bitrate_kbps: 4500;
+    latency_budget_ms: 2000; failure_latency_ms: 10000;
+    packet_loss_budget_percent: 0.5; jitter_budget_ms: 250;
+    monitoring_interval_seconds: 1; bitrate_drop_window_seconds: 10;
+    SLO "GlassToGlassLatency" { metric: "latency_ms"; statistic: "p95"; operator: LTE; value: 2000; unit: "ms"; window_seconds: 10; }
+}
+
+SLA "L1_SILVER_LIVE_STREAMING" {
+    grade: "silver"; traffic: "live_streaming"; codec: "Low-Latency HLS / AAC-LC + H.264/AVC";
+    target_bitrate_kbps: 3500; min_bitrate_kbps: 2500;
+    latency_budget_ms: 3000; failure_latency_ms: 10000;
+    packet_loss_budget_percent: 1.0; jitter_budget_ms: 400;
+    monitoring_interval_seconds: 1; bitrate_drop_window_seconds: 10;
+    SLO "GlassToGlassLatency" { metric: "latency_ms"; statistic: "p95"; operator: LTE; value: 3000; unit: "ms"; window_seconds: 10; }
+}
+
+SLA "L1_BRONZE_LIVE_STREAMING" {
+    grade: "bronze"; traffic: "live_streaming"; codec: "Low-Latency HLS / AAC-LC + H.264/AVC";
+    target_bitrate_kbps: 2000; min_bitrate_kbps: 1200;
+    latency_budget_ms: 5000; failure_latency_ms: 10000;
+    packet_loss_budget_percent: 2.0; jitter_budget_ms: 700;
+    monitoring_interval_seconds: 1; bitrate_drop_window_seconds: 10;
+    SLO "GlassToGlassLatency" { metric: "latency_ms"; statistic: "p95"; operator: LTE; value: 5000; unit: "ms"; window_seconds: 10; }
+}
+
 SLA "L1_GOLD_FTP" {
     grade: "gold";
     traffic: "ftp";
-    codec: "TCP/IP";
+    codec: "FTP over TCP/IP / binary/octet-stream";
     target_bitrate_kbps: 4096;
     min_bitrate_kbps: 3072;
     latency_budget_ms: 300;
     packet_loss_budget_percent: 0.5;
+    tcp_retransmission_budget_percent: 0.1;
     jitter_budget_ms: 120;
     monitoring_interval_seconds: 1;
     bitrate_drop_window_seconds: 10;
@@ -102,7 +189,7 @@ SLA "L1_GOLD_FTP" {
 SLA "L1_GOLD_DNS" {
     grade: "gold";
     traffic: "dns";
-    codec: "UDP/TCP DNS";
+    codec: "DNS wire format over UDP with TCP fallback";
     target_bitrate_kbps: 64;
     min_bitrate_kbps: 32;
     latency_budget_ms: 30;
@@ -151,7 +238,7 @@ SLA "L1_GOLD_DNS" {
 SLA "L1_SILVER_BROADCAST_MP3" {
     grade: "silver";
     traffic: "broadcast_mp3";
-    codec: "MP3/VLC";
+    codec: "Legacy VLC / MP3 audio over RTP/UDP";
     target_bitrate_kbps: 192;
     min_bitrate_kbps: 160;
     latency_budget_ms: 120;
@@ -200,11 +287,12 @@ SLA "L1_SILVER_BROADCAST_MP3" {
 SLA "L1_SILVER_FTP" {
     grade: "silver";
     traffic: "ftp";
-    codec: "TCP/IP";
+    codec: "FTP over TCP/IP / binary/octet-stream";
     target_bitrate_kbps: 2048;
     min_bitrate_kbps: 1536;
     latency_budget_ms: 500;
     packet_loss_budget_percent: 1.0;
+    tcp_retransmission_budget_percent: 0.5;
     jitter_budget_ms: 180;
     monitoring_interval_seconds: 1;
     bitrate_drop_window_seconds: 10;
@@ -249,7 +337,7 @@ SLA "L1_SILVER_FTP" {
 SLA "L1_SILVER_DNS" {
     grade: "silver";
     traffic: "dns";
-    codec: "UDP/TCP DNS";
+    codec: "DNS wire format over UDP with TCP fallback";
     target_bitrate_kbps: 32;
     min_bitrate_kbps: 16;
     latency_budget_ms: 50;
@@ -298,7 +386,7 @@ SLA "L1_SILVER_DNS" {
 SLA "L1_BRONZE_BROADCAST_MP3" {
     grade: "bronze";
     traffic: "broadcast_mp3";
-    codec: "MP3/VLC";
+    codec: "Legacy VLC / MP3 audio over RTP/UDP";
     target_bitrate_kbps: 96;
     min_bitrate_kbps: 64;
     latency_budget_ms: 180;
@@ -347,11 +435,12 @@ SLA "L1_BRONZE_BROADCAST_MP3" {
 SLA "L1_BRONZE_FTP" {
     grade: "bronze";
     traffic: "ftp";
-    codec: "TCP/IP";
+    codec: "FTP over TCP/IP / binary/octet-stream";
     target_bitrate_kbps: 512;
     min_bitrate_kbps: 384;
     latency_budget_ms: 800;
     packet_loss_budget_percent: 1.5;
+    tcp_retransmission_budget_percent: 1.0;
     jitter_budget_ms: 250;
     monitoring_interval_seconds: 1;
     bitrate_drop_window_seconds: 10;
@@ -396,7 +485,7 @@ SLA "L1_BRONZE_FTP" {
 SLA "L1_BRONZE_DNS" {
     grade: "bronze";
     traffic: "dns";
-    codec: "UDP/TCP DNS";
+    codec: "DNS wire format over UDP with TCP fallback";
     target_bitrate_kbps: 16;
     min_bitrate_kbps: 8;
     latency_budget_ms: 80;

@@ -18,26 +18,45 @@ from .constants import SERVICE_DISPLAY_NAMES
 
 FLOW_COLORS = {
     "RTP_OPUS": "#ef4444",
-    "RTP_MP3": "#f97316",
+    "RTP_VLC_AV": "#f97316",
     "FTP_DATA": "#3b82f6",
     "DNS": "#a855f7",
+    "RTP_TELEMOST": "#14b8a6",
+    "LIVE_HLS": "#eab308",
+    "ATTACK_DOS": "#ff1744",
+    "ATTACK_DDOS": "#b91c1c",
+    "ATTACK_SYN": "#f43f5e",
 }
 FLOW_LABELS = {
     "RTP_OPUS": "Голос · Opus по RTP/UDP",
-    "RTP_MP3": "Аудио · MP3 по RTP/UDP",
+    "RTP_VLC_AV": "VLC · голос и видео по RTP/UDP",
     "FTP_DATA": "Файлы · FTP по TCP",
     "DNS": "DNS · запросы имён по UDP",
+    "RTP_TELEMOST": "Видеоконференция · RTP/UDP",
+    "LIVE_HLS": "Прямая трансляция · LL-HLS/TCP",
+    "ATTACK_DOS": "АТАКА · DoS / прямой flood",
+    "ATTACK_DDOS": "АТАКА · DDoS / отражённое усиление",
+    "ATTACK_SYN": "АТАКА · SYN flood",
 }
 FLOW_SHORT_LABELS = {
     "RTP_OPUS": "Голос · Opus/RTP",
-    "RTP_MP3": "Аудио · MP3/RTP",
+    "RTP_VLC_AV": "VLC · аудио/видео",
     "FTP_DATA": "Файлы · FTP/TCP",
     "DNS": "DNS · запросы/UDP",
+    "RTP_TELEMOST": "Видеоконференция",
+    "LIVE_HLS": "Прямая трансляция",
+    "ATTACK_DOS": "АТАКА · DoS",
+    "ATTACK_DDOS": "АТАКА · DDoS",
+    "ATTACK_SYN": "АТАКА · SYN flood",
 }
-TRAFFIC_LABELS = {"voice": "голос", "broadcast_mp3": "аудиовещание MP3", "ftp": "передача файлов FTP", "dns": "запросы DNS"}
+TRAFFIC_LABELS = {
+    "voice": "голос", "broadcast_mp3": "аудиовещание MP3", "vlc_av": "VLC: голос и видео",
+    "ftp": "передача файлов FTP", "dns": "запросы DNS",
+    "video_conference": "видеоконференция", "live_streaming": "прямая трансляция",
+}
 SLA_LABELS = {"gold": "золотой", "silver": "серебряный", "bronze": "бронзовый"}
 LEVEL_COLORS = {"L0": "#10b981", "L2": "#60a5fa", "L7": "#fb923c", "L8": "#94a3b8"}
-NODE_SIZES = {"L0": 150, "L2": 55, "L7": 95, "L8": 28}
+NODE_SIZES = {"L0": 175, "L2": 64, "L7": 105, "L8": 28}
 SUBSCRIBER_STYLES = {
     "mobile-subscriber": {"color": "#22d3ee", "marker": "o", "label": "Мобильные абоненты (М)"},
     "fixed-subscriber": {"color": "#fbbf24", "marker": "s", "label": "Фиксированные абоненты (Ф)"},
@@ -66,7 +85,7 @@ def _positions(model) -> dict[str, tuple[float, float]]:
         center_x, access_y = positions[access_node]
         for index, node_id in enumerate(sorted(node_ids)):
             row, column = divmod(index, 8)
-            positions[node_id] = (center_x + (column - 3.5) * 0.38, access_y - 1.42 - row * 0.58)
+            positions[node_id] = (center_x + (column - 3.5) * 0.42, access_y - 1.42 - row * 0.62)
     return positions
 
 
@@ -89,17 +108,18 @@ def draw_service_flow_map(model, flows: list[dict[str, Any]], path: Path) -> Non
     pos = _positions(model)
     loads = aggregate_flow_edges(flows)
     max_bytes = max((item["wire_bytes"] for item in loads.values()), default=1)
-    fig, ax = plt.subplots(figsize=(24, 14))
+    fig, ax = plt.subplots(figsize=(32, 15))
+    fig.subplots_adjust(bottom=0.055, left=0.014, right=0.755, top=0.94)
     _style_axes(ax, "G-Net: сервисные потоки и загрузка связей")
     _draw_access_zones(ax, model, pos)
     _draw_topology(ax, model, pos, loads=loads, max_bytes=max_bytes)
     _draw_labels(ax, model, pos)
-    _draw_legend(ax)
+    _set_topology_view(ax, pos)
+    _draw_legend(ax, static=True)
     ax.text(
-        0.012, 0.018, _flow_summary(flows), transform=ax.transAxes, fontsize=10, color="#e9ecef",
+        1.018, 0.98, _flow_summary(flows), transform=ax.transAxes, va="top", fontsize=9.8, color="#e9ecef",
         bbox={"boxstyle": "round,pad=0.5", "fc": "#212529", "ec": "#6c757d", "alpha": 0.92},
     )
-    fig.tight_layout()
     fig.savefig(path, dpi=220, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
 
@@ -127,12 +147,13 @@ class ServiceFlowWindow:
             (item["wire_bytes"] for loads in self.edge_loads for item in loads.values()), default=1
         )
 
-        self.fig, self.ax = plt.subplots(figsize=(21, 12))
-        self.fig.subplots_adjust(bottom=0.145, right=0.80, left=0.025, top=0.94)
+        self.fig, self.ax = plt.subplots(figsize=(22, 13))
+        self.fig.subplots_adjust(bottom=0.20, right=0.765, left=0.018, top=0.94)
         _style_axes(self.ax, "G-Net: сервисные потоки по шагам динамики")
         _draw_access_zones(self.ax, model, self.pos)
         _draw_topology(self.ax, model, self.pos)
         _draw_labels(self.ax, model, self.pos)
+        _set_topology_view(self.ax, self.pos)
         _draw_legend(self.ax)
 
         self.edge_artists: dict[frozenset[str], Any] = {}
@@ -144,17 +165,21 @@ class ServiceFlowWindow:
 
         self.particle_glow = self.ax.scatter([], [], s=[], c=[], alpha=0.18, linewidths=0, zorder=7)
         self.particles = self.ax.scatter([], [], s=[], c=[], edgecolors="white", linewidths=0.45, zorder=8)
+        self.attack_targets = self.ax.scatter(
+            [], [], s=[], facecolors="none", edgecolors="#ff1744", linewidths=2.8, alpha=0.95, zorder=15
+        )
         panel_style = {"boxstyle": "round,pad=0.55", "fc": "#172033", "ec": "#475569", "alpha": 0.96}
         self.status = self.ax.text(
-            1.025, 0.98, "", transform=self.ax.transAxes, va="top", fontsize=9.1,
+            1.018, 0.98, "", transform=self.ax.transAxes, va="top", fontsize=9.0,
             color="#f8fafc", linespacing=1.25, bbox=panel_style,
         )
         self.help_text = self.ax.text(
-            1.025, 0.40,
+            1.018, 0.39,
             "КАК ЧИТАТЬ СХЕМУ\n\n"
             "C — маршрутизатор ядра\n"
             "A — агрегирующий коммутатор\n"
             "Зелёный узел — сервис L0\n"
+            "Фиолетовый ромб — физический сервер\n"
             "АРБ — арбитратор уровня L7\n\n"
             "Opus/RTP — голос по UDP\n"
             "MP3/RTP — аудиопоток по UDP\n\n"
@@ -182,7 +207,7 @@ class ServiceFlowWindow:
         ]
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_hover)
 
-        slider_ax = self.fig.add_axes([0.15, 0.045, 0.49, 0.028])
+        slider_ax = self.fig.add_axes([0.14, 0.048, 0.49, 0.027])
         self.slider = Slider(
             slider_ax, "Шаг динамики · ПАУЗА", 0, len(usable) - 1, valinit=0, valstep=1,
             valfmt="%d", color="#38bdf8", initcolor="none"
@@ -196,7 +221,7 @@ class ServiceFlowWindow:
         slider_ax.tick_params(axis="x", length=2, pad=3, colors="#cbd5e1")
         self.slider.on_changed(self._select_step)
         self.slider.track.set_facecolor("#334155")
-        button_ax = self.fig.add_axes([0.675, 0.032, 0.115, 0.055])
+        button_ax = self.fig.add_axes([0.675, 0.030, 0.115, 0.055])
         self.button = Button(button_ax, "▶  Продолжить", color="#2563eb", hovercolor="#3b82f6")
         self.button.label.set_color("#f8fafc")
         self.button.label.set_fontweight("bold")
@@ -324,23 +349,52 @@ class ServiceFlowWindow:
                 continue
             points.append(point)
             colors.append(FLOW_COLORS.get(flow.get("application"), "#ffbe0b"))
-            sizes.append(23.0 if flow.get("transport") == "TCP" else 17.0)
+            sizes.append(46.0 if flow.get("is_attack_traffic") else 23.0 if flow.get("transport") == "TCP" else 17.0)
         self.particles.set_offsets(np.asarray(points) if points else np.empty((0, 2)))
         self.particles.set_color(colors)
         self.particles.set_sizes(sizes)
         self.particle_glow.set_offsets(np.asarray(points) if points else np.empty((0, 2)))
         self.particle_glow.set_color(colors)
         self.particle_glow.set_sizes([size * 3.0 for size in sizes])
+        target_nodes = [
+            event.get("target_id") for event in snapshot.get("attacks", {}).get("events", [])
+            if event.get("target_id") in self.pos
+        ]
+        self.attack_targets.set_offsets(
+            np.asarray([self.pos[node] for node in target_nodes]) if target_nodes else np.empty((0, 2))
+        )
+        self.attack_targets.set_sizes([360.0 + 35.0 * np.sin(self.frame_in_step / 4.0) for _ in target_nodes])
         self.status.set_text(_snapshot_summary(snapshot, flows, loads, self.paused, self.model))
-        return (self.particle_glow, self.particles, self.status, *self.edge_artists.values())
+        return (self.particle_glow, self.particles, self.attack_targets, self.status, *self.edge_artists.values())
 
 
 def show_service_flow_window(model, snapshots: list[dict[str, Any]]) -> None:
-    _ensure_interactive_backend()
-    ServiceFlowWindow(model, snapshots).show()
+    create_service_flow_window(model, snapshots).show()
 
 
-def _ensure_interactive_backend() -> None:
+def create_service_flow_window(model, snapshots: list[dict[str, Any]]) -> ServiceFlowWindow:
+    """Создать окно без запуска блокирующего цикла Matplotlib.
+
+    Это позволяет сначала создать окно сети и окно диагностики, а затем показать
+    их одновременно одним общим циклом обработки событий.
+    """
+    ensure_interactive_backend()
+    return ServiceFlowWindow(model, snapshots)
+
+
+def show_visualization_windows(*windows: Any) -> None:
+    """Показать одно или несколько заранее созданных окон одновременно."""
+    for window in windows:
+        manager = getattr(getattr(window, "fig", None), "canvas", None)
+        manager = getattr(manager, "manager", None)
+        try:
+            manager.window.state("zoomed")
+        except (AttributeError, RuntimeError):
+            pass
+    plt.show()
+
+
+def ensure_interactive_backend() -> None:
     if plt.get_backend().lower() != "agg":
         return
     try:
@@ -350,6 +404,10 @@ def _ensure_interactive_backend() -> None:
             "Не удалось открыть окно: Matplotlib использует неинтерактивный режим Agg, а Tkinter недоступен. "
             "Установите Python с компонентом Tcl/Tk или выберите интерактивный режим Matplotlib."
         ) from exc
+
+
+# Обратная совместимость для внутренних вызовов предыдущих версий проекта.
+_ensure_interactive_backend = ensure_interactive_backend
 
 
 def _draw_topology(ax, model, pos, *, loads=None, max_bytes: int = 1) -> None:
@@ -369,7 +427,7 @@ def _draw_topology(ax, model, pos, *, loads=None, max_bytes: int = 1) -> None:
     levels: dict[str, list[str]] = {}
     for node_id, attrs in model.graph.nodes(data=True):
         level = attrs.get("level", "?")
-        if level not in {"L1", "L2"}:
+        if level not in {"L1", "L2"} and attrs.get("role") != "service-server":
             levels.setdefault(level, []).append(node_id)
     for level, node_ids in levels.items():
         ax.scatter(
@@ -381,16 +439,31 @@ def _draw_topology(ax, model, pos, *, loads=None, max_bytes: int = 1) -> None:
         node_ids = [node for node, attrs in model.graph.nodes(data=True) if attrs.get("role") == role]
         ax.scatter(
             [pos[node][0] for node in node_ids], [pos[node][1] for node in node_ids],
-            s=size * 1.22, c=LEVEL_COLORS["L2"], marker=marker, edgecolors="#f8fafc",
+            s=size * 1.34, c=LEVEL_COLORS["L2"], marker=marker, edgecolors="#f8fafc",
             linewidths=0.55, alpha=0.98, zorder=6,
         )
+    server_nodes = [node for node, attrs in model.graph.nodes(data=True) if attrs.get("role") == "service-server"]
+    ax.scatter(
+        [pos[node][0] for node in server_nodes], [pos[node][1] for node in server_nodes],
+        s=150, c="#a78bfa", marker="D", edgecolors="#f8fafc",
+        linewidths=0.8, alpha=0.98, zorder=6,
+    )
     for role, style in SUBSCRIBER_STYLES.items():
         node_ids = [node for node, attrs in model.graph.nodes(data=True) if attrs.get("role") == role]
         ax.scatter(
             [pos[node][0] for node in node_ids], [pos[node][1] for node in node_ids],
-            s=25, c=style["color"], marker=style["marker"], edgecolors="#0f172a",
+            s=30, c=style["color"], marker=style["marker"], edgecolors="#0f172a",
             linewidths=0.35, alpha=0.95, zorder=6,
         )
+    protected_nodes = [
+        node for node, attrs in model.graph.nodes(data=True)
+        if attrs.get("critical_protection", {}).get("is_critical")
+        and attrs.get("role") in {"core-router", "aggregation-switch", "service-server"}
+    ]
+    ax.scatter(
+        [pos[node][0] for node in protected_nodes], [pos[node][1] for node in protected_nodes],
+        s=175, facecolors="none", edgecolors="#fbbf24", linewidths=1.15, alpha=0.9, zorder=7,
+    )
 
 
 def _draw_access_zones(ax, model, pos) -> None:
@@ -430,7 +503,9 @@ def _draw_labels(ax, model, pos) -> None:
             continue
         x, y = pos[node_id]
         label = node_id
-        if level == "L0":
+        if attrs.get("role") == "service-server":
+            label = node_id.replace("SRV_", "СЕРВЕР ")
+        elif level == "L0":
             label = SERVICE_DISPLAY_NAMES.get(attrs.get("label"), attrs.get("label", node_id)).upper()
         elif level == "L7":
             label = "АРБ"
@@ -444,12 +519,25 @@ def _style_axes(ax, title: str) -> None:
     ax.figure.patch.set_facecolor("#0f172a")
     ax.set_facecolor("#0f172a")
     ax.set_title(title, color="#f8fafc", fontsize=16, pad=12)
-    ax.set_aspect("equal", adjustable="datalim")
+    ax.set_aspect("equal", adjustable="box")
     ax.axis("off")
 
 
-def _draw_legend(ax) -> None:
-    handles = [Line2D([0], [0], color=color, lw=3, label=FLOW_LABELS[name]) for name, color in FLOW_COLORS.items()]
+def _set_topology_view(ax, pos: dict[str, tuple[float, float]]) -> None:
+    """Zoom to real topology bounds so legends and panels do not steal the graph area."""
+    if not pos:
+        return
+    xs = [point[0] for point in pos.values()]
+    ys = [point[1] for point in pos.values()]
+    width = max(xs) - min(xs)
+    height = max(ys) - min(ys)
+    ax.set_xlim(min(xs) - max(width * 0.035, 0.55), max(xs) + max(width * 0.035, 0.55))
+    ax.set_ylim(min(ys) - max(height * 0.10, 0.80), max(ys) + max(height * 0.08, 0.65))
+
+
+def _draw_legend(ax, *, static: bool = False) -> None:
+    flow_labels = FLOW_LABELS if static else FLOW_SHORT_LABELS
+    handles = [Line2D([0], [0], color=color, lw=3, label=flow_labels[name]) for name, color in FLOW_COLORS.items()]
     for style in SUBSCRIBER_STYLES.values():
         handles.append(Line2D(
             [0], [0], marker=style["marker"], color="none", markerfacecolor=style["color"],
@@ -457,28 +545,40 @@ def _draw_legend(ax) -> None:
         ))
     handles.extend([
         Line2D([0], [0], marker="o", color="none", markerfacecolor=LEVEL_COLORS["L0"], markersize=8, label="Сервис L0"),
+        Line2D([0], [0], marker="D", color="none", markerfacecolor="#a78bfa", markersize=7, label="Физический сервер L0"),
         Line2D([0], [0], marker="o", color="none", markerfacecolor=LEVEL_COLORS["L2"], markersize=7, label="C — маршрутизатор ядра"),
         Line2D([0], [0], marker="s", color="none", markerfacecolor=LEVEL_COLORS["L2"], markersize=7, label="A — агрегирующий коммутатор"),
         Line2D([0], [0], marker="o", color="none", markerfacecolor=LEVEL_COLORS["L7"], markersize=7, label="АРБ — арбитратор L7"),
+        Line2D([0], [0], marker="o", color="#fbbf24", markerfacecolor="none", markersize=9, label="Критически важный Gold-узел"),
+        Line2D([0], [0], marker="o", color="#ff1744", markerfacecolor="none", markersize=10, label="Текущая цель атаки"),
         Line2D([0], [0], color="#94a3b8", lw=0.7, alpha=0.7, label="Связь без трафика"),
     ])
-    legend = ax.legend(
-        handles=handles, loc="upper left", framealpha=0.92, fontsize=7.8,
-        title="Узлы и сервисные потоки", title_fontsize=8.5, ncol=2,
+    legend_options = (
+        {"loc": "lower left", "bbox_to_anchor": (1.018, 0.02), "ncol": 1}
+        if static else {"loc": "lower center", "bbox_to_anchor": (0.5, -0.095), "ncol": 4}
     )
+    legend = ax.legend(
+        handles=handles, framealpha=0.96, facecolor="#111827", edgecolor="#475569",
+        labelcolor="#e2e8f0", fontsize=7.6 if static else 7.25,
+        title="Узлы и сервисные потоки", title_fontsize=8.3, **legend_options,
+    )
+    legend.get_title().set_color("#f8fafc")
     legend.set_zorder(20)
 
 
 def _flow_summary(flows: list[dict[str, Any]]) -> str:
     apps = Counter(flow.get("application", "unknown") for flow in flows)
+    legitimate_count = sum(1 for flow in flows if not flow.get("is_attack_traffic"))
+    attack_count = len(flows) - legitimate_count
     packets = sum(int(flow.get("packet_count", 0)) for flow in flows)
     wire_bytes = sum(int(flow.get("wire_bytes", 0)) for flow in flows)
     interval = int(flows[0].get("interval_seconds", 0)) if flows else 0
     megabytes = wire_bytes / 1_000_000
     rate_mbps = wire_bytes * 8.0 / max(interval, 1) / 1_000_000
     lines = [
-        f"Потоки: {len(flows)} = {len(flows)} абонентов",
+        f"Легитимные потоки: {legitimate_count} = {legitimate_count} абонентов",
         "По 1 активному потоку на пользователя",
+        f"Атакующие агрегированные потоки: {attack_count}",
         f"Пакеты за интервал {interval} с: {packets:,}",
         f"Сформировано: {megabytes:,.1f} МБ",
         f"Это {megabytes * 8:,.1f} Мбит за {interval} с",
@@ -498,6 +598,15 @@ def _snapshot_summary(snapshot, flows, loads, paused: bool, model) -> str:
     mode = "ПАУЗА — выбранный снимок" if paused else f"ВОСПРОИЗВЕДЕНИЕ → следующий шаг"
     t0_note = "\nt0: пакеты находятся в точках-источниках" if paused and snapshot.get("step_index", 0) == 0 else ""
     breakdown = _active_link_breakdown(model, loads)
+    attacks = snapshot.get("attacks", {})
+    attack_names = ", ".join(event.get("name_ru", event.get("attack_id", "")) for event in attacks.get("events", []))
+    attack_note = (
+        f"\n\nАТАКА АКТИВНА: {attack_names}\n"
+        f"Вредоносная скорость: {attacks.get('attack_rate_mbps', 0.0):,.1f} Мбит/с\n"
+        f"Потери легитимных пакетов: {attacks.get('legitimate_loss_ratio', 0.0) * 100:.2f}%\n"
+        f"Затронуто Gold-потоков: {attacks.get('impacted_gold_flow_count', 0)}"
+        if attacks.get("active") else "\n\nАтаки: нет"
+    )
     return (
         f"ШАГ {snapshot.get('step_index', 0)} · t = {snapshot.get('time_seconds', 0)} с\n"
         f"{mode}{t0_note}\n\n{_flow_summary(flows)}\n"
@@ -505,12 +614,12 @@ def _snapshot_summary(snapshot, flows, loads, paused: bool, model) -> str:
         f"  абонент → коммутатор A: {breakdown['access']}\n"
         f"  коммутатор A → маршрутизатор C: {breakdown['uplink']}\n"
         f"  маршрутизатор C → маршрутизатор C: {breakdown['core']}\n"
-        f"  маршрутизатор C → сервис: {breakdown['service']}\n"
+        f"  маршрутизатор C → сервер: {breakdown['service']}\n"
         f"Средняя задержка: {np.mean(latencies) if latencies else 0.0:.2f} мс\n"
         f"Макс. задержка: {max(latencies, default=0.0):.2f} мс\n\n"
         f"Самая нагруженная связь:\n{edge_name}\n"
         f"{busiest[1]['wire_bytes'] / 1_000_000:.1f} МБ за шаг\n\n"
-        f"Решение L7: {remap}"
+        f"Решение L7: {remap}{attack_note}"
     )
 
 
@@ -539,19 +648,44 @@ def _node_hover_text(model, node_id: str) -> str:
     role = attrs.get("role")
     if role in {"core-router", "aggregation-switch"}:
         return _equipment_hover_text(model, node_id, attrs)
+    if role == "service-server":
+        profile = attrs.get("server_profile", {})
+        runtime = attrs.get("runtime", {})
+        return (
+            f"{node_id} · Физический сервер L0\n"
+            f"IP: {attrs.get('ip_address')} · MAC: {attrs.get('mac_address')}\n"
+            f"Модель: {profile.get('model')}\n"
+            f"ЦП: {profile.get('cpu')} · {profile.get('total_cores')} ядер\n"
+            f"ОЗУ: {profile.get('ram_gb')} ГБ · хранилище: {profile.get('storage_tb')} ТБ\n"
+            f"Сетевые порты: {profile.get('network_ports_gbps')} Гбит/с\n"
+            f"Сервисы: {', '.join(attrs.get('hosted_services', []))}\n"
+            f"Текущая нагрузка: ЦП {runtime.get('cpu_util_percent', 0):.1f}%, "
+            f"ОЗУ {runtime.get('ram_util_percent', 0):.1f}%, сеть {runtime.get('network_util_percent', 0):.1f}%\n"
+            f"Диски {runtime.get('storage_util_percent', 0):.1f}%, "
+            f"температура {runtime.get('temperature_c', 0):.1f} °C, сеансов {runtime.get('active_sessions', 0)}"
+            f"{_protection_hover(attrs)}"
+        )
     if attrs.get("level") == "L1":
         kind = "Мобильный абонент" if role == "mobile-subscriber" else "Фиксированный абонент"
         return (
             f"{node_id} · {kind}\n"
+            f"IP: {attrs.get('ip_address')} · MAC: {attrs.get('mac_address')}\n"
             f"Коммутатор доступа: {attrs.get('home_access')}\n"
             f"Класс SLA: {SLA_LABELS.get(attrs.get('sla_grade'), attrs.get('sla_grade'))}\n"
             f"Приложение: {TRAFFIC_LABELS.get(attrs.get('traffic_kind'), attrs.get('traffic_kind'))}\n"
-            f"Кодек: {attrs.get('codec')}\n"
+            f"Кодек/профиль: {attrs.get('codec_profile_name') or attrs.get('codec')}\n"
             f"Целевая скорость: {attrs.get('target_bitrate_kbps', 0):.0f} кбит/с"
+            f"{_protection_hover(attrs)}"
         )
     if attrs.get("level") == "L0":
         service_name = SERVICE_DISPLAY_NAMES.get(attrs.get("label"), attrs.get("label"))
-        return f"{node_id} · Сервис L0\nНазначение: {service_name}\nПодключён к: {', '.join(model.graph.neighbors(node_id))}"
+        return (
+            f"{node_id} · Логический сервис L0\nНазначение: {service_name}\n"
+            f"VIP: {attrs.get('ip_address')} · MAC: {attrs.get('mac_address')}\n"
+            f"Платформа: {attrs.get('platform')}\nСервер: {attrs.get('hosted_on')}\n"
+            f"Профиль: {attrs.get('codec_profile_name')}\n"
+            f"Аудиокодек: {attrs.get('audio_codec') or '—'} · Видеокодек: {attrs.get('video_codec') or '—'}"
+        )
     if role == "arbitrator":
         return "АРБ · Арбитратор L7\nНаблюдает метрики всех уровней\nПринимает решение о переназначении"
     return f"{node_id}\nРоль: {role}\nУровень: {attrs.get('level')}"
@@ -570,6 +704,7 @@ def _equipment_hover_text(model, node_id: str, attrs: dict[str, Any]) -> str:
     forwarding_origin = "Cisco" if "forwarding_mpps" in verified else "модель"
     return (
         f"{node_id} · {device_name}\n"
+        f"IP: {attrs.get('ip_address')} · MAC: {attrs.get('mac_address')}\n"
         f"Платформа: {attrs.get('platform_family')}\n"
         f"Профиль: {attrs.get('platform_profile')}\n"
         f"Базовая загрузка ЦП: {raw.get('cpu_util', 0):.1f}% [модель]\n"
@@ -580,15 +715,31 @@ def _equipment_hover_text(model, node_id: str, attrs: dict[str, Any]) -> str:
         f"Подключений: {len(neighbors)}"
         + (f" · клиентов: {len(clients)}" if clients else "")
         + f"\nСвязи: {', '.join(uplinks)}"
+        + _protection_hover(attrs)
+    )
+
+
+def _protection_hover(attrs: dict[str, Any]) -> str:
+    protection = attrs.get("critical_protection", {})
+    if not protection.get("is_critical"):
+        return ""
+    return (
+        "\nКРИТИЧЕСКИЙ GOLD-УЗЕЛ · приоритет защиты 1"
+        f"\nGold-потоков через узел: {protection.get('gold_transit_flow_count', 0)}"
+        f" · КВУ: {protection.get('critical_involvement_coefficient', 0.0):.3f}"
+        f"\nПредел загрузки при переназначении: {protection.get('maximum_safe_utilization_percent', 80.0):.0f}%"
     )
 
 
 def _spread_sample(flows: list[dict[str, Any]], limit: int, frame: int) -> list[dict[str, Any]]:
     if len(flows) <= limit:
         return flows
-    stride = max(1, len(flows) // limit)
+    attack_flows = [flow for flow in flows if flow.get("is_attack_traffic")]
+    legitimate = [flow for flow in flows if not flow.get("is_attack_traffic")]
+    regular_limit = max(0, limit - len(attack_flows))
+    stride = max(1, len(legitimate) // max(regular_limit, 1))
     start = frame % stride
-    return flows[start::stride][:limit]
+    return attack_flows[:limit] + legitimate[start::stride][:regular_limit]
 
 
 def _advance_playback(

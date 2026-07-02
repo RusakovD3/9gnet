@@ -33,6 +33,9 @@ class TrafficKind(str, Enum):
     FTP = "ftp"
     DNS = "dns"
     VOICE = "voice"
+    VLC_AV = "vlc_av"
+    VIDEO_CONFERENCE = "video_conference"
+    LIVE_STREAMING = "live_streaming"
 
 
 @dataclass(frozen=True)
@@ -78,6 +81,12 @@ class D0SLSubscriberPolicy:
     channels: int | None = None
     inband_fec: str | None = None
     dtx: str | None = None
+    audio_bitrate_kbps: float | None = None
+    video_bitrate_kbps: float | None = None
+    audio_latency_budget_ms: float | None = None
+    video_latency_budget_ms: float | None = None
+    failure_latency_ms: float | None = None
+    tcp_retransmission_budget_percent: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -234,6 +243,12 @@ def _parse_sla_block(name: str, body: str) -> D0SLSubscriberPolicy:
         channels=_read_optional_int_field(scalar_body, "channels"),
         inband_fec=_read_optional_string_field(scalar_body, "inband_fec"),
         dtx=_read_optional_string_field(scalar_body, "dtx"),
+        audio_bitrate_kbps=_read_optional_float_field(scalar_body, "audio_bitrate_kbps"),
+        video_bitrate_kbps=_read_optional_float_field(scalar_body, "video_bitrate_kbps"),
+        audio_latency_budget_ms=_read_optional_float_field(scalar_body, "audio_latency_budget_ms"),
+        video_latency_budget_ms=_read_optional_float_field(scalar_body, "video_latency_budget_ms"),
+        failure_latency_ms=_read_optional_float_field(scalar_body, "failure_latency_ms"),
+        tcp_retransmission_budget_percent=_read_optional_float_field(scalar_body, "tcp_retransmission_budget_percent"),
     )
 
 
@@ -299,6 +314,11 @@ def _read_int_field(body: str, field: str) -> int:
 def _read_optional_int_field(body: str, field: str) -> int | None:
     match = re.search(rf'\b{field}\s*:\s*([0-9]+)\s*;', body)
     return int(match.group(1)) if match else None
+
+
+def _read_optional_float_field(body: str, field: str) -> float | None:
+    match = re.search(rf'\b{field}\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*;', body)
+    return float(match.group(1)) if match else None
 
 
 def _read_optional_string_field(body: str, field: str) -> str | None:

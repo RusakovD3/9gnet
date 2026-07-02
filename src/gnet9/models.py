@@ -39,6 +39,33 @@ class StateTensor:
 
 
 @dataclass
+class CodecComponent:
+    """One media or application payload component used by an L0 service."""
+
+    media: str
+    codec: str
+    profile: str
+    payload_or_container: str
+    bitrate_note: str
+    clock_rate_hz: int | None = None
+    channels: int | None = None
+    packetization_ms: int | None = None
+    frame_rate_fps: float | None = None
+
+
+@dataclass
+class CodecProfile:
+    """Human-readable codec/protocol profile attached to L0 and L1."""
+
+    profile_id: str
+    display_name: str
+    transport_stack: str
+    application_protocol: str
+    components: tuple[CodecComponent, ...]
+    realism_note: str
+
+
+@dataclass
 class ServiceProfile:
     """Runtime L0 service description."""
 
@@ -48,6 +75,43 @@ class ServiceProfile:
     jitter_ms_max: float
     availability_target: float
     priority: str
+    service_id: str = ""
+    server_id: str = ""
+    category: str = ""
+    platform: str = ""
+    audio_codec: str | None = None
+    video_codec: str | None = None
+    critical_latency_ms: float | None = None
+    codec_profile_id: str = ""
+
+
+@dataclass(frozen=True)
+class ServerProfile:
+    """Паспорт и выбранная конфигурация физического сервера L0."""
+
+    server_id: str
+    model: str
+    cpu: str
+    cpu_sockets: int
+    total_cores: int
+    ram_gb: int
+    storage_tb: float
+    network_ports_gbps: tuple[int, ...]
+    hosted_service_ids: tuple[str, ...]
+    source_url: str
+
+
+@dataclass(frozen=True)
+class ServerRuntimeMetrics:
+    """Измеряемое состояние сервера, отделённое от паспортной конфигурации."""
+
+    cpu_util_percent: float
+    ram_util_percent: float
+    network_util_percent: float
+    storage_util_percent: float
+    temperature_c: float
+    active_sessions: int
+    health: float
 
 
 @dataclass
@@ -72,6 +136,7 @@ class NetworkModel:
     services: list[ServiceProfile]
     slices: list[SliceProfile]
     level_summary: dict[str, int]
+    servers: list[ServerProfile] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
     @staticmethod
@@ -105,6 +170,7 @@ class NetworkModel:
     def to_serializable(self) -> dict[str, Any]:
         return {
             "services": [asdict(service) for service in self.services],
+            "servers": [asdict(server) for server in self.servers],
             "slices": [asdict(slice_profile) for slice_profile in self.slices],
             "level_summary": self.level_summary,
             "notes": self.notes,
@@ -136,7 +202,9 @@ class NetworkModel:
         result: dict[str, Any] = {}
         for key, value in attrs.items():
             value = self._to_json_value(value)
-            if isinstance(value, (list, dict)):
+            if value is None:
+                result[key] = ""
+            elif isinstance(value, (list, dict)):
                 result[key] = json.dumps(value, ensure_ascii=False)
             else:
                 result[key] = value
@@ -155,10 +223,21 @@ class NetworkModel:
         lines.extend(["", "Сервисы:"])
         for service in self.services:
             display_name = SERVICE_DISPLAY_NAMES.get(service.name, service.name)
+            codecs = " + ".join(item for item in (service.audio_codec, service.video_codec) if item) or "протокольный профиль без медиакодека"
             lines.append(
                 f"  - {display_name}: {service.bitrate_mbps} Мбит/с, "
                 f"задержка <= {service.latency_ms_max} мс, "
-                f"доступность {service.availability_target:.4f}"
+                f"доступность {service.availability_target:.4f}, "
+                f"кодеки/профиль: {codecs}"
+            )
+
+        lines.extend(["", "Физические серверы сервисов:"])
+        for server in self.servers:
+            ports = "+".join(f"{speed}G" for speed in server.network_ports_gbps)
+            lines.append(
+                f"  - {server.server_id}: {server.model}, {server.total_cores} ядер, "
+                f"ОЗУ {server.ram_gb} ГБ, хранилище {server.storage_tb:.2f} ТБ, сеть {ports}; "
+                f"сервисы: {', '.join(server.hosted_service_ids)}"
             )
 
         slice_names = {

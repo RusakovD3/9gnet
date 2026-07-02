@@ -13,6 +13,7 @@ from typing import Any, Literal
 
 import networkx as nx
 
+from .attacks import active_attack_events, attack_catalog
 from .arbitrator import build_arbitrator_view, tensor_metrics
 from .constants import DYNAMICS_STEP_SECONDS, DYNAMICS_STEPS
 from .models import NetworkModel, StateTensor
@@ -22,6 +23,7 @@ from .packet_simulator import simulate_packet_snapshot
 TENSOR_LEVELS = ("L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8", "EDGE")
 SnapshotDetail = Literal["full", "tensor", "summary"]
 PacketDetail = Literal["summary", "flows", "sample"]
+AttackScenario = Literal["none", "mitre-demo"]
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,7 @@ class DynamicsConfig:
     snapshot_detail: SnapshotDetail = "full"
     packet_detail: PacketDetail = "sample"
     packet_sample_limit: int = 48
+    attack_scenario: AttackScenario = "none"
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -66,8 +69,9 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
         raise ValueError(f"t0 is not ideal: {ideal_t0['violation_count']} violations")
 
     return {
-        "mode": "stationary_healthy_baseline",
+        "mode": "mitre_attack_demonstration" if config.attack_scenario != "none" else "stationary_healthy_baseline",
         "config": config.to_dict(),
+        "attack_catalog": attack_catalog() if config.attack_scenario != "none" else [],
         "health": health,
         "ideal_t0": ideal_t0,
         "snapshot_count": len(snapshots),
@@ -88,6 +92,7 @@ def validate_ideal_t0(model: NetworkModel, snapshot: dict[str, Any] | None = Non
         "aggregation_switch_count": 0,
         "core_router_count": 0,
         "service_count": 0,
+        "service_server_count": 0,
         "minimum_bitrate_headroom_ratio": float("inf"),
         "maximum_latency_budget_ratio": 0.0,
         "maximum_jitter_budget_ratio": 0.0,
@@ -136,10 +141,25 @@ def validate_ideal_t0(model: NetworkModel, snapshot: dict[str, Any] | None = Non
             core_neighbors = [node for node in model.graph.neighbors(node_id) if model.graph.nodes[node].get("role") == "core-router"]
             if len(core_neighbors) < 2:
                 violations.append({"scope": "L2", "node": node_id, "reason": "core_ring_not_redundant"})
-        elif level == "L0":
+        elif role == "service":
             metrics["service_count"] += 1
             if model.graph.degree(node_id) != 1:
                 violations.append({"scope": "L0", "node": node_id, "reason": "invalid_service_attachment"})
+            host = attrs.get("hosted_on")
+            if host not in model.graph or model.graph.nodes[host].get("role") != "service-server":
+                violations.append({"scope": "L0", "node": node_id, "reason": "invalid_service_host"})
+        elif role == "service-server":
+            metrics["service_server_count"] += 1
+            runtime = attrs.get("runtime", {})
+            core_links = [neighbor for neighbor in model.graph.neighbors(node_id) if model.graph.nodes[neighbor].get("role") == "core-router"]
+            if (
+                len(core_links) < 2
+                or runtime.get("cpu_util_percent", 100.0) > 50.0
+                or runtime.get("ram_util_percent", 100.0) > 60.0
+                or runtime.get("storage_util_percent", 100.0) > 70.0
+                or runtime.get("temperature_c", 100.0) > 60.0
+            ):
+                violations.append({"scope": "L0_SERVER", "node": node_id, "reason": "insufficient_server_redundancy_or_headroom"})
 
         if level == "L2" and isinstance(attrs.get("tensor"), StateTensor):
             values = tensor_metrics(attrs["tensor"])
@@ -254,8 +274,32 @@ def validate_healthy_baseline(model: NetworkModel) -> dict[str, Any]:
 
 
 def _snapshot(model: NetworkModel, config: DynamicsConfig, step_index: int, time_seconds: int) -> dict[str, Any]:
+    attack_events = active_attack_events(
+        model,
+        config.attack_scenario,
+        step_index=step_index,
+        time_seconds=time_seconds,
+        step_seconds=config.step_seconds,
+    )
+    traffic = None
+    if config.include_packet_simulation:
+        traffic = simulate_packet_snapshot(
+            model,
+            step_index=step_index,
+            time_seconds=time_seconds,
+            step_seconds=config.step_seconds,
+            detail=config.packet_detail,
+            packet_sample_limit=config.packet_sample_limit,
+            attack_events=attack_events,
+        )
+        traffic["attack_state"]["scenario"] = config.attack_scenario
+
     tensor_state = _tensor_state_snapshot(model)
-    arbitrator = build_arbitrator_view(model, tensor_state)
+    observation = None if traffic is None else {
+        "traffic": traffic.get("summary", {}),
+        "attacks": traffic.get("attack_state", {}),
+    }
+    arbitrator = build_arbitrator_view(model, tensor_state, observation=observation)
     snapshot = {
         "step_index": step_index,
         "time_seconds": time_seconds,
@@ -263,21 +307,19 @@ def _snapshot(model: NetworkModel, config: DynamicsConfig, step_index: int, time
         "tensor_state": _format_tensor_state(tensor_state, config.snapshot_detail),
         "state_vector": arbitrator["state_vector"],
         "arbitrator": arbitrator,
+        "attacks": (
+            traffic.get("attack_state", {}) if traffic is not None
+            else {"scenario": config.attack_scenario, "active": bool(attack_events), "events": attack_events}
+        ),
     }
 
     if config.snapshot_detail == "full":
         snapshot["nodes"] = [_node_snapshot(node_id, attrs) for node_id, attrs in model.graph.nodes(data=True)]
         snapshot["edges"] = [_edge_snapshot(source, target, attrs) for source, target, attrs in model.graph.edges(data=True)]
 
-    if config.include_packet_simulation:
-        snapshot["traffic"] = simulate_packet_snapshot(
-            model,
-            step_index=step_index,
-            time_seconds=time_seconds,
-            step_seconds=config.step_seconds,
-            detail=config.packet_detail,
-            packet_sample_limit=config.packet_sample_limit,
-        )
+    if traffic is not None:
+        traffic.pop("attack_state", None)
+        snapshot["traffic"] = traffic
 
     return snapshot
 
@@ -389,6 +431,10 @@ def _validate_config(config: DynamicsConfig) -> None:
         raise ValueError("DynamicsConfig.snapshot_detail must be one of: full, tensor, summary")
     if config.packet_detail not in {"summary", "flows", "sample"}:
         raise ValueError("DynamicsConfig.packet_detail must be one of: summary, flows, sample")
+    if config.attack_scenario not in {"none", "mitre-demo"}:
+        raise ValueError("DynamicsConfig.attack_scenario must be one of: none, mitre-demo")
+    if config.attack_scenario != "none" and not config.include_packet_simulation:
+        raise ValueError("Сценарий атак требует включённой пакетной симуляции")
 
 
 def _json_value(value: Any) -> Any:

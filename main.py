@@ -4,12 +4,17 @@ import argparse
 import csv
 import json
 import shutil
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from src.gnet9.address_visualizer import draw_ip_address_map, export_ip_address_plan
+from src.gnet9.attacks import attack_catalog
+from src.gnet9.debug_visualizer import DebugFlowWindow, RuntimeCallTracer, export_debug_artifacts
 from src.gnet9.dynamics import DynamicsConfig, simulate_stationary_dynamics
 from src.gnet9.dynamics_charts import export_dynamics_charts
-from src.gnet9.flow_visualizer import draw_service_flow_map, show_service_flow_window
+from src.gnet9.flow_visualizer import create_service_flow_window, draw_service_flow_map, show_visualization_windows
+from src.gnet9.service_catalog import CODEC_CATALOG
 from src.gnet9.topology_builder import GNetBaselineBuilder
 from src.gnet9.visualizer import GNetVisualizer
 
@@ -73,6 +78,32 @@ def export_l2_equipment_profiles(model, path: Path) -> None:
             }
         )
     path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def export_l0_server_service_catalog(model, path: Path) -> None:
+    """Экспортировать серверы, размещённые сервисы и базовую телеметрию L0."""
+    server_runtime = {
+        node_id: attrs.get("runtime", {})
+        for node_id, attrs in model.graph.nodes(data=True)
+        if attrs.get("role") == "service-server"
+    }
+    payload = {
+        "servers": [{**asdict(server), "runtime": server_runtime.get(server.server_id, {})} for server in model.servers],
+        "services": [asdict(service) for service in model.services],
+        "codec_profiles": [asdict(profile) for profile in CODEC_CATALOG.values()],
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def export_attack_catalog(model, path: Path) -> None:
+    """Экспортировать MITRE-профили и рассчитанные приоритеты защиты узлов."""
+    critical_nodes = [
+        {"node_id": node_id, "role": attrs.get("role"), **attrs.get("critical_protection", {})}
+        for node_id, attrs in model.graph.nodes(data=True)
+        if attrs.get("critical_protection", {}).get("is_critical")
+    ]
+    payload = {"attacks": attack_catalog(), "critical_nodes": critical_nodes}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def export_l1_monitoring(model, path: Path) -> None:
@@ -172,6 +203,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="После экспорта открыть интерактивное окно с анимацией сервисных потоков.",
     )
+    parser.add_argument(
+        "--debug-diagram",
+        action="store_true",
+        help="Записать блок-схему, граф вызовов функций и полную трассу запуска в output/debug.",
+    )
+    parser.add_argument(
+        "--show-debug",
+        action="store_true",
+        help="Открыть окно графической диагностики и создать артефакты output/debug.",
+    )
+    parser.add_argument(
+        "--attack-scenario",
+        choices=("none", "mitre-demo"),
+        default="none",
+        help="Сценарий воздействий: none или демонстрация DoS/DDoS/SYN flood по MITRE ATT&CK.",
+    )
     return parser.parse_args()
 
 
@@ -180,6 +227,10 @@ def main() -> None:
     project_root = Path(__file__).resolve().parent
     output_dir = project_root / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
+    debug_enabled = args.debug_diagram or args.show_debug
+    runtime_tracer = RuntimeCallTracer(project_root)
+    if debug_enabled:
+        runtime_tracer.start()
 
     d0sl_policy_path = project_root / "policies" / "l1_policies.d0sl"
     model = GNetBaselineBuilder(d0sl_policy_path=d0sl_policy_path).build()
@@ -190,6 +241,9 @@ def main() -> None:
         "l1_profiles": output_dir / "l1_d0sl_profiles.json",
         "l1_monitoring": output_dir / "l1_monitoring.csv",
         "l2_profiles": output_dir / "l2_equipment_profiles.json",
+        "l0_servers": output_dir / "l0_server_service_catalog.json",
+        "ip_plan": output_dir / "ip_address_plan.json",
+        "attacks": output_dir / "mitre_attack_catalog.json",
         "d0sl_parsed": output_dir / "l1_d0sl_parsed.json",
         "d0sl_source": output_dir / "l1_policies.d0sl",
         "dynamics": output_dir / "network_dynamics.json",
@@ -197,11 +251,14 @@ def main() -> None:
         "network_png": output_dir / "network_logic.png",
         "layers_png": output_dir / "layer_scheme.png",
         "flows_png": output_dir / "service_flows.png",
+        "ip_map_png": output_dir / "ip_address_map.png",
+        "debug_dir": output_dir / "debug",
     }
 
     visualizer = GNetVisualizer(model)
     visualizer.draw_network_logic(artifacts["network_png"])
     visualizer.draw_layer_scheme(artifacts["layers_png"])
+    draw_ip_address_map(model, artifacts["ip_map_png"])
 
     model.export_json(artifacts["json"])
     model.export_graphml(artifacts["graphml"])
@@ -209,6 +266,9 @@ def main() -> None:
     export_l1_profiles(model, artifacts["l1_profiles"])
     export_l1_monitoring(model, artifacts["l1_monitoring"])
     export_l2_equipment_profiles(model, artifacts["l2_profiles"])
+    export_l0_server_service_catalog(model, artifacts["l0_servers"])
+    export_ip_address_plan(model, artifacts["ip_plan"])
+    export_attack_catalog(model, artifacts["attacks"])
     export_parsed_d0sl_catalog(model, artifacts["d0sl_parsed"])
     dynamics_config = DynamicsConfig(
         step_count=args.dynamics_steps if args.dynamics_steps is not None else DynamicsConfig().step_count,
@@ -216,6 +276,7 @@ def main() -> None:
         include_packet_simulation=not args.no_packet_simulation,
         snapshot_detail=args.snapshot_detail,
         packet_detail=args.packet_detail,
+        attack_scenario=args.attack_scenario,
     )
     dynamics = export_stationary_dynamics(model, artifacts["dynamics"], dynamics_config)
     flow_snapshots = dynamics["snapshots"]
@@ -227,6 +288,7 @@ def main() -> None:
                 step_seconds=dynamics_config.step_seconds,
                 snapshot_detail="summary",
                 packet_detail="flows",
+                attack_scenario=dynamics_config.attack_scenario,
             ),
         )
         flow_snapshots = flow_dynamics["snapshots"]
@@ -238,6 +300,10 @@ def main() -> None:
         flow_snapshots=flow_snapshots,
     )
     shutil.copyfile(d0sl_policy_path, artifacts["d0sl_source"])
+    debug_paths: dict[str, Path] = {}
+    if debug_enabled:
+        runtime_tracer.stop()
+        debug_paths = export_debug_artifacts(runtime_tracer, artifacts["debug_dir"])
 
     print("Готово.")
     print(f"Артефакты сохранены в: {output_dir}")
@@ -247,13 +313,25 @@ def main() -> None:
         f"детализация снимка={dynamics_config.snapshot_detail}, "
         f"пакетная симуляция={dynamics_config.include_packet_simulation}, "
         f"детализация пакетов={dynamics_config.packet_detail}"
+        f", сценарий атак={dynamics_config.attack_scenario}"
     )
     print("Графики динамики:")
     for path in chart_paths.values():
         print(f"  - {path}")
     print(f"Карта сервисных потоков: {artifacts['flows_png']}")
+    print(f"Карта IP-адресации: {artifacts['ip_map_png']}")
+    if debug_paths:
+        print("Графическая диагностика:")
+        for path in debug_paths.values():
+            print(f"  - {path}")
+
+    windows = []
     if args.show_window:
-        show_service_flow_window(model, flow_snapshots)
+        windows.append(create_service_flow_window(model, flow_snapshots))
+    if args.show_debug:
+        windows.append(DebugFlowWindow(runtime_tracer))
+    if windows:
+        show_visualization_windows(*windows)
 
 
 if __name__ == "__main__":

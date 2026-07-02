@@ -46,8 +46,8 @@ class GNetVisualizer:
         self.graph = model.graph
 
     def draw_network_logic(self, path: Path) -> None:
-        fig, ax = plt.subplots(figsize=(24, 14))
-        ax.set_xlim(0, 24)
+        fig, ax = plt.subplots(figsize=(26, 14.5))
+        ax.set_xlim(0, 26)
         ax.set_ylim(0, 15)
         ax.axis("off")
 
@@ -347,13 +347,16 @@ class GNetVisualizer:
             if level == "L1":
                 label = "М" if attrs["role"] == "mobile-subscriber" else "Ф"
                 fontsize = FONTSIZE_CONFIGS["label_l1"]
+            elif attrs.get("role") == "service-server":
+                label = node_id.replace("SRV_", "СЕРВЕР\n")
+                fontsize = FONTSIZE_CONFIGS["label_l1"]
             else:
                 label = SERVICE_DISPLAY_NAMES.get(attrs["label"], attrs["label"])
                 fontsize = FONTSIZE_CONFIGS["label_default"]
             ax.text(x, y, label, ha="center", va="center", fontsize=fontsize, fontweight="bold", zorder=6)
 
         area_badges = [
-            (6.95, 12.05, "L0 сервисы", "#d8f3dc"),
+            (6.95, 12.05, "L0 серверы и сервисы", "#d8f3dc"),
             (10.8, 7.05, "L2 активное оборудование", "#a9def9"),
             (5.10, 3.05, "L1 мобильные → A1/A3/A5", "#b7e4c7"),
             (13.40, 3.05, "L1 фиксированные → A2/A4/A6", "#b7e4c7"),
@@ -393,7 +396,7 @@ class GNetVisualizer:
         ax.text(1.92, 10.67, inclusion_text, ha="center", va="center", fontsize=9.7)
 
         small_legend = FancyBboxPatch(
-            (19.2, 9.25),
+            (22.05, 9.25),
             3.0,
             2.9,
             boxstyle="round,pad=0.06",
@@ -403,12 +406,12 @@ class GNetVisualizer:
             alpha=0.95,
         )
         ax.add_patch(small_legend)
-        ax.text(20.7, 11.72, "Легенда", ha="center", va="center", fontsize=10.5, fontweight="bold")
-        ax.text(19.45, 11.2, "узлы: L0 / L1 / L2", fontsize=9.2)
-        ax.text(19.45, 10.78, "кольца: L5", fontsize=9.2)
-        ax.text(19.45, 10.36, "зоны питания: L6", fontsize=9.2)
-        ax.text(19.45, 9.94, "среда/линейка: L3/L4", fontsize=9.2)
-        ax.text(19.45, 9.52, "фон: L8", fontsize=9.2)
+        ax.text(23.55, 11.72, "Легенда", ha="center", va="center", fontsize=10.5, fontweight="bold")
+        ax.text(22.30, 11.2, "узлы: L0 / L1 / L2", fontsize=9.2)
+        ax.text(22.30, 10.78, "кольца: L5", fontsize=9.2)
+        ax.text(22.30, 10.36, "зоны питания: L6", fontsize=9.2)
+        ax.text(22.30, 9.94, "среда/линейка: L3/L4", fontsize=9.2)
+        ax.text(22.30, 9.52, "фон: L8", fontsize=9.2)
 
         arb_box = FancyBboxPatch(
             (8.55, 13.12),

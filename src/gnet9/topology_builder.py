@@ -16,11 +16,11 @@ from typing import Iterable
 import networkx as nx
 import numpy as np
 
+from .attacks import mark_critical_nodes
 from .constants import (
     AGGREGATION_FIXED,
     AGGREGATION_MOBILE,
     CRITICALITY_COLORS,
-    DEFAULT_SERVICES,
     FIXED_SUBSCRIBERS_PER_AGG,
     L2_NODE_COUNT,
     L1_MONITORING_SECONDS,
@@ -45,7 +45,16 @@ from .baseline import (
     l8_placement_tensor,
 )
 from .metrics import vertex_proximity_index
-from .models import NetworkModel, ServiceProfile, SliceProfile
+from .addressing import attach_network_identities
+from .models import NetworkModel, SliceProfile
+from .service_catalog import (
+    CODEC_CATALOG,
+    SERVER_BASELINE_RUNTIME,
+    SERVER_CATALOG,
+    SERVICE_CATALOG,
+    TRAFFIC_CODEC_PROFILE,
+    codec_summary,
+)
 from .tensors import build_layer_tensor, build_transport_tensor
 from .l2_equipment import (
     build_l2_raw_baseline,
@@ -64,7 +73,8 @@ class GNetBaselineBuilder:
 
     def __init__(self, d0sl_policy_path: Path | None = None) -> None:
         self.graph = nx.Graph()
-        self.services = [ServiceProfile(**asdict(service)) for service in DEFAULT_SERVICES]
+        self.services = list(SERVICE_CATALOG)
+        self.servers = list(SERVER_CATALOG)
         self.slices: list[SliceProfile] = []
 
         project_root = Path(__file__).resolve().parents[2]
@@ -85,13 +95,17 @@ class GNetBaselineBuilder:
         self._validate()
 
         level_summary = Counter(attrs["level"] for _, attrs in self.graph.nodes(data=True))
-        return NetworkModel(
+        model = NetworkModel(
             graph=self.graph,
             services=self.services,
             slices=self.slices,
             level_summary=dict(level_summary),
+            servers=self.servers,
             notes=self._build_notes(),
         )
+        attach_network_identities(model)
+        mark_critical_nodes(model)
+        return model
 
     def _build_notes(self) -> list[str]:
         return [
@@ -100,7 +114,10 @@ class GNetBaselineBuilder:
             "Тензоры уровней — числовые векторы состояния с явными именами и единицами метрик.",
             "Абоненты подключены непосредственно к агрегирующим коммутаторам.",
             f"Абоненты L1 используют исполняемые политики d0sl SLA/SLO/SLI из {self.d0sl_policy_path}.",
-            "Классы трафика L1: голос Opus, аудиовещание MP3, FTP и DNS.",
+            "Классы трафика L1: голос Opus, VLC-аудио/видео, FTP, DNS, видеоконференция и прямая трансляция.",
+            "Кодеки и протокольные профили L0 описаны единым каталогом CodecProfile и привязаны к сервисам, абонентам и потокам.",
+            "Каждый узел имеет детерминированный private IPv4 и локально-администрируемый MAC-адрес для безопасной пакетной модели.",
+            "Логические сервисы L0 размещены на отдельных физических серверах Dell PowerEdge R660.",
             "Тензоры L3/L4 закреплены за транспортными связями; L5/L6 — за оборудованием и абонентами, где это применимо.",
             "Тензор L7 хранит эталонные признаки решения Koopman/Lyapunov/Hausdorff.",
             "Тензоры L8 хранят координаты размещения и данные для расчёта расстояния Хаусдорфа.",
@@ -319,7 +336,7 @@ class GNetBaselineBuilder:
                 group_index=group_index,
                 angles_deg=mobile_spread,
                 grade_fn=lambda index: "gold" if index <= 8 else "bronze",
-                traffic_shift=group_index,
+                traffic_shift=group_index - 1,
                 medium="radio",
                 color="#b7e4c7",
                 visible_limit=14,
@@ -335,7 +352,7 @@ class GNetBaselineBuilder:
                 group_index=group_index,
                 angles_deg=fixed_spread,
                 grade_fn=lambda index: "silver" if index <= 10 else "bronze",
-                traffic_shift=group_index + 1,
+                traffic_shift=group_index + 2,
                 medium="ethernet",
                 color="#95d5b2",
                 visible_limit=10,
@@ -360,9 +377,11 @@ class GNetBaselineBuilder:
     ) -> None:
         traffic_cycle = [
             TrafficKind.VOICE.value,
-            TrafficKind.BROADCAST_MP3.value,
+            TrafficKind.VLC_AV.value,
             TrafficKind.FTP.value,
             TrafficKind.DNS.value,
+            TrafficKind.VIDEO_CONFERENCE.value,
+            TrafficKind.LIVE_STREAMING.value,
         ]
         x0, y0 = self.graph.nodes[aggregation_node]["pos"]
 
@@ -371,6 +390,7 @@ class GNetBaselineBuilder:
             grade = grade_fn(subscriber_index)
             traffic = traffic_cycle[(subscriber_index + traffic_shift) % len(traffic_cycle)]
             policy = self.l1_policy_catalog.get(grade, traffic)
+            codec_profile_id = TRAFFIC_CODEC_PROFILE[policy.traffic.value]
             queue_model = build_l1_queue_model(policy)
             monitoring = simulate_l1_monitoring(
                 policy,
@@ -389,6 +409,9 @@ class GNetBaselineBuilder:
                 sla_grade=policy.grade.value,
                 traffic_kind=policy.traffic.value,
                 codec=policy.codec,
+                codec_profile_id=codec_profile_id,
+                codec_profile_name=CODEC_CATALOG[codec_profile_id].display_name,
+                codec_summary=codec_summary(codec_profile_id),
                 target_bitrate_kbps=policy.target_bitrate_kbps,
                 min_bitrate_kbps=policy.min_bitrate_kbps,
                 latency_budget_ms=policy.latency_budget_ms,
@@ -438,35 +461,82 @@ class GNetBaselineBuilder:
     # L0, L7 and common helpers
     # ---------------------------------------------------------------------
     def _add_services(self) -> None:
-        service_positions = {
-            "SVC_VOICE": (-6.4, 5.5),
-            "SVC_AUDIO": (-2.2, 6.3),
-            "SVC_FTP": (2.2, 6.3),
-            "SVC_DNS": (6.4, 5.5),
+        server_positions = {
+            "SRV_MEDIA": (-6.0, 5.0),
+            "SRV_DATA": (-2.0, 5.0),
+            "SRV_RTC": (2.0, 5.0),
+            "SRV_LIVE": (6.0, 5.0),
         }
-        service_to_core = {"SVC_VOICE": "C1", "SVC_AUDIO": "C5", "SVC_FTP": "C8", "SVC_DNS": "C9"}
-        profiles = {service.name.lower(): service for service in self.services}
-        profile_map = {"SVC_VOICE": profiles["voice"], "SVC_AUDIO": profiles["audio"], "SVC_FTP": profiles["ftp"], "SVC_DNS": profiles["dns"]}
+        server_to_core = {
+            "SRV_MEDIA": ("C1", "C4"),
+            "SRV_DATA": ("C5", "C8"),
+            "SRV_RTC": ("C9", "C12"),
+            "SRV_LIVE": ("C10", "C11"),
+        }
+        service_positions = {
+            "SVC_VOICE": (-7.0, 7.7),
+            "SVC_VLC": (-5.0, 7.7),
+            "SVC_FTP": (-3.0, 7.7),
+            "SVC_DNS": (-1.0, 7.7),
+            "SVC_TELEMOST": (2.0, 7.7),
+            "SVC_LIVE": (6.0, 7.7),
+        }
 
-        for service_id, pos in service_positions.items():
-            profile = profile_map[service_id]
+        for server in self.servers:
+            self.graph.add_node(
+                server.server_id,
+                level="L0",
+                role="service-server",
+                label=server.model,
+                pos=server_positions[server.server_id],
+                visible_in_logic=True,
+                color="#a78bfa",
+                server_profile=asdict(server),
+                hosted_services=list(server.hosted_service_ids),
+                runtime=asdict(SERVER_BASELINE_RUNTIME[server.server_id]),
+            )
+            for core_id in server_to_core[server.server_id]:
+                self._add_transport_edge(
+                    server.server_id,
+                    core_id,
+                    medium="fiber",
+                    capacity_mbps=25_000.0,
+                    latency_ms=0.35,
+                    redundancy=0.95,
+                    logical_level="L0",
+                    physical_level="L4",
+                )
+
+        for profile in self.services:
+            service_id = profile.service_id
+            codec_profile = CODEC_CATALOG[profile.codec_profile_id]
             self.graph.add_node(
                 service_id,
                 level="L0",
                 role="service",
                 label=profile.name,
-                pos=pos,
+                pos=service_positions[service_id],
                 visible_in_logic=True,
                 color="#d8f3dc",
                 tensor=build_layer_tensor("L0", l0_service_tensor(profile)),
+                hosted_on=profile.server_id,
+                category=profile.category,
+                platform=profile.platform,
+                audio_codec=profile.audio_codec,
+                video_codec=profile.video_codec,
+                critical_latency_ms=profile.critical_latency_ms,
+                codec_profile_id=profile.codec_profile_id,
+                codec_profile_name=codec_profile.display_name,
+                codec_summary=codec_summary(profile.codec_profile_id),
+                codec_profile=asdict(codec_profile),
             )
             self._add_transport_edge(
                 service_id,
-                service_to_core[service_id],
+                profile.server_id,
                 medium="logical-service-binding",
-                capacity_mbps=max(2_000.0, profile.bitrate_mbps * 500),
-                latency_ms=max(1.0, profile.latency_ms_max / 20.0),
-                redundancy=0.90,
+                capacity_mbps=100_000.0,
+                latency_ms=0.05,
+                redundancy=0.99,
                 logical_level="L0",
                 physical_level="L5",
             )

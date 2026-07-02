@@ -38,7 +38,12 @@ STATE_VECTOR_METRICS = (
 )
 
 
-def build_arbitrator_view(model: NetworkModel, tensor_state: dict[str, Any]) -> dict[str, Any]:
+def build_arbitrator_view(
+    model: NetworkModel,
+    tensor_state: dict[str, Any],
+    *,
+    observation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return L7 analysis and a no-remap decision for the current snapshot.
 
     Healthy baseline dynamics should keep `remap.needed` false. Future degraded
@@ -49,10 +54,13 @@ def build_arbitrator_view(model: NetworkModel, tensor_state: dict[str, Any]) -> 
     full_aggregates = level_metric_aggregates(tensor_state, observed_only=False)
     l7_tensor = model.graph.nodes["ARB"].get("tensor") if "ARB" in model.graph.nodes else None
     l7_metrics = tensor_metrics(l7_tensor) if isinstance(l7_tensor, StateTensor) else {}
-    remap_pressure = remap_pressure_from_tensors(aggregates, l7_metrics)
+    observation = observation or {}
+    attack_signals = _attack_signals(observation)
+    remap_pressure = remap_pressure_from_tensors(aggregates, l7_metrics, attack_pressure=attack_signals["attack_pressure"])
     lyapunov_value = lyapunov_value_from_tensors(aggregates, l7_metrics, remap_pressure)
     koopman_residual = koopman_residual_from_tensors(aggregates, l7_metrics, remap_pressure)
-    state_vector = build_state_vector(full_aggregates)
+    state_vector = build_state_vector(full_aggregates, observation=observation)
+    attack_active = bool(observation.get("attacks", {}).get("active", False))
 
     return {
         "node_id": "ARB",
@@ -66,12 +74,19 @@ def build_arbitrator_view(model: NetworkModel, tensor_state: dict[str, Any]) -> 
             "koopman_residual": koopman_residual,
             "remap_pressure": remap_pressure,
             "decision_confidence": decision_confidence(remap_pressure, l7_metrics),
+            **attack_signals,
         },
+        "observations": observation,
         "remap": {
             "needed": remap_pressure > 0.20,
             "action": "NO_REMAP" if remap_pressure <= 0.20 else "PLAN_REMAP",
-            "reason": "healthy_stationary_baseline" if remap_pressure <= 0.20 else "tensor_threshold_pressure",
-            "candidate_actions": [] if remap_pressure <= 0.20 else ["reroute_high_pressure_flows", "increase_slice_reserve"],
+            "reason": (
+                "healthy_stationary_baseline" if remap_pressure <= 0.20
+                else "mitre_attack_observed" if attack_active else "tensor_threshold_pressure"
+            ),
+            "candidate_actions": [] if remap_pressure <= 0.20 else [
+                "rate_limit_attack_traffic", "protect_gold_paths", "reroute_high_pressure_flows"
+            ],
         },
     }
 
@@ -102,7 +117,11 @@ def level_metric_aggregates(tensor_state: dict[str, Any], *, observed_only: bool
     return result
 
 
-def build_state_vector(aggregates: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def build_state_vector(
+    aggregates: dict[str, dict[str, Any]],
+    *,
+    observation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Build a compact numeric vector for Koopman/DMD and Lyapunov pipelines."""
     metric_names = [
         f"{level}.{metric_name}.{statistic}"
@@ -112,13 +131,37 @@ def build_state_vector(aggregates: dict[str, dict[str, Any]]) -> dict[str, Any]:
         aggregate_metric(aggregates, level, metric_name, statistic, 0.0)
         for level, metric_name, statistic in STATE_VECTOR_METRICS
     ]
+    observation = observation or {}
+    attacks = observation.get("attacks", {})
+    traffic = observation.get("traffic", {})
+    observed_names = [
+        "OBS.attack_active_count", "OBS.attack_intensity_ratio", "OBS.attack_rate_mbps",
+        "OBS.legitimate_loss_ratio", "OBS.legitimate_delivery_ratio",
+        "OBS.impacted_gold_flow_count", "OBS.gold_sla_compliance_ratio",
+        "OBS.maximum_target_utilization_percent",
+    ]
+    observed_vector = [
+        float(attacks.get("active_count", 0.0)),
+        float(attacks.get("maximum_intensity_ratio", 0.0)),
+        float(attacks.get("attack_rate_mbps", 0.0)),
+        float(attacks.get("legitimate_loss_ratio", traffic.get("observed_loss_ratio", 0.0))),
+        float(attacks.get("legitimate_delivery_ratio", 1.0)),
+        float(attacks.get("impacted_gold_flow_count", 0.0)),
+        float(attacks.get("gold_sla_compliance_ratio", 1.0)),
+        float(attacks.get("maximum_target_utilization_percent", 0.0)),
+    ]
     return {
-        "metric_names": metric_names,
-        "vector": vector,
+        "metric_names": metric_names + observed_names,
+        "vector": vector + observed_vector,
     }
 
 
-def remap_pressure_from_tensors(aggregates: dict[str, dict[str, Any]], l7_metrics: dict[str, float]) -> float:
+def remap_pressure_from_tensors(
+    aggregates: dict[str, dict[str, Any]],
+    l7_metrics: dict[str, float],
+    *,
+    attack_pressure: float = 0.0,
+) -> float:
     l1_min_sla = aggregate_metric(aggregates, "L1", "sla_margin", "min", 1.0)
     l2_max_cpu = aggregate_metric(aggregates, "L2", "cpu_load_percent", "max", 0.0)
     edge_min_stability = aggregate_metric(aggregates, "EDGE", "stability_margin", "min", 1.0)
@@ -132,8 +175,25 @@ def remap_pressure_from_tensors(aggregates: dict[str, dict[str, Any]], l7_metric
         (edge_max_loss - 0.003) / 0.002,
         (terrain_max_risk - 0.50) / 0.50,
         l7_metrics.get("remap_pressure", 0.0),
+        attack_pressure,
     ]
     return round(max(0.0, min(1.0, max(pressures))), 6)
+
+
+def _attack_signals(observation: dict[str, Any]) -> dict[str, float]:
+    attacks = observation.get("attacks", {})
+    active_count = float(attacks.get("active_count", 0.0))
+    intensity = float(attacks.get("maximum_intensity_ratio", 0.0))
+    resource = float(attacks.get("target_resource_pressure", 0.0))
+    loss = float(attacks.get("legitimate_loss_ratio", 0.0))
+    gold_compliance = float(attacks.get("gold_sla_compliance_ratio", 1.0))
+    attack_pressure = max(resource, intensity * 0.65, min(1.0, loss * 4.0), 1.0 - gold_compliance)
+    return {
+        "attack_active_count": active_count,
+        "attack_intensity_ratio": intensity,
+        "attack_pressure": round(attack_pressure, 6),
+        "gold_sla_compliance_ratio": gold_compliance,
+    }
 
 
 def lyapunov_value_from_tensors(

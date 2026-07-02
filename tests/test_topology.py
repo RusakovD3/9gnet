@@ -28,7 +28,7 @@ def test_tensor_is_state_vector() -> None:
 
 
 def test_l0_service_tensor_metrics() -> None:
-    tensor = MODEL.graph.nodes["SVC_AUDIO"]["tensor"]
+    tensor = MODEL.graph.nodes["SVC_VLC"]["tensor"]
     assert tensor.metric_names == (
         "service_code",
         "bitrate_mbps",
@@ -97,8 +97,10 @@ def test_l5_l6_l7_l8_tensors_are_present() -> None:
 
 
 def test_service_count() -> None:
-    l0_nodes = [node for node, attrs in MODEL.graph.nodes(data=True) if attrs["level"] == "L0"]
-    assert len(l0_nodes) == 4
+    services = [node for node, attrs in MODEL.graph.nodes(data=True) if attrs.get("role") == "service"]
+    servers = [node for node, attrs in MODEL.graph.nodes(data=True) if attrs.get("role") == "service-server"]
+    assert len(services) == 6
+    assert len(servers) == 4
 
 
 def test_subscriber_count() -> None:
@@ -142,7 +144,8 @@ def test_stationary_dynamics_snapshots_every_five_seconds() -> None:
     assert dynamics["ideal_t0"]["metrics"]["subscriber_count"] == 240
     assert dynamics["ideal_t0"]["metrics"]["aggregation_switch_count"] == 6
     assert dynamics["ideal_t0"]["metrics"]["core_router_count"] == 12
-    assert dynamics["ideal_t0"]["metrics"]["service_count"] == 4
+    assert dynamics["ideal_t0"]["metrics"]["service_count"] == 6
+    assert dynamics["ideal_t0"]["metrics"]["service_server_count"] == 4
     assert dynamics["ideal_t0"]["metrics"]["maximum_planned_link_utilization"] <= 0.12
     assert dynamics["ideal_t0"]["metrics"]["minimum_link_stability_margin"] >= 0.88
     assert dynamics["ideal_t0"]["metrics"]["l7_decision"] == "NO_REMAP"
@@ -262,7 +265,7 @@ def test_packet_simulation_builds_realistic_in_memory_headers() -> None:
     assert summary["tcp_flow_count"] > 0
     assert summary["udp_flow_count"] > 0
     assert summary["observed_loss_ratio"] == 0.0
-    assert set(summary["applications"]) == {"DNS", "FTP_DATA", "RTP_MP3", "RTP_OPUS"}
+    assert set(summary["applications"]) == {"DNS", "FTP_DATA", "LIVE_HLS", "RTP_OPUS", "RTP_TELEMOST", "RTP_VLC_AV"}
     assert sum(item["flow_count"] for item in summary["applications"].values()) == 240
     assert summary["offered_rate_mbps"] > 0.0
     assert 0.0 < summary["protocol_efficiency_ratio"] < 1.0
@@ -292,5 +295,5 @@ def test_dynamics_chart_series_exposes_sla_traffic_and_arbitrator_metrics() -> N
     assert min(series["traffic_rate_mbps"]) > 0.0
     assert series["remap_pressure"] == [0.0, 0.0]
     applications = extract_application_series(dynamics)
-    assert set(applications) == {"DNS", "FTP_DATA", "RTP_MP3", "RTP_OPUS"}
+    assert set(applications) == {"DNS", "FTP_DATA", "LIVE_HLS", "RTP_OPUS", "RTP_TELEMOST", "RTP_VLC_AV"}
     assert all(len(values["offered_rate_mbps"]) == 2 for values in applications.values())

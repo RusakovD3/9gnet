@@ -32,7 +32,7 @@ def test_voice_flows_use_opus_rtp_and_voice_service() -> None:
         for _, attrs in model.graph.nodes(data=True)
         if attrs.get("level") == "L1"
     )
-    assert traffic_kinds["voice"] == 60
+    assert traffic_kinds["voice"] == 40
 
     traffic = simulate_packet_snapshot(
         model,
@@ -43,8 +43,9 @@ def test_voice_flows_use_opus_rtp_and_voice_service() -> None:
         packet_sample_limit=1000,
     )
     voice_flows = [flow for flow in traffic["flows"] if flow["application"] == "RTP_OPUS"]
-    assert len(voice_flows) == 60
-    assert all(flow["server_node"] == "SVC_VOICE" for flow in voice_flows)
+    assert len(voice_flows) == 40
+    assert all(flow["service_node"] == "SVC_VOICE" for flow in voice_flows)
+    assert all(flow["server_node"] == "SRV_MEDIA" for flow in voice_flows)
     assert all(flow["packets_per_second"] == 50 for flow in voice_flows)
     assert all(flow["line_bitrate_kbps"] > flow["codec_bitrate_kbps"] for flow in voice_flows)
 

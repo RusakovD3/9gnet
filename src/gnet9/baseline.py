@@ -15,12 +15,15 @@ from .models import ServiceProfile
 
 
 # Stable numeric category codes used by tensor vectors.
-SERVICE_CODES = {"Voice": 1.0, "Audio": 2.0, "FTP": 3.0, "DNS": 4.0}
+SERVICE_CODES = {"Voice": 1.0, "VLC AV": 2.0, "FTP": 3.0, "DNS": 4.0, "Telemost": 5.0, "Live Streaming": 6.0}
 TRAFFIC_TO_SERVICE_CODE = {
     TrafficKind.VOICE: SERVICE_CODES["Voice"],
-    TrafficKind.BROADCAST_MP3: SERVICE_CODES["Audio"],
+    TrafficKind.BROADCAST_MP3: SERVICE_CODES["VLC AV"],
+    TrafficKind.VLC_AV: SERVICE_CODES["VLC AV"],
     TrafficKind.FTP: SERVICE_CODES["FTP"],
     TrafficKind.DNS: SERVICE_CODES["DNS"],
+    TrafficKind.VIDEO_CONFERENCE: SERVICE_CODES["Telemost"],
+    TrafficKind.LIVE_STREAMING: SERVICE_CODES["Live Streaming"],
 }
 ACCESS_TYPE_CODES = {"fixed": 0.0, "mobile": 1.0}
 PLACEMENT_ROLE_CODES = {
@@ -30,6 +33,7 @@ PLACEMENT_ROLE_CODES = {
     "aggregation-switch": 3.0,
     "core-router": 4.0,
     "arbitrator": 7.0,
+    "service-server": 8.0,
 }
 
 
@@ -88,9 +92,15 @@ L1_ACCESS_GRADE_BASELINE = {
 L1_PROCESSING_DELAY_MS = {
     ("mobile", TrafficKind.VOICE): 18.0,
     ("mobile", TrafficKind.BROADCAST_MP3): 24.0,
+    ("mobile", TrafficKind.VLC_AV): 28.0,
+    ("mobile", TrafficKind.VIDEO_CONFERENCE): 22.0,
+    ("mobile", TrafficKind.LIVE_STREAMING): 32.0,
     ("mobile", TrafficKind.FTP): 55.0,
     ("mobile", TrafficKind.DNS): 12.0,
     ("fixed", TrafficKind.BROADCAST_MP3): 10.0,
+    ("fixed", TrafficKind.VLC_AV): 11.0,
+    ("fixed", TrafficKind.VIDEO_CONFERENCE): 9.0,
+    ("fixed", TrafficKind.LIVE_STREAMING): 14.0,
     ("fixed", TrafficKind.FTP): 22.0,
     ("fixed", TrafficKind.DNS): 3.0,
     ("fixed", TrafficKind.VOICE): 7.0,

@@ -5,21 +5,6 @@ service templates and topology sizes. Keeping these values in one place makes
 it easier to tune the experiment without digging through the builder logic.
 """
 
-from dataclasses import dataclass
-
-
-@dataclass(frozen=True)
-class ServiceTemplate:
-    """Input template for an L0 service before it is added to the graph."""
-
-    name: str
-    bitrate_mbps: float
-    latency_ms_max: float
-    jitter_ms_max: float
-    availability_target: float
-    priority: str
-
-
 # Human-readable names of the 9 G-Net layers.
 LEVEL_NAMES = {
     "L0": "Сервисы",
@@ -52,22 +37,15 @@ CRITICALITY_COLORS = {
     "bronze": "#90be6d",
 }
 
-# L0 service catalogue.  Bitrate is a representative planning demand for the
-# service class, not a codec/chassis limit and not the sum of all L1 flows.
-DEFAULT_SERVICES = (
-    ServiceTemplate("Voice", 0.032, 80.0, 20.0, 0.9995, "gold"),
-    ServiceTemplate("Audio", 0.320, 80.0, 20.0, 0.9990, "gold"),
-    ServiceTemplate("FTP", 4.096, 300.0, 120.0, 0.9950, "silver"),
-    ServiceTemplate("DNS", 0.064, 30.0, 10.0, 0.9999, "gold"),
-)
-
 # Localized names are used only in human-facing reports and visualizations.
 # Stable English service identifiers remain unchanged in JSON and code.
 SERVICE_DISPLAY_NAMES = {
     "Voice": "Голос",
-    "Audio": "Аудио",
+    "VLC AV": "VLC: голос и видео",
     "FTP": "FTP",
     "DNS": "DNS",
+    "Telemost": "Видеоконференция «Телемост»",
+    "Live Streaming": "Прямая трансляция",
 }
 
 # L1 subscriber generation settings.
