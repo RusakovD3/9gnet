@@ -29,13 +29,40 @@ class SlaGrade(str, Enum):
 class TrafficKind(str, Enum):
     """Supported traffic classes in the current L1 model."""
 
-    BROADCAST_MP3 = "broadcast_mp3"
     FTP = "ftp"
     DNS = "dns"
     VOICE = "voice"
     VLC_AV = "vlc_av"
     VIDEO_CONFERENCE = "video_conference"
     LIVE_STREAMING = "live_streaming"
+
+
+TRAFFIC_REFERENCE_URLS: dict[str, tuple[str, ...]] = {
+    "voice": (
+        "https://www.rfc-editor.org/rfc/rfc7587.html",
+        "https://www.itu.int/rec/T-REC-G.114",
+    ),
+    "vlc_av": (
+        "https://www.rfc-editor.org/rfc/rfc7587.html",
+        "https://www.rfc-editor.org/rfc/rfc6184.html",
+    ),
+    "ftp": ("https://www.rfc-editor.org/rfc/rfc959.html",),
+    "dns": (
+        "https://www.rfc-editor.org/rfc/rfc1035.html",
+        "https://www.rfc-editor.org/rfc/rfc7766.html",
+    ),
+    "video_conference": (
+        "https://www.w3.org/TR/webrtc/",
+        "https://www.rfc-editor.org/rfc/rfc7587.html",
+        "https://www.rfc-editor.org/rfc/rfc7742.html",
+        "https://www.rfc-editor.org/rfc/rfc8834.html",
+        "https://www.itu.int/rec/T-REC-G.114",
+    ),
+    "live_streaming": (
+        "https://developer.apple.com/documentation/http-live-streaming/"
+        "hls-authoring-specification-for-apple-devices/",
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -87,11 +114,25 @@ class D0SLSubscriberPolicy:
     video_latency_budget_ms: float | None = None
     failure_latency_ms: float | None = None
     tcp_retransmission_budget_percent: float | None = None
+    request_rate_qps: float | None = None
+    timeout_budget_percent: float | None = None
+    file_size_mib: float | None = None
+    completion_time_budget_seconds: float | None = None
+    startup_time_budget_ms: float | None = None
+    rebuffer_ratio_budget_percent: float | None = None
+    segment_deadline_miss_budget_percent: float | None = None
+    primary_slo_semantics: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
         result["grade"] = self.grade.value
         result["traffic"] = self.traffic.value
+        result["reference_urls"] = list(
+            TRAFFIC_REFERENCE_URLS.get(self.traffic.value, ())
+        )
+        result["slo_value_origin"] = (
+            "explicit_gnet9_engineering_policy_not_protocol_standard"
+        )
         return result
 
 
@@ -99,9 +140,10 @@ class D0SLSubscriberPolicy:
 class L1QueueModel:
     """Simple Kendall queue model for one subscriber flow.
 
-    Current model: M/M/1/128/finite/FIFO.
-    It is not a full network simulator, but it gives a useful baseline load and
-    stability estimate for every L1 subscriber.
+    Current model: M/M/1/128/∞/FIFO. ``128`` is the finite system capacity;
+    the subscriber request population is unbounded. It is not a full network
+    simulator, but the stationary M/M/1/K probabilities are calculated
+    consistently instead of using the infinite-buffer approximation.
     """
 
     kendall: str
@@ -111,8 +153,13 @@ class L1QueueModel:
     capacity_packets: int
     queue_discipline: str
     utilization_rho: float
+    blocking_probability: float
+    effective_arrival_rate_pps: float
+    mean_queue_depth_packets: float
     mean_system_time_ms: float
     stability_margin: float
+    arrival_rate_origin: str
+    service_rate_origin: str
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -249,6 +296,23 @@ def _parse_sla_block(name: str, body: str) -> D0SLSubscriberPolicy:
         video_latency_budget_ms=_read_optional_float_field(scalar_body, "video_latency_budget_ms"),
         failure_latency_ms=_read_optional_float_field(scalar_body, "failure_latency_ms"),
         tcp_retransmission_budget_percent=_read_optional_float_field(scalar_body, "tcp_retransmission_budget_percent"),
+        request_rate_qps=_read_optional_float_field(scalar_body, "request_rate_qps"),
+        timeout_budget_percent=_read_optional_float_field(scalar_body, "timeout_budget_percent"),
+        file_size_mib=_read_optional_float_field(scalar_body, "file_size_mib"),
+        completion_time_budget_seconds=_read_optional_float_field(
+            scalar_body,
+            "completion_time_budget_seconds",
+        ),
+        startup_time_budget_ms=_read_optional_float_field(scalar_body, "startup_time_budget_ms"),
+        rebuffer_ratio_budget_percent=_read_optional_float_field(
+            scalar_body,
+            "rebuffer_ratio_budget_percent",
+        ),
+        segment_deadline_miss_budget_percent=_read_optional_float_field(
+            scalar_body,
+            "segment_deadline_miss_budget_percent",
+        ),
+        primary_slo_semantics=_read_optional_string_field(scalar_body, "primary_slo_semantics"),
     )
 
 
@@ -327,7 +391,7 @@ def _read_optional_string_field(body: str, field: str) -> str | None:
 
 
 def build_l1_queue_model(policy: D0SLSubscriberPolicy, *, packet_size_bytes: int | None = None) -> L1QueueModel:
-    """Build M/M/1/K/FIFO queue parameters for one subscriber flow."""
+    """Build internally consistent stationary M/M/1/K/FIFO parameters."""
     if packet_size_bytes is None:
         # Opus uses one codec payload per 20 ms RTP packet (50 packets/s).
         packet_size_bytes = (
@@ -336,23 +400,102 @@ def build_l1_queue_model(policy: D0SLSubscriberPolicy, *, packet_size_bytes: int
             else 1200
         )
     bits_per_packet = packet_size_bytes * 8
-    arrival_rate = max(0.1, policy.target_bitrate_kbps * 1000.0 / bits_per_packet)
+    if policy.traffic is TrafficKind.DNS and policy.request_rate_qps is not None:
+        # Одна DNS-транзакция даёт как минимум запрос и ответ на access-линии.
+        # TCP fallback моделируется отдельно в пакетной модели и не раздувает t0.
+        arrival_rate = max(0.1, 2.0 * policy.request_rate_qps)
+        arrival_rate_origin = "dns_query_plus_response_from_explicit_request_rate_qps"
+    elif policy.traffic is TrafficKind.VOICE and policy.packetization_ms:
+        arrival_rate = 1000.0 / float(policy.packetization_ms)
+        arrival_rate_origin = "opus_packetization_interval"
+    else:
+        arrival_rate = max(0.1, policy.target_bitrate_kbps * 1000.0 / bits_per_packet)
+        arrival_rate_origin = "target_payload_bitrate_divided_by_packet_size"
 
-    # Higher SLA gets more service reserve, therefore lower utilization rho.
+    # Higher SLA gets more service reserve. For low-rate control traffic the
+    # latency reserve, not the bitrate multiplier, determines the scheduler
+    # service rate; otherwise a 64-kbit/s DNS profile would paradoxically have
+    # a queueing time above its own 30-ms budget.
     service_multiplier = {SlaGrade.GOLD: 3.2, SlaGrade.SILVER: 2.4, SlaGrade.BRONZE: 1.9}[policy.grade]
-    service_rate = arrival_rate * service_multiplier
+    queue_delay_target_ms = min(
+        policy.latency_budget_ms * 0.25,
+        {SlaGrade.GOLD: 8.0, SlaGrade.SILVER: 15.0, SlaGrade.BRONZE: 25.0}[policy.grade],
+    )
+    latency_driven_service_rate = arrival_rate + 1000.0 / max(queue_delay_target_ms, 0.1)
+    service_rate = max(
+        arrival_rate * service_multiplier,
+        latency_driven_service_rate,
+    )
     rho = arrival_rate / service_rate
+    capacity_packets = 128
+    (
+        blocking_probability,
+        effective_arrival_rate,
+        _mean_system_packets,
+        mean_queue_packets,
+        mean_system_time_ms,
+    ) = _mm1k_stationary_metrics(
+        arrival_rate,
+        service_rate,
+        capacity_packets,
+    )
 
     return L1QueueModel(
-        kendall="M/M/1/128/finite/FIFO",
+        kendall="M/M/1/128/∞/FIFO",
         arrival_rate_pps=float(arrival_rate),
         service_rate_pps=float(service_rate),
         servers=1,
-        capacity_packets=128,
+        capacity_packets=capacity_packets,
         queue_discipline="FIFO",
         utilization_rho=float(rho),
-        mean_system_time_ms=float(1000.0 / max(service_rate - arrival_rate, 1e-9)),
+        blocking_probability=float(blocking_probability),
+        effective_arrival_rate_pps=float(effective_arrival_rate),
+        mean_queue_depth_packets=float(mean_queue_packets),
+        mean_system_time_ms=float(mean_system_time_ms),
         stability_margin=float(1.0 - rho),
+        arrival_rate_origin=arrival_rate_origin,
+        service_rate_origin="sla_reserve_and_latency_budget_engineering_policy",
+    )
+
+
+def _mm1k_stationary_metrics(
+    arrival_rate: float,
+    service_rate: float,
+    capacity: int,
+) -> tuple[float, float, float, float, float]:
+    """Return ``p_K, λ_eff, L, Lq, W_ms`` for a stationary M/M/1/K queue."""
+    if arrival_rate < 0.0 or service_rate <= 0.0 or capacity < 1:
+        raise ValueError("Некорректные параметры очереди M/M/1/K")
+    rho = arrival_rate / service_rate
+    if abs(rho - 1.0) <= 1e-12:
+        p0 = 1.0 / (capacity + 1.0)
+        blocking = p0
+        mean_system = capacity / 2.0
+    else:
+        rho_k = rho**capacity
+        rho_k1 = rho_k * rho
+        denominator = 1.0 - rho_k1
+        p0 = (1.0 - rho) / denominator
+        blocking = p0 * rho_k
+        mean_system = (
+            rho
+            * (1.0 - (capacity + 1.0) * rho_k + capacity * rho_k1)
+            / ((1.0 - rho) * denominator)
+        )
+    effective_arrival = arrival_rate * (1.0 - blocking)
+    busy_probability = 1.0 - p0
+    mean_queue = max(0.0, mean_system - busy_probability)
+    mean_system_time_ms = (
+        0.0
+        if effective_arrival <= 1e-15
+        else 1000.0 * mean_system / effective_arrival
+    )
+    return (
+        blocking,
+        effective_arrival,
+        mean_system,
+        mean_queue,
+        mean_system_time_ms,
     )
 
 
@@ -378,7 +521,9 @@ def simulate_l1_monitoring(
         latency = _sample_latency(policy, queue_model, rng)
         jitter = _sample_jitter(policy, rng)
         packet_loss = _sample_packet_loss(policy, rng)
-        queue_depth = int(rng.poisson(max(1.0, queue_model.utilization_rho * 12.0)))
+        queue_depth = int(
+            rng.poisson(max(0.05, queue_model.mean_queue_depth_packets))
+        )
 
         below_bitrate_counter = below_bitrate_counter + 1 if bitrate < policy.min_bitrate_kbps else 0
         bitrate_drop_alarm = below_bitrate_counter >= policy.bitrate_drop_window_seconds

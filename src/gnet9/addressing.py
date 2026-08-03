@@ -41,7 +41,7 @@ NETWORKS = {
     "l2_management": {
         "subnet": "10.10.0.0/24",
         "title": "L2: управление маршрутизаторами и коммутаторами",
-        "description": "Loopback/management-адреса C1–C12 и A1–A6.",
+        "description": "Loopback/management-адреса C1–C12, A1–A6, RAN1–RAN6 и OLT1–OLT6.",
     },
     "mobile_access": {
         "subnet": "10.1.0.0/16",
@@ -150,6 +150,12 @@ def _ip_for_node(node_id: str, attrs: dict[str, Any], fallback_index: int) -> st
     if role == "aggregation-switch" and node_id.startswith("A"):
         return f"10.10.0.{100 + _numeric_suffix(node_id, fallback_index)}"
 
+    if role == "radio-access-node" and node_id.startswith("RAN"):
+        return f"10.10.0.{150 + _numeric_suffix(node_id, fallback_index)}"
+
+    if role == "optical-line-terminal" and node_id.startswith("OLT"):
+        return f"10.10.0.{180 + _numeric_suffix(node_id, fallback_index)}"
+
     if role == "mobile-subscriber":
         group, subscriber = _subscriber_numbers(node_id)
         return f"10.1.{group}.{subscriber}"
@@ -172,7 +178,7 @@ def _subnet_for_node(node_id: str, attrs: dict[str, Any]) -> str:
     level = attrs.get("level")
     if level == "L0":
         return NETWORKS["l0_services"]["subnet"]
-    if role in {"core-router", "aggregation-switch"}:
+    if role in {"core-router", "aggregation-switch", "radio-access-node", "optical-line-terminal"}:
         return NETWORKS["l2_management"]["subnet"]
     if role == "mobile-subscriber":
         group, _ = _subscriber_numbers(node_id)
@@ -192,7 +198,7 @@ def _scope_for_node(node_id: str, attrs: dict[str, Any]) -> str:
     level = attrs.get("level")
     if level == "L0":
         return "l0_services"
-    if role in {"core-router", "aggregation-switch"}:
+    if role in {"core-router", "aggregation-switch", "radio-access-node", "optical-line-terminal"}:
         return "l2_management"
     if role == "mobile-subscriber":
         return "mobile_access"
@@ -211,6 +217,8 @@ def _role_ru(role: str) -> str:
         "service": "логический сервис L0",
         "core-router": "маршрутизатор ядра C",
         "aggregation-switch": "агрегирующий коммутатор A",
+        "radio-access-node": "RAN/UPF access-узел",
+        "optical-line-terminal": "OLT access-узел",
         "mobile-subscriber": "мобильный абонент",
         "fixed-subscriber": "фиксированный абонент",
         "arbitrator": "арбитратор L7",

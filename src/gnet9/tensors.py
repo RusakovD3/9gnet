@@ -176,7 +176,7 @@ STATE_TENSOR_SPECS: dict[str, StateTensorSpec] = {
     "L7": StateTensorSpec(
         "L7",
         (
-            "hausdorff_distance",
+            "gold_threat_minimum_distance_ms",
             "lyapunov_value",
             "lyapunov_delta",
             "koopman_residual",
@@ -185,7 +185,7 @@ STATE_TENSOR_SPECS: dict[str, StateTensorSpec] = {
             "action_cost",
         ),
         {
-            "hausdorff_distance": "model-coordinate",
+            "gold_threat_minimum_distance_ms": "ms",
             "lyapunov_value": "normalized",
             "lyapunov_delta": "normalized",
             "koopman_residual": "normalized",

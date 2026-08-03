@@ -63,6 +63,8 @@ class CodecProfile:
     application_protocol: str
     components: tuple[CodecComponent, ...]
     realism_note: str
+    reference_urls: tuple[str, ...] = ()
+    value_origin: str = "standards_based_protocol_profile_with_engineering_bitrates"
 
 
 @dataclass
@@ -83,6 +85,10 @@ class ServiceProfile:
     video_codec: str | None = None
     critical_latency_ms: float | None = None
     codec_profile_id: str = ""
+    reference_urls: tuple[str, ...] = ()
+    slo_value_origin: str = "explicit_engineering_policy_not_protocol_standard"
+    primary_slo_metrics: tuple[str, ...] = ()
+    modeling_limitations: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -99,6 +105,21 @@ class ServerProfile:
     network_ports_gbps: tuple[int, ...]
     hosted_service_ids: tuple[str, ...]
     source_url: str
+    reference_urls: tuple[str, ...] = ()
+    configuration_origin: str = "supported_vendor_platform_plus_selected_lab_configuration"
+    threads_total: int = 128
+    core_count_semantics: str = "total_physical_cores_across_both_cpu_sockets"
+    psu_count: int = 2
+    psu_rating_w_each: int = 800
+    # В спецификации Dell класс указан как ``Platinum``; не расширяем это
+    # обозначение до отдельной сертификации 80 PLUS без прямого источника.
+    psu_efficiency_class: str = "Platinum"
+    psu_redundancy_mode: str = "1+1"
+    psu_hot_swappable: bool = True
+    psu_source_url: str = ""
+    psu_rating_semantics: str = (
+        "vendor_supported_nameplate_capacity_per_psu_not_measured_server_draw"
+    )
 
 
 @dataclass(frozen=True)

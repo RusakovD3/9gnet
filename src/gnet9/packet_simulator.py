@@ -12,11 +12,12 @@ import math
 from dataclasses import dataclass
 from typing import Any, Literal
 
-import networkx as nx
-
 from .addressing import NetworkIdentity, build_network_identities
 from .attacks import apply_attack_effects
 from .models import NetworkModel, StateTensor
+from .metrics import gold_route_hausdorff_view
+from .remapping import apply_gold_first_remap
+from .routing import shortest_data_path
 
 
 ETHERNET_HEADER_BYTES = 14
@@ -47,17 +48,6 @@ TRAFFIC_APPS = {
         "codec_profile_id": "voice_opus_rtp",
         "media_codec": "Opus",
         "rtp_clock_rate_hz": 48_000,
-    },
-    "broadcast_mp3": {
-        "application": "RTP_MP3",
-        "transport": "UDP",
-        "service_node": "SVC_VLC",
-        "server_port": 5004,
-        "payload_unit_bytes": UDP_PAYLOAD_BYTES,
-        "codec_profile_id": "vlc_opus_h264_rtp",
-        "media_codec": "Opus + H.264/AVC",
-        "rtp_clock_rate_hz": 90_000,
-        "rtp_payload_type": 96,
     },
     "vlc_av": {
         "application": "RTP_VLC_AV",
@@ -96,7 +86,7 @@ TRAFFIC_APPS = {
         "server_port": 5006,
         "payload_unit_bytes": UDP_PAYLOAD_BYTES,
         "codec_profile_id": "webrtc_opus_h264",
-        "media_codec": "Opus + H.264/AVC",
+        "media_codec": "Opus + VP8/H.264 Constrained Baseline",
         "rtp_clock_rate_hz": 90_000,
         "rtp_payload_type": 98,
     },
@@ -140,6 +130,10 @@ def simulate_packet_snapshot(
     detail: PacketDetail = "sample",
     packet_sample_limit: int = 48,
     attack_events: list[dict[str, Any]] | None = None,
+    attack_precursors: list[dict[str, Any]] | None = None,
+    defense_plan: dict[str, Any] | None = None,
+    attack_scenario: str | None = None,
+    power_runtime_state: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build simulated traffic for one step.
 
@@ -151,7 +145,6 @@ def simulate_packet_snapshot(
 
     identities = build_network_identities(model)
     flows: list[dict[str, Any]] = []
-    packet_sample: list[dict[str, Any]] = []
 
     subscribers = [
         (node_id, attrs)
@@ -162,16 +155,74 @@ def simulate_packet_snapshot(
     for flow_index, (subscriber_id, attrs) in enumerate(subscribers, start=1):
         flow = _build_flow(model, identities, subscriber_id, attrs, flow_index, step_index, time_seconds, step_seconds)
         flows.append(flow)
-        if detail == "sample" and len(packet_sample) < packet_sample_limit:
-            remaining = packet_sample_limit - len(packet_sample)
-            packet_sample.extend(_sample_packets_for_flow(flow, identities, model, remaining))
 
-    flows, attack_state = apply_attack_effects(model, flows, attack_events or [])
-    result: dict[str, Any] = {"summary": _traffic_summary(flows), "attack_state": attack_state}
+    # Реальный data-plane overlay применяется до моделирования ущерба. Поэтому
+    # успешно переназначенный поток больше не считается проходящим через цель.
+    flows, routing_summary = apply_gold_first_remap(
+        model,
+        flows,
+        attack_events or [],
+        defense_plan,
+        step_index=step_index,
+        identities=identities,
+    )
+    routing_summary["by_sla"] = {
+        str(item["sla_grade"]): item for item in routing_summary.get("tiers", [])
+    }
+    routing_summary["service_failover_flow_count"] = int(routing_summary.get("failover_flow_count", 0))
+    maximum_network_utilization = max(
+        float(routing_summary.get("maximum_projected_edge_utilization_percent", 0.0)),
+        float(routing_summary.get("maximum_projected_node_utilization_percent", 0.0)),
+    )
+    # ``apply_gold_first_remap`` already includes projected server CPU, RAM and
+    # sessions in the aggregate maximum.  Keep that value: replacing it with
+    # the network-only maximum would hide a binding server admission resource
+    # from the arbitrator state vector and from exported diagnostics.
+    routing_summary["maximum_projected_network_utilization_percent"] = (
+        maximum_network_utilization
+    )
+    routing_summary["maximum_projected_utilization_percent"] = max(
+        float(routing_summary.get("maximum_projected_utilization_percent", 0.0)),
+        maximum_network_utilization,
+        float(
+            routing_summary.get(
+                "maximum_projected_server_resource_utilization_percent",
+                0.0,
+            )
+        ),
+    )
+    routing_summary["route_change_ratio"] = float(routing_summary.get("rerouted_flow_count", 0)) / max(len(flows), 1)
+    routing_summary["gold_route_hausdorff"] = gold_route_hausdorff_view(model, flows)
+
+    flows, attack_state = apply_attack_effects(
+        model,
+        flows,
+        attack_events or [],
+        precursor_events=attack_precursors or [],
+        defense_plan=defense_plan,
+        identities=identities,
+        scenario=attack_scenario,
+        power_runtime_state=power_runtime_state,
+    )
+    if attack_scenario is None and any(
+        str(event.get("attack_id", "")).startswith("PRED-")
+        for event in (attack_events or [])
+    ):
+        attack_state["scenario"] = "predictive-demo"
+    attack_state["routing"] = routing_summary
+    result: dict[str, Any] = {
+        "summary": _traffic_summary(flows, model),
+        "attack_state": attack_state,
+    }
     if detail in {"flows", "sample"}:
         result["flows"] = flows
     if detail == "sample":
-        result["packet_sample"] = packet_sample
+        result["packet_sample"] = _build_packet_sample(
+            flows,
+            identities,
+            model,
+            packet_sample_limit,
+        )
     return result
 
 
@@ -271,6 +322,7 @@ def _build_voice_flow(context: FlowContext) -> dict[str, Any]:
 
 
 def _build_tcp_flow(context: FlowContext) -> dict[str, Any]:
+    policy = context.attrs.get("d0sl_policy", {})
     data_route = _route(context.model, context.server_node, context.subscriber_id)
     ack_route = list(reversed(data_route))
     payload_bytes = _payload_bytes(context.payload_bps, context.step_seconds, TCP_MSS_BYTES)
@@ -300,13 +352,22 @@ def _build_tcp_flow(context: FlowContext) -> dict[str, Any]:
             "data_segments": data_segments,
             "ack_segments": ack_segments,
             "mss_bytes": TCP_MSS_BYTES,
-            "tcp_retransmission_budget_percent": context.attrs.get("d0sl_policy", {}).get("tcp_retransmission_budget_percent"),
+            "tcp_retransmission_budget_percent": policy.get("tcp_retransmission_budget_percent"),
             "tcp_quality_grade": context.attrs.get("sla_grade") if context.attrs.get("traffic_kind") == "ftp" else None,
+            "goodput_mbps": round(payload_bytes * 8.0 / max(context.step_seconds, 1) / 1_000_000.0, 6),
+            "file_size_mib": policy.get("file_size_mib"),
+            "completion_time_budget_seconds": policy.get("completion_time_budget_seconds"),
             "media_codec": context.app.get("media_codec"),
             "glass_to_glass_latency_ms": (
                 round(float(context.attrs.get("latency_budget_ms", 0.0)) * 0.65, 3)
                 if context.attrs.get("traffic_kind") == "live_streaming" else None
             ),
+            "startup_time_budget_ms": policy.get("startup_time_budget_ms"),
+            "rebuffer_ratio_budget_percent": policy.get("rebuffer_ratio_budget_percent"),
+            "segment_deadline_miss_budget_percent": policy.get(
+                "segment_deadline_miss_budget_percent"
+            ),
+            "application_slo_semantics": policy.get("primary_slo_semantics"),
         },
     )
 
@@ -335,6 +396,12 @@ def _build_udp_media_flow(context: FlowContext) -> dict[str, Any]:
         "video_latency_budget_ms": context.attrs.get("d0sl_policy", {}).get("video_latency_budget_ms"),
         "failure_latency_ms": context.attrs.get("d0sl_policy", {}).get("failure_latency_ms"),
         "media_codec": context.app.get("media_codec"),
+        "media_security_profile": (
+            "DTLS-SRTP/SRTCP required by WebRTC profile"
+            if context.attrs.get("traffic_kind") == "video_conference"
+            else None
+        ),
+        "security_encapsulation_byte_overhead_modeled": False,
     }
     if has_rtp:
         extra.update(
@@ -365,7 +432,11 @@ def _build_udp_media_flow(context: FlowContext) -> dict[str, Any]:
 def _build_dns_flow(context: FlowContext) -> dict[str, Any]:
     query_route = _route(context.model, context.subscriber_id, context.server_node)
     response_route = list(reversed(query_route))
-    request_rate = _tensor_metric(context.attrs.get("tensor"), "request_rate_pps", default=1.0)
+    policy = context.attrs.get("d0sl_policy", {})
+    request_rate = float(
+        policy.get("request_rate_qps")
+        or _tensor_metric(context.attrs.get("tensor"), "request_rate_pps", default=1.0)
+    )
     query_count = max(1, int(round(request_rate * context.step_seconds)))
     query_bytes = int(context.app["query_payload_bytes"])
     response_bytes = int(context.app["response_payload_bytes"])
@@ -390,6 +461,12 @@ def _build_dns_flow(context: FlowContext) -> dict[str, Any]:
         extra={
             "dns_queries": query_count,
             "dns_responses": query_count,
+            "dns_request_rate_qps": request_rate,
+            "dns_response_time_ms": round(query_latency_ms + response_latency_ms, 4),
+            "dns_timeout_count": 0,
+            "dns_servfail_count": 0,
+            "dns_timeout_budget_percent": policy.get("timeout_budget_percent"),
+            "application_slo_semantics": policy.get("primary_slo_semantics"),
             "media_codec": context.app.get("media_codec"),
         },
     )
@@ -436,6 +513,9 @@ def _flow_record(
         "expected_loss_ratio": round(expected_loss, 8),
         "observed_dropped_packets": 0,
         "observed_retransmissions": 0,
+        "home_access_node": context.attrs.get("home_access"),
+        "active_access_node": context.attrs.get("home_access"),
+        "active_access_role": "primary",
         "sla_grade": context.attrs.get("sla_grade"),
         "traffic_kind": context.attrs.get("traffic_kind"),
         "codec": context.attrs.get("codec"),
@@ -454,8 +534,11 @@ def _sample_packets_for_flow(
     model: NetworkModel,
     limit: int,
 ) -> list[dict[str, Any]]:
-    if limit <= 0:
+    if limit <= 0 or flow.get("isolated") or not flow.get("route_available", True):
         return []
+
+    if flow.get("is_attack_traffic"):
+        return _attack_packet_samples(flow, identities, model, limit)
 
     if flow["transport"] == "TCP":
         return _tcp_packet_samples(flow, identities, model, limit)
@@ -497,6 +580,147 @@ def _sample_packets_for_flow(
             "media_payload_bytes": media_payload,
         }
     return [event][:limit]
+
+
+def _build_packet_sample(
+    flows: list[dict[str, Any]],
+    identities: dict[str, NetworkIdentity],
+    model: NetworkModel,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Снять репрезентативные пакеты после применения атак и защиты."""
+    if limit <= 0:
+        return []
+    attacks = sorted(
+        (flow for flow in flows if flow.get("is_attack_traffic")),
+        key=lambda flow: str(flow["flow_id"]),
+    )
+    legitimate = [flow for flow in flows if not flow.get("is_attack_traffic")]
+    sample: list[dict[str, Any]] = []
+    packet_ids: set[int] = set()
+
+    def append_from(flow: dict[str, Any], sample_limit: int) -> None:
+        for event in _sample_packets_for_flow(flow, identities, model, sample_limit):
+            _annotate_packet_sample(event, flow)
+            packet_id = int(event["packet_id"])
+            if packet_id not in packet_ids and len(sample) < limit:
+                sample.append(event)
+                packet_ids.add(packet_id)
+
+    if attacks:
+        # Атакующий пакет и по одному затронутому потоку каждого SLA не должны
+        # исчезать из-за обычного лимита sample=48 и большого числа абонентов.
+        for flow in attacks:
+            if len(sample) >= limit:
+                break
+            append_from(flow, 1)
+        for grade in ("gold", "silver", "bronze"):
+            representative = next(
+                (
+                    flow
+                    for flow in legitimate
+                    if flow.get("attack_impacted") and flow.get("sla_grade") == grade
+                ),
+                None,
+            )
+            if representative is not None and len(sample) < limit:
+                append_from(representative, 1)
+
+    ordered = legitimate if not attacks else [*attacks, *legitimate]
+    for flow in ordered:
+        if len(sample) >= limit:
+            break
+        append_from(flow, limit - len(sample))
+    return sample
+
+
+def _annotate_packet_sample(event: dict[str, Any], flow: dict[str, Any]) -> None:
+    """Добавить агрегированное состояние потока, не притворяясь судьбой пакета."""
+    event["flow_observation"] = {
+        "attack_impacted": bool(flow.get("attack_impacted", False)),
+        "attack_ids": list(flow.get("attack_ids", [])),
+        "observed_dropped_packets": int(flow.get("observed_dropped_packets", 0)),
+        "observed_retransmissions": int(flow.get("observed_retransmissions", 0)),
+        "preventive_mitigation_ratio": float(flow.get("preventive_mitigation_ratio", 0.0)),
+        "prevented_dropped_packets": int(flow.get("prevented_dropped_packets", 0)),
+        "one_way_latency_ms": float(flow.get("one_way_latency_ms", 0.0)),
+        "rerouted": bool(flow.get("rerouted", False)),
+        "failover_active": bool(flow.get("failover_active", False)),
+        "isolated": bool(flow.get("isolated", False)),
+        "routing_action": flow.get("routing_action", "keep_baseline_route"),
+        "original_route": list(flow.get("original_route", flow.get("route", []))),
+        "active_route": list(flow.get("route", [])),
+    }
+
+
+def _attack_packet_samples(
+    flow: dict[str, Any],
+    identities: dict[str, NetworkIdentity],
+    model: NetworkModel,
+    limit: int,
+) -> list[dict[str, Any]]:
+    route = list(flow["route"])
+    if not route or limit <= 0:
+        return []
+    protocol = str(flow["transport"])
+    is_syn = protocol == "TCP"
+    attack_payload_bytes = 0 if is_syn else int(
+        flow.get("attack_payload_bytes_per_packet", 0)
+    )
+    event = _packet_event(
+        model,
+        identities,
+        flow=flow,
+        packet_role="attack_syn" if is_syn else "attack_udp_flood",
+        route=route,
+        src_node=route[0],
+        dst_node=route[-1],
+        protocol=protocol,
+        src_port=int(flow.get("client_port", 0)),
+        dst_port=int(flow.get("server_port", 0)),
+        payload_bytes=attack_payload_bytes,
+        udp_length_bytes=(
+            UDP_HEADER_BYTES + attack_payload_bytes
+            if not is_syn
+            else None
+        ),
+        sequence_number=int(flow.get("sequence_base", 0)),
+        tcp_flags="S" if is_syn else None,
+        src_ip_override=(
+            str(flow.get("client_ip"))
+            if flow.get("external_reflector_traffic")
+            else None
+        ),
+        dst_ip_override=(
+            str(flow.get("server_ip"))
+            if flow.get("external_reflector_traffic")
+            else None
+        ),
+    )
+    event["attack"] = {
+        "attack_id": flow.get("attack_id"),
+        "mitre_technique_id": flow.get("mitre_technique_id"),
+        "source_count": int(flow.get("source_count", 1)),
+        "raw_packet_count": int(flow.get("raw_packet_count", flow.get("packet_count", 0))),
+        "admitted_packet_count": int(flow.get("packet_count", 0)),
+        "blocked_packet_count": int(flow.get("blocked_packet_count", 0)),
+        "raw_wire_bytes": int(flow.get("raw_wire_bytes", flow.get("wire_bytes", 0))),
+        "admitted_wire_bytes": int(flow.get("wire_bytes", 0)),
+        "blocked_wire_bytes": int(flow.get("blocked_wire_bytes", 0)),
+        "application_payload_bytes_per_packet": attack_payload_bytes,
+        "ipv4_packet_bytes": int(flow.get("attack_l3_packet_bytes", 40 if is_syn else 0)),
+        "line_time_bytes_per_packet": int(flow.get("on_wire_size_bytes", 84 if is_syn else 0)),
+        "traffic_leg": flow.get("attack_traffic_leg", "direct_attack_source_to_target"),
+        "external_reflector_traffic": bool(flow.get("external_reflector_traffic", False)),
+        "operator_ingress_node": flow.get("operator_ingress_node"),
+        "spoofed_request_initiator_ids": list(
+            flow.get("spoofed_request_initiator_ids", [])
+        ),
+        "quarantined_request_initiator_ids": list(
+            flow.get("quarantined_request_initiator_ids", [])
+        ),
+    }
+    return [event]
 
 
 def _voice_packet_samples(
@@ -713,6 +937,8 @@ def _packet_event(
     tcp_flags: str | None = None,
     acknowledgment_number: int | None = None,
     udp_length_bytes: int | None = None,
+    src_ip_override: str | None = None,
+    dst_ip_override: str | None = None,
 ) -> dict[str, Any]:
     transport_header_bytes = TCP_HEADER_BYTES if protocol == "TCP" else UDP_HEADER_BYTES
     total_length = IPV4_HEADER_BYTES + transport_header_bytes + payload_bytes
@@ -720,6 +946,8 @@ def _packet_event(
     ttl_at_destination = max(1, DEFAULT_TTL - max(0, len(route) - 1))
     packet_id = _packet_id(flow["flow_id"], packet_role, sequence_number)
 
+    src_ip = src_ip_override or identities[src_node].ip
+    dst_ip = dst_ip_override or identities[dst_node].ip
     event: dict[str, Any] = {
         "packet_id": packet_id,
         "flow_id": flow["flow_id"],
@@ -750,9 +978,11 @@ def _packet_event(
             "ttl_at_destination": ttl_at_destination,
             "protocol": protocol,
             "protocol_number": protocol_number,
-            "src_ip": identities[src_node].ip,
-            "dst_ip": identities[dst_node].ip,
-            "header_checksum": _checksum16(f"ip:{src_node}:{dst_node}:{protocol}:{total_length}:{packet_id}"),
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
+            "header_checksum": _checksum16(
+                f"ip:{src_ip}:{dst_ip}:{protocol}:{total_length}:{packet_id}"
+            ),
         },
         "payload": {
             "bytes": payload_bytes,
@@ -806,7 +1036,19 @@ def _hop_frames(
     return frames
 
 
-def _traffic_summary(flows: list[dict[str, Any]]) -> dict[str, Any]:
+def _traffic_summary(flows: list[dict[str, Any]], model: NetworkModel) -> dict[str, Any]:
+    legitimate = [flow for flow in flows if not flow.get("is_attack_traffic")]
+    security_excluded = [
+        flow
+        for flow in legitimate
+        if flow.get("security_excluded_from_sla_accounting")
+    ]
+    sla_accounted = [
+        flow
+        for flow in legitimate
+        if not flow.get("security_excluded_from_sla_accounting")
+    ]
+    attack_flows = [flow for flow in flows if flow.get("is_attack_traffic")]
     packet_count = sum(int(flow["packet_count"]) for flow in flows)
     payload_bytes = sum(int(flow["payload_bytes"]) for flow in flows)
     wire_bytes = sum(int(flow["wire_bytes"]) for flow in flows)
@@ -814,34 +1056,116 @@ def _traffic_summary(flows: list[dict[str, Any]]) -> dict[str, Any]:
     retransmissions = sum(int(flow["observed_retransmissions"]) for flow in flows)
     tcp_flows = sum(1 for flow in flows if flow["transport"] == "TCP")
     udp_flows = sum(1 for flow in flows if flow["transport"] == "UDP")
-    latencies = [float(flow["one_way_latency_ms"]) for flow in flows]
+    carried = [
+        flow for flow in flows
+        if flow.get("route") and not flow.get("isolated") and int(flow.get("packet_count", 0)) > 0
+    ]
+    carried_wire_bytes = sum(int(flow["wire_bytes"]) for flow in carried)
+    delivered_wire_bytes = sum(
+        round(
+            int(flow["wire_bytes"])
+            * max(0, int(flow["packet_count"]) - int(flow["observed_dropped_packets"]))
+            / max(int(flow["packet_count"]), 1)
+        )
+        for flow in carried
+    )
+    latencies = [float(flow["one_way_latency_ms"]) for flow in carried]
     interval_seconds = int(flows[0].get("interval_seconds", 0)) if flows else 0
     applications: dict[str, dict[str, Any]] = {}
     for application in sorted({str(flow["application"]) for flow in flows}):
         app_flows = [flow for flow in flows if flow["application"] == application]
         app_payload = sum(int(flow["payload_bytes"]) for flow in app_flows)
         app_wire = sum(int(flow["wire_bytes"]) for flow in app_flows)
-        app_latencies = [float(flow["one_way_latency_ms"]) for flow in app_flows]
+        app_carried = [
+            flow for flow in app_flows
+            if flow.get("route") and not flow.get("isolated") and int(flow.get("packet_count", 0)) > 0
+        ]
+        app_carried_wire = sum(int(flow["wire_bytes"]) for flow in app_carried)
+        app_delivered_wire = sum(
+            round(
+                int(flow["wire_bytes"])
+                * max(0, int(flow["packet_count"]) - int(flow["observed_dropped_packets"]))
+                / max(int(flow["packet_count"]), 1)
+            )
+            for flow in app_carried
+        )
+        app_latencies = [float(flow["one_way_latency_ms"]) for flow in app_carried]
         applications[application] = {
             "flow_count": len(app_flows),
+            "carried_flow_count": len(app_carried),
             "codec_profile_id": next((flow.get("codec_profile_id") for flow in app_flows if flow.get("codec_profile_id")), None),
             "codec_profile_name": next((flow.get("codec_profile_name") for flow in app_flows if flow.get("codec_profile_name")), None),
             "packet_count": sum(int(flow["packet_count"]) for flow in app_flows),
             "payload_bytes": app_payload,
             "wire_bytes": app_wire,
             "offered_rate_mbps": round(app_wire * 8.0 / max(interval_seconds, 1) / 1_000_000.0, 4),
+            "carried_rate_mbps": round(app_carried_wire * 8.0 / max(interval_seconds, 1) / 1_000_000.0, 4),
+            "delivered_rate_mbps": round(app_delivered_wire * 8.0 / max(interval_seconds, 1) / 1_000_000.0, 4),
             "protocol_efficiency_ratio": round(app_payload / max(app_wire, 1), 6),
             "mean_one_way_latency_ms": round(sum(app_latencies) / max(len(app_latencies), 1), 4),
             "max_one_way_latency_ms": round(max(app_latencies, default=0.0), 4),
         }
 
+    legitimate_packets = sum(int(flow["packet_count"]) for flow in legitimate)
+    legitimate_wire = sum(int(flow["wire_bytes"]) for flow in legitimate)
+    legitimate_dropped = sum(int(flow["observed_dropped_packets"]) for flow in legitimate)
+    legitimate_latencies = [
+        float(flow["one_way_latency_ms"]) for flow in legitimate if not flow.get("isolated")
+    ]
+    link_rates: dict[tuple[str, str], float] = {}
+    link_packets: dict[tuple[str, str], int] = {}
+    link_exposed_drops: dict[tuple[str, str], int] = {}
+    for flow in flows:
+        interval = max(int(flow.get("interval_seconds", 1)), 1)
+        rate_mbps = float(flow.get("wire_bytes", 0)) * 8.0 / interval / 1_000_000.0
+        route = [str(node) for node in flow.get("route", [])]
+        for source, target in zip(route, route[1:]):
+            edge = tuple(sorted((source, target)))
+            link_rates[edge] = link_rates.get(edge, 0.0) + rate_mbps
+            link_packets[edge] = link_packets.get(edge, 0) + int(flow.get("packet_count", 0))
+            # Потеря известна на уровне потока, а не конкретного порта. Поэтому
+            # это честно названная экспозиция ребра к end-to-end loss, а не
+            # утверждение о физическом месте отбрасывания пакета.
+            link_exposed_drops[edge] = link_exposed_drops.get(edge, 0) + int(
+                flow.get("observed_dropped_packets", 0)
+            )
+    link_rows = []
+    for (source, target), rate_mbps in link_rates.items():
+        capacity = float(model.graph.edges[source, target].get("capacity_mbps", 0.0))
+        utilization = rate_mbps / max(capacity, 1e-9) * 100.0
+        link_rows.append(
+            {
+                "source": source,
+                "target": target,
+                "rate_mbps": round(rate_mbps, 6),
+                "capacity_mbps": round(capacity, 6),
+                "utilization_percent": round(utilization, 6),
+                "end_to_end_flow_loss_exposure_ratio": round(
+                    link_exposed_drops[(source, target)]
+                    / max(link_packets[(source, target)], 1),
+                    9,
+                ),
+            }
+        )
+    top_links = sorted(
+        link_rows,
+        key=lambda item: float(item["utilization_percent"]),
+        reverse=True,
+    )[:10]
+
     return {
         "flow_count": len(flows),
+        "legitimate_flow_count": len(legitimate),
+        "sla_accounted_flow_count": len(sla_accounted),
+        "security_excluded_flow_count": len(security_excluded),
+        "attack_flow_count": len(attack_flows),
         "tcp_flow_count": tcp_flows,
         "udp_flow_count": udp_flows,
         "packet_count": packet_count,
         "payload_bytes": payload_bytes,
         "wire_bytes": wire_bytes,
+        "carried_wire_bytes": carried_wire_bytes,
+        "delivered_wire_bytes": delivered_wire_bytes,
         "observed_dropped_packets": dropped,
         "observed_retransmissions": retransmissions,
         "observed_loss_ratio": 0.0 if packet_count == 0 else dropped / packet_count,
@@ -849,13 +1173,35 @@ def _traffic_summary(flows: list[dict[str, Any]]) -> dict[str, Any]:
         "max_one_way_latency_ms": round(max(latencies, default=0.0), 4),
         "interval_seconds": interval_seconds,
         "offered_rate_mbps": round(wire_bytes * 8.0 / max(interval_seconds, 1) / 1_000_000.0, 4),
+        "carried_rate_mbps": round(carried_wire_bytes * 8.0 / max(interval_seconds, 1) / 1_000_000.0, 4),
+        "delivered_rate_mbps": round(delivered_wire_bytes * 8.0 / max(interval_seconds, 1) / 1_000_000.0, 4),
         "protocol_efficiency_ratio": round(payload_bytes / max(wire_bytes, 1), 6),
+        "maximum_observed_link_utilization_percent": max(
+            (float(item["utilization_percent"]) for item in link_rows),
+            default=0.0,
+        ),
+        "observed_link_count": len(link_rows),
+        "observed_links": link_rows,
+        "observed_link_loss_semantics": (
+            "flow_weighted_end_to_end_loss_exposure_not_physical_drop_location"
+        ),
+        "most_utilized_links": top_links,
+        "legitimate_packet_count": legitimate_packets,
+        "legitimate_wire_bytes": legitimate_wire,
+        "legitimate_offered_rate_mbps": round(
+            legitimate_wire * 8.0 / max(interval_seconds, 1) / 1_000_000.0, 4
+        ),
+        "legitimate_observed_dropped_packets": legitimate_dropped,
+        "legitimate_observed_loss_ratio": legitimate_dropped / max(legitimate_packets, 1),
+        "legitimate_mean_one_way_latency_ms": round(
+            sum(legitimate_latencies) / max(len(legitimate_latencies), 1), 4
+        ),
         "applications": applications,
     }
 
 
 def _route(model: NetworkModel, source: str, target: str) -> list[str]:
-    return nx.shortest_path(model.graph, source, target, weight="latency_ms")
+    return shortest_data_path(model, source, target)
 
 
 def _path_latency_ms(model: NetworkModel, route: list[str], packet_bytes: int) -> float:

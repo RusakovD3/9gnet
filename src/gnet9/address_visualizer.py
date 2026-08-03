@@ -17,6 +17,8 @@ ROLE_COLORS = {
     "service": "#10b981",
     "core-router": "#60a5fa",
     "aggregation-switch": "#93c5fd",
+    "radio-access-node": "#38bdf8",
+    "optical-line-terminal": "#2dd4bf",
     "mobile-subscriber": "#22d3ee",
     "fixed-subscriber": "#fbbf24",
     "arbitrator": "#fb923c",
@@ -54,21 +56,24 @@ def _draw_top_panel(ax, devices: list[dict[str, Any]]) -> None:
     l0 = [device for device in devices if device["level"] == "L0"]
     l2 = [device for device in devices if device["level"] == "L2"]
     l7_l8 = [device for device in devices if device["level"] in {"L7", "L8"}]
-    _draw_box(ax, 0.6, 13.35, 7.7, 3.45, "L0 · серверы и сервисные VIP · 10.0.0.0/24", l0, columns=1, font_size=7.0)
-    _draw_box(ax, 8.7, 13.35, 9.0, 3.45, "L2 · loopback/управление · 10.10.0.0/24", l2, columns=2, font_size=6.8)
+    _draw_box(ax, 0.6, 13.35, 7.7, 3.45, "L0 · серверы и вирт. адреса сервисов · 10.0.0.0/24", l0, columns=1, font_size=7.0)
+    _draw_box(ax, 8.7, 13.35, 9.0, 3.45, "L2 · петлевые адреса и управление · 10.10.0.0/24", l2, columns=2, font_size=6.8)
     _draw_box(ax, 18.1, 13.35, 5.1, 3.45, "L7/L8 · служебные адреса", l7_l8, columns=1, font_size=6.4, limit=10)
 
     text = (
-        "Адреса являются private laboratory plan.\n"
-        "Они используются в JSON, GraphML, packet_sample и визуализации.\n"
+        "Адреса образуют частный лабораторный план.\n"
+        "Они используются в JSON, GraphML, выборке пакетов и визуализации.\n"
+        "Абоненты сгруппированы по единственной линии доступа.\n"
+        "Резервирование предусмотрено в L2 и на серверах,\n"
+        "но не в последней миле абонента.\n"
         "Реальные сетевые пакеты проект не отправляет."
     )
     ax.text(
         23.6,
-        15.4,
+        16.75,
         text,
         va="top",
-        fontsize=8.2,
+        fontsize=7.7,
         color="#dbeafe",
         linespacing=1.3,
         bbox={"boxstyle": "round,pad=0.55", "fc": "#172033", "ec": "#475569", "alpha": 0.96},
@@ -141,12 +146,14 @@ def _draw_address_legend(ax) -> None:
         ("SVC_*", "виртуальный адрес сервиса", ROLE_COLORS["service"]),
         ("C*", "маршрутизатор ядра", ROLE_COLORS["core-router"]),
         ("A*", "агрегирующий коммутатор", ROLE_COLORS["aggregation-switch"]),
+        ("RAN*", "мобильный access", ROLE_COLORS["radio-access-node"]),
+        ("OLT*", "фиксированный access", ROLE_COLORS["optical-line-terminal"]),
         ("M*", "мобильный абонент", ROLE_COLORS["mobile-subscriber"]),
         ("F*", "фиксированный абонент", ROLE_COLORS["fixed-subscriber"]),
     ]
     ax.add_patch(
         FancyBboxPatch(
-            (23.6, 13.0),
+            (23.6, 12.82),
             3.8,
             2.0,
             boxstyle="round,pad=0.06,rounding_size=0.13",
@@ -156,6 +163,6 @@ def _draw_address_legend(ax) -> None:
             alpha=0.98,
         )
     )
-    ax.text(23.82, 14.72, "Обозначения", color="#f8fafc", fontsize=8.8, fontweight="bold", va="top")
+    ax.text(23.82, 14.54, "Обозначения", color="#f8fafc", fontsize=8.8, fontweight="bold", va="top")
     for index, (prefix, label, color) in enumerate(lines):
-        ax.text(23.82, 14.36 - index * 0.25, f"{prefix:<5} {label}", color=color, fontsize=7.2, family="DejaVu Sans Mono")
+        ax.text(23.82, 14.18 - index * 0.25, f"{prefix:<5} {label}", color=color, fontsize=7.2, family="DejaVu Sans Mono")

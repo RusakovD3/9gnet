@@ -1,4 +1,10 @@
+from dataclasses import replace
+from pathlib import Path
+
+from src.gnet9.baseline import l0_service_tensor
+from src.gnet9.constants import L2_NODE_COUNT, SUBSCRIBER_COUNT
 from src.gnet9.dynamics import DynamicsConfig, simulate_stationary_dynamics, validate_healthy_baseline
+from src.gnet9 import dynamics_charts
 from src.gnet9.dynamics_charts import extract_application_series, extract_dynamics_chart_series
 from src.gnet9.topology_builder import GNetBaselineBuilder
 
@@ -8,16 +14,110 @@ MODEL = GNetBaselineBuilder().build()
 
 def test_l2_count() -> None:
     l2_nodes = [node for node, attrs in MODEL.graph.nodes(data=True) if attrs["level"] == "L2"]
-    assert len(l2_nodes) == 18  # 12 core routers + 6 aggregation switches
+    assert len(l2_nodes) == L2_NODE_COUNT
 
 
 def test_l2_has_cisco_profiles_with_provenance() -> None:
     l2_nodes = [(node, attrs) for node, attrs in MODEL.graph.nodes(data=True) if attrs["level"] == "L2"]
-    assert all(attrs["platform_family"] in {"NCS 5501", "Catalyst C9500-24Y4C"} for _, attrs in l2_nodes)
+    assert all(
+        attrs["platform_family"]
+        in {
+            "NCS 5501",
+            "Catalyst C9500-24Y4C",
+            "Integrated gNodeB/UPF access edge",
+            "XGS-PON OLT access shelf",
+        }
+        for _, attrs in l2_nodes
+    )
     assert all("l2_raw_baseline" in attrs for _, attrs in l2_nodes)
     assert all("l2_health_index" in attrs for _, attrs in l2_nodes)
     assert all(attrs["l2_profile"]["verified_fields"] for _, attrs in l2_nodes)
     assert all(attrs["l2_profile"]["assumed_fields"] for _, attrs in l2_nodes)
+
+
+def test_ncs5501_published_forwarding_memory_and_buffer_limits_are_preserved() -> None:
+    """Do not silently replace published chassis limits with scenario guesses."""
+    profile = MODEL.graph.nodes["C1"]["l2_profile"]
+
+    assert profile["forwarding_mpps"] == 720.0
+    assert profile["dram_gb"] == 32.0
+    assert profile["buffer_mb"] == 4_112.0  # 16 MB on-chip + 4 GiB off-chip
+    assert {"forwarding_mpps", "dram_gb", "buffer_mb"} <= set(profile["verified_fields"])
+    assert {"forwarding_mpps", "dram_gb", "buffer_mb"}.isdisjoint(profile["assumed_fields"])
+    assert any("platform-ar-wp" in url for url in profile["reference_urls"])
+
+
+def test_c9500_published_default_core_sdm_route_scale_is_preserved() -> None:
+    profile = MODEL.graph.nodes["A1"]["l2_profile"]
+
+    assert profile["fib_routes"] == 212_000
+    assert "fib_routes" in profile["verified_fields"]
+    assert "fib_routes" not in profile["assumed_fields"]
+
+
+def test_l2_power_values_preserve_vendor_semantics_and_model_assumptions() -> None:
+    core = MODEL.graph.nodes["C1"]
+    aggregation = MODEL.graph.nodes["A1"]
+
+    assert core["l2_profile"]["typical_power_w"] == 240.0
+    assert core["l2_profile"]["max_power_w"] == 370.0
+    assert core["power_architecture"]["modeled_t0_power_w"] == 240.0
+    assert "output_power" in core["power_architecture"]["vendor_power_value_semantics"]
+
+    assert aggregation["l2_profile"]["typical_power_w"] is None
+    assert aggregation["l2_profile"]["max_power_w"] is None
+    assert aggregation["l2_profile"]["thermal_output_btu_per_hour"] == 1_454.0
+    assert aggregation["l2_profile"]["thermal_output_equivalent_w"] == 426.0
+    assert aggregation["power_architecture"]["modeled_t0_power_w"] == 250.0
+    assert "thermal_equivalent" in aggregation["power_architecture"]["vendor_power_value_semantics"]
+    assert aggregation["power_architecture"]["backup_autonomy_origin"].endswith("not_vendor_spec")
+
+
+def test_selected_equipment_links_fit_published_port_speeds() -> None:
+    """The topology must not invent port rates absent from selected platforms."""
+    for source, target, attrs in MODEL.graph.edges(data=True):
+        source_role = MODEL.graph.nodes[source].get("role")
+        target_role = MODEL.graph.nodes[target].get("role")
+        capacity = float(attrs.get("capacity_mbps", 0.0))
+        if source_role == "core-router" and target_role == "core-router":
+            assert capacity <= 100_000.0
+        if {source_role, target_role} == {"core-router", "service-server"}:
+            assert capacity == 10_000.0
+            assert attrs["physical_profile"].startswith("Dell R660 10GbE")
+
+    for node, attrs in MODEL.graph.nodes(data=True):
+        if attrs.get("role") == "core-router":
+            assert attrs["physical_high_speed_ports_used"] <= 6
+        elif attrs.get("role") == "aggregation-switch":
+            assert attrs["physical_high_speed_ports_used"] <= 4
+        elif attrs.get("role") in {"radio-access-node", "optical-line-terminal"}:
+            aggregation_links = [
+                neighbor
+                for neighbor in MODEL.graph.neighbors(node)
+                if MODEL.graph.nodes[neighbor].get("role") == "aggregation-switch"
+            ]
+            assert len(aggregation_links) >= 2
+
+
+def test_subscriber_access_is_independent_of_application_and_logically_aggregated() -> None:
+    grouped_capacities: dict[tuple[str, str], set[float]] = {}
+    grouped_latencies: dict[str, set[float]] = {}
+    for node, attrs in MODEL.graph.nodes(data=True):
+        if attrs.get("level") != "L1":
+            continue
+        key = (attrs["role"], attrs["sla_grade"])
+        grouped_capacities.setdefault(key, set()).add(float(attrs["access_capacity_mbps"]))
+        grouped_latencies.setdefault(attrs["role"], set()).add(float(attrs["access_latency_ms"]))
+        primary = attrs["home_access"]
+        edge = MODEL.graph.edges[node, primary]
+        assert edge["consumes_c9500_physical_port"] is False
+        assert attrs["access_architecture_reference_url"].startswith("https://www.itu.int/")
+        assert edge["attachment_semantics"].startswith("logical_")
+
+    assert all(len(capacities) == 1 for capacities in grouped_capacities.values())
+    assert all(len(latencies) == 1 for latencies in grouped_latencies.values())
+    assert grouped_capacities[("mobile-subscriber", "gold")] == {100.0}
+    assert grouped_capacities[("fixed-subscriber", "silver")] == {500.0}
 
 
 def test_tensor_is_state_vector() -> None:
@@ -39,6 +139,12 @@ def test_l0_service_tensor_metrics() -> None:
         "demand_pressure",
         "service_health",
     )
+
+
+def test_l0_service_tensor_is_independent_of_localized_display_name() -> None:
+    profile = next(service for service in MODEL.services if service.service_id == "SVC_VOICE")
+    localized = replace(profile, name="Любое локализованное имя")
+    assert l0_service_tensor(localized)["service_code"] == 1.0
 
 
 def test_l1_tensor_has_access_service_processing_and_cost() -> None:
@@ -66,7 +172,7 @@ def test_l2_tensor_has_load_port_and_stability_metrics() -> None:
 
 
 def test_transport_edges_have_l3_l4_and_edge_tensors() -> None:
-    edge_attrs = MODEL.graph.edges["A1", "M1_01"]
+    edge_attrs = MODEL.graph.edges[MODEL.graph.nodes["M1_01"]["home_access"], "M1_01"]
     assert edge_attrs["l3_tensor"].metric_names == (
         "medium_code",
         "line_rate_mbps",
@@ -105,7 +211,7 @@ def test_service_count() -> None:
 
 def test_subscriber_count() -> None:
     l1_nodes = [node for node, attrs in MODEL.graph.nodes(data=True) if attrs["level"] == "L1"]
-    assert len(l1_nodes) == 240
+    assert len(l1_nodes) == SUBSCRIBER_COUNT
 
 
 def test_l1_baseline_has_no_sla_violations() -> None:
@@ -125,8 +231,8 @@ def test_healthy_baseline_validation_passes() -> None:
     health = validate_healthy_baseline(MODEL)
 
     assert health["ok"]
-    assert health["checked_l1_points"] == 240 * 30
-    assert health["checked_l2_nodes"] == 18
+    assert health["checked_l1_points"] == SUBSCRIBER_COUNT * 30
+    assert health["checked_l2_nodes"] == L2_NODE_COUNT
     assert health["checked_edges"] == MODEL.graph.number_of_edges()
     assert health["violation_count"] == 0
 
@@ -141,12 +247,24 @@ def test_stationary_dynamics_snapshots_every_five_seconds() -> None:
     assert dynamics["health"]["ok"]
     assert dynamics["ideal_t0"]["ok"]
     assert dynamics["ideal_t0"]["status"] == "IDEAL_REALISTIC_BASELINE"
-    assert dynamics["ideal_t0"]["metrics"]["subscriber_count"] == 240
+    assert dynamics["ideal_t0"]["metrics"]["subscriber_count"] == SUBSCRIBER_COUNT
     assert dynamics["ideal_t0"]["metrics"]["aggregation_switch_count"] == 6
     assert dynamics["ideal_t0"]["metrics"]["core_router_count"] == 12
+    assert dynamics["ideal_t0"]["metrics"]["radio_access_node_count"] == 6
+    assert dynamics["ideal_t0"]["metrics"]["optical_line_terminal_count"] == 6
     assert dynamics["ideal_t0"]["metrics"]["service_count"] == 6
     assert dynamics["ideal_t0"]["metrics"]["service_server_count"] == 4
     assert dynamics["ideal_t0"]["metrics"]["maximum_planned_link_utilization"] <= 0.12
+    assert dynamics["ideal_t0"]["metrics"]["maximum_observed_link_utilization_percent"] <= 25.0
+    assert dynamics["ideal_t0"]["metrics"]["maximum_l2_high_speed_ports_used"] <= 6
+    assert dynamics["ideal_t0"]["metrics"]["network_device_dual_feed_count"] == L2_NODE_COUNT
+    assert dynamics["ideal_t0"]["metrics"]["network_device_power_provenance_count"] == L2_NODE_COUNT
+    assert dynamics["ideal_t0"]["metrics"]["maximum_modeled_t0_network_device_power_w"] == 250.0
+    assert dynamics["ideal_t0"]["metrics"]["service_server_l6_count"] == 4
+    assert dynamics["ideal_t0"]["metrics"]["service_server_dual_feed_count"] == 4
+    assert dynamics["ideal_t0"]["metrics"]["service_server_power_provenance_count"] == 4
+    assert dynamics["ideal_t0"]["metrics"]["service_standby_cross_power_domain_count"] == 18
+    assert dynamics["ideal_t0"]["metrics"]["local_power_fault_domain_count"] == L2_NODE_COUNT + 4
     assert dynamics["ideal_t0"]["metrics"]["minimum_link_stability_margin"] >= 0.88
     assert dynamics["ideal_t0"]["metrics"]["l7_decision"] == "NO_REMAP"
     assert [snapshot["time_seconds"] for snapshot in snapshots] == list(range(0, 51, 5))
@@ -158,7 +276,7 @@ def test_stationary_dynamics_snapshots_every_five_seconds() -> None:
     assert all(snapshots[0]["tensor_state"]["counts"][level] > 0 for level in snapshots[0]["tensor_state"]["levels"])
     assert snapshots[0]["state_vector"]["metric_names"]
     assert len(snapshots[0]["state_vector"]["metric_names"]) == len(snapshots[0]["state_vector"]["vector"])
-    assert snapshots[0]["traffic"]["summary"]["flow_count"] == 240
+    assert snapshots[0]["traffic"]["summary"]["flow_count"] == SUBSCRIBER_COUNT
     assert snapshots[0]["traffic"]["summary"]["observed_dropped_packets"] == 0
     assert snapshots[0]["traffic"]["summary"]["observed_retransmissions"] == 0
 
@@ -198,7 +316,7 @@ def test_stationary_dynamics_summary_detail_is_compact() -> None:
     assert "state_vector" in snapshot
     assert "flows" not in snapshot["traffic"]
     assert "packet_sample" not in snapshot["traffic"]
-    assert snapshot["traffic"]["summary"]["flow_count"] == 240
+    assert snapshot["traffic"]["summary"]["flow_count"] == SUBSCRIBER_COUNT
 
 
 def test_stationary_dynamics_tensor_detail_keeps_tensor_values_without_graph_lists() -> None:
@@ -224,7 +342,7 @@ def test_arbitrator_observes_tensor_state_and_keeps_no_remap_baseline() -> None:
 
     assert arbitrator["node_id"] == "ARB"
     assert arbitrator["input_tensor_counts"] == snapshot["tensor_state"]["counts"]
-    assert arbitrator["input_tensor_counts"]["L1"] == 240
+    assert arbitrator["input_tensor_counts"]["L1"] == SUBSCRIBER_COUNT
     assert arbitrator["input_tensor_counts"]["EDGE"] == MODEL.graph.number_of_edges()
     assert "sla_margin" in arbitrator["level_metric_aggregates"]["L1"]["metrics"]
     assert "stability_margin" in arbitrator["level_metric_aggregates"]["EDGE"]["metrics"]
@@ -252,7 +370,7 @@ def test_packet_flow_detail_omits_representative_packet_samples() -> None:
 
     assert "flows" in traffic
     assert "packet_sample" not in traffic
-    assert len(traffic["flows"]) == 240
+    assert len(traffic["flows"]) == SUBSCRIBER_COUNT
 
 
 def test_packet_simulation_builds_realistic_in_memory_headers() -> None:
@@ -261,12 +379,12 @@ def test_packet_simulation_builds_realistic_in_memory_headers() -> None:
     summary = traffic["summary"]
     packets = traffic["packet_sample"]
 
-    assert summary["flow_count"] == 240
+    assert summary["flow_count"] == SUBSCRIBER_COUNT
     assert summary["tcp_flow_count"] > 0
     assert summary["udp_flow_count"] > 0
     assert summary["observed_loss_ratio"] == 0.0
     assert set(summary["applications"]) == {"DNS", "FTP_DATA", "LIVE_HLS", "RTP_OPUS", "RTP_TELEMOST", "RTP_VLC_AV"}
-    assert sum(item["flow_count"] for item in summary["applications"].values()) == 240
+    assert sum(item["flow_count"] for item in summary["applications"].values()) == SUBSCRIBER_COUNT
     assert summary["offered_rate_mbps"] > 0.0
     assert 0.0 < summary["protocol_efficiency_ratio"] < 1.0
     assert packets
@@ -297,3 +415,28 @@ def test_dynamics_chart_series_exposes_sla_traffic_and_arbitrator_metrics() -> N
     applications = extract_application_series(dynamics)
     assert set(applications) == {"DNS", "FTP_DATA", "LIVE_HLS", "RTP_OPUS", "RTP_TELEMOST", "RTP_VLC_AV"}
     assert all(len(values["offered_rate_mbps"]) == 2 for values in applications.values())
+
+
+def test_chart_export_removes_stale_weibull_artifact_without_arrivals(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stale = tmp_path / "attack_arrival_weibull.png"
+    stale.write_bytes(b"old predictive-demo chart")
+    for name in (
+        "_plot_health_dashboard",
+        "_plot_traffic_composition",
+        "_plot_link_capacity",
+        "_plot_arbitrator",
+        "_plot_attacks",
+        "_plot_remapping",
+    ):
+        monkeypatch.setattr(dynamics_charts, name, lambda *args, **kwargs: None)
+
+    paths = dynamics_charts.export_dynamics_charts(
+        {"snapshots": []},
+        tmp_path,
+    )
+
+    assert "arrival" not in paths
+    assert not stale.exists()

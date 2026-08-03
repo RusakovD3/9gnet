@@ -39,6 +39,15 @@ FONTSIZE_CONFIGS = {
     "legend": 10.5,
 }
 
+LOGIC_SERVICE_LABELS = {
+    "SVC_VOICE": "Голос",
+    "SVC_VLC": "VLC\nаудио/видео",
+    "SVC_FTP": "Файлы\nFTP",
+    "SVC_DNS": "Имена\nDNS",
+    "SVC_TELEMOST": "Видео-\nконференция",
+    "SVC_LIVE": "Прямая\nтрансляция",
+}
+
 
 class GNetVisualizer:
     def __init__(self, model) -> None:
@@ -197,7 +206,7 @@ class GNetVisualizer:
         self._draw_scheme_relations(ax)
 
         ax.set_title(
-            "Схематичная сеть взаимодействия всех 9 уровней G-Net",
+            "Схема взаимодействия всех девяти уровней G-Net",
             fontsize=18,
             fontweight="bold",
             pad=18,
@@ -308,10 +317,11 @@ class GNetVisualizer:
             x2, y2 = pos[target]
             medium = attrs["medium"]
             color = MEDIUM_COLORS.get(medium, "#666666")
-            style = ":" if medium == "logical-service-binding" else "-"
+            standby = bool(attrs.get("standby", False))
+            style = "--" if standby else ":" if medium == "logical-service-binding" else "-"
             
             # Draw background line for specific mediums
-            if medium in EDGE_VISUAL_STYLES:
+            if medium in EDGE_VISUAL_STYLES and not standby:
                 style_config = EDGE_VISUAL_STYLES[medium]
                 ax.plot([x1, x2], [y1, y2], color=style_config["line_color"], linewidth=style_config["line_width"], alpha=style_config["alpha"], zorder=2)
             
@@ -319,14 +329,14 @@ class GNetVisualizer:
                 [x1, x2],
                 [y1, y2],
                 linestyle=style,
-                linewidth=2.6 if medium == "fiber" else 1.8,
+                linewidth=(1.25 if standby else 2.6 if medium == "fiber" else 1.8),
                 color=color,
-                alpha=0.86 if medium != "logical-service-binding" else 0.78,
+                alpha=(0.48 if standby else 0.86 if medium != "logical-service-binding" else 0.78),
                 zorder=3,
             )
 
     def _draw_logic_nodes(self, ax, pos: dict[str, tuple[float, float]]) -> None:
-        node_groups = {"L0": [], "L1": [], "L2": []}
+        node_groups = {"L0": [], "L2": []}
         for node_id, attrs in self.graph.nodes(data=True):
             if attrs.get("visible_in_logic", False) and attrs["level"] in node_groups:
                 node_groups[attrs["level"]].append(node_id)
@@ -338,6 +348,29 @@ class GNetVisualizer:
             size = NODE_SIZES.get(level, NODE_SIZES["default"])
             ax.scatter(xs, ys, s=size, c=colors, edgecolors="#303030", linewidths=0.9, zorder=5)
 
+        # Буквы M/F поверх каждой точки превращают access-сегмент в нечитаемое
+        # пятно. Тип абонента передаётся формой и цветом маркера, а его смысл
+        # объяснён в вынесенной легенде.
+        for role, marker, color in (
+            ("mobile-subscriber", "o", "#22d3ee"),
+            ("fixed-subscriber", "s", "#fbbf24"),
+        ):
+            node_ids = [
+                node_id
+                for node_id, attrs in self.graph.nodes(data=True)
+                if attrs.get("visible_in_logic", False) and attrs.get("role") == role
+            ]
+            ax.scatter(
+                [pos[node_id][0] for node_id in node_ids],
+                [pos[node_id][1] for node_id in node_ids],
+                s=88,
+                c=color,
+                marker=marker,
+                edgecolors="#303030",
+                linewidths=0.65,
+                zorder=5,
+            )
+
     def _draw_logic_labels(self, ax, pos: dict[str, tuple[float, float]]) -> None:
         for node_id, attrs in self.graph.nodes(data=True):
             if not attrs.get("visible_in_logic", False):
@@ -345,21 +378,33 @@ class GNetVisualizer:
             x, y = pos[node_id]
             level = attrs["level"]
             if level == "L1":
-                label = "М" if attrs["role"] == "mobile-subscriber" else "Ф"
-                fontsize = FONTSIZE_CONFIGS["label_l1"]
-            elif attrs.get("role") == "service-server":
+                continue
+            if attrs.get("role") == "service-server":
                 label = node_id.replace("SRV_", "СЕРВЕР\n")
                 fontsize = FONTSIZE_CONFIGS["label_l1"]
             else:
-                label = SERVICE_DISPLAY_NAMES.get(attrs["label"], attrs["label"])
+                label = LOGIC_SERVICE_LABELS.get(
+                    node_id,
+                    SERVICE_DISPLAY_NAMES.get(attrs["label"], attrs["label"]),
+                )
                 fontsize = FONTSIZE_CONFIGS["label_default"]
-            ax.text(x, y, label, ha="center", va="center", fontsize=fontsize, fontweight="bold", zorder=6)
+            ax.text(
+                x,
+                y,
+                label,
+                ha="center",
+                va="center",
+                fontsize=fontsize,
+                fontweight="bold",
+                linespacing=0.92,
+                zorder=6,
+            )
 
         area_badges = [
             (6.95, 12.05, "L0 серверы и сервисы", "#d8f3dc"),
             (10.8, 7.05, "L2 активное оборудование", "#a9def9"),
-            (5.10, 3.05, "L1 мобильные → A1/A3/A5", "#b7e4c7"),
-            (13.40, 3.05, "L1 фиксированные → A2/A4/A6", "#b7e4c7"),
+            (5.10, 3.05, "L1 мобильные: круг → A1/A3/A5", "#b7e4c7"),
+            (13.40, 3.05, "L1 фиксированные: квадрат → A2/A4/A6", "#b7e4c7"),
         ]
         for x, y, text, color in area_badges:
             ax.text(
@@ -396,9 +441,9 @@ class GNetVisualizer:
         ax.text(1.92, 10.67, inclusion_text, ha="center", va="center", fontsize=9.7)
 
         small_legend = FancyBboxPatch(
-            (22.05, 9.25),
-            3.0,
-            2.9,
+            (21.85, 7.55),
+            3.45,
+            4.6,
             boxstyle="round,pad=0.06",
             facecolor="white",
             edgecolor="#6d6d6d",
@@ -406,12 +451,20 @@ class GNetVisualizer:
             alpha=0.95,
         )
         ax.add_patch(small_legend)
-        ax.text(23.55, 11.72, "Легенда", ha="center", va="center", fontsize=10.5, fontweight="bold")
-        ax.text(22.30, 11.2, "узлы: L0 / L1 / L2", fontsize=9.2)
-        ax.text(22.30, 10.78, "кольца: L5", fontsize=9.2)
-        ax.text(22.30, 10.36, "зоны питания: L6", fontsize=9.2)
-        ax.text(22.30, 9.94, "среда/линейка: L3/L4", fontsize=9.2)
-        ax.text(22.30, 9.52, "фон: L8", fontsize=9.2)
+        ax.text(23.575, 11.72, "Легенда", ha="center", va="center", fontsize=10.5, fontweight="bold")
+        legend_lines = (
+            ("C — маршрутизатор ядра", 11.20),
+            ("A — агрегирующий коммутатор", 10.78),
+            ("M / F — мобильный / фиксированный", 10.36),
+            ("L0 — серверы и сервисы", 9.94),
+            ("L5 — кольца маршрутизации", 9.52),
+            ("L6 — зоны электропитания", 9.10),
+            ("L3 / L4 — среда и линейная основа", 8.68),
+            ("L8 — географическая топооснова", 8.26),
+            ("штриховая связь — резерв L2; контуры — L5/L8", 7.84),
+        )
+        for text, y in legend_lines:
+            ax.text(22.08, y, text, fontsize=8.35, color="#555555")
 
         arb_box = FancyBboxPatch(
             (8.55, 13.12),

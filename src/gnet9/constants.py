@@ -49,15 +49,33 @@ SERVICE_DISPLAY_NAMES = {
 }
 
 # L1 subscriber generation settings.
-MOBILE_SUBSCRIBERS_PER_AGG = 40
-FIXED_SUBSCRIBERS_PER_AGG = 40
+MOBILE_SUBSCRIBERS_PER_AGG = 80
+FIXED_SUBSCRIBERS_PER_AGG = 80
 AGGREGATION_MOBILE = ("A1", "A3", "A5")
 AGGREGATION_FIXED = ("A2", "A4", "A6")
+MOBILE_ACCESS_BY_AGG = {
+    "A1": ("RAN1", "RAN2"),
+    "A3": ("RAN3", "RAN4"),
+    "A5": ("RAN5", "RAN6"),
+}
+FIXED_ACCESS_BY_AGG = {
+    "A2": ("OLT1", "OLT2"),
+    "A4": ("OLT3", "OLT4"),
+    "A6": ("OLT5", "OLT6"),
+}
+ACCESS_DEVICE_ROLES = frozenset({"radio-access-node", "optical-line-terminal"})
+MOBILE_ACCESS_COUNT = sum(len(nodes) for nodes in MOBILE_ACCESS_BY_AGG.values())
+FIXED_ACCESS_COUNT = sum(len(nodes) for nodes in FIXED_ACCESS_BY_AGG.values())
+ACCESS_NODE_COUNT = MOBILE_ACCESS_COUNT + FIXED_ACCESS_COUNT
+SUBSCRIBER_COUNT = (
+    len(AGGREGATION_MOBILE) * MOBILE_SUBSCRIBERS_PER_AGG
+    + len(AGGREGATION_FIXED) * FIXED_SUBSCRIBERS_PER_AGG
+)
 
-# L2 active equipment: 12 core routers + 6 aggregation switches.
-AGGREGATION_COUNT = 6
+# L2 active equipment: core routers + aggregation + realistic access devices.
+AGGREGATION_COUNT = len(AGGREGATION_MOBILE) + len(AGGREGATION_FIXED)
 CORE_COUNT = 12
-L2_NODE_COUNT = CORE_COUNT + AGGREGATION_COUNT
+L2_NODE_COUNT = CORE_COUNT + AGGREGATION_COUNT + ACCESS_NODE_COUNT
 
 # Реалистичная плановая нагрузка идеального t0. Значения не подменяют
 # фактическую пакетную загрузку, которая отдельно рассчитывается по потокам.

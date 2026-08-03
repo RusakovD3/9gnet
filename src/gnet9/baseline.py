@@ -14,16 +14,23 @@ from .l1_d0sl import D0SLSubscriberPolicy, SlaGrade, TrafficKind
 from .models import ServiceProfile
 
 
-# Stable numeric category codes used by tensor vectors.
-SERVICE_CODES = {"Voice": 1.0, "VLC AV": 2.0, "FTP": 3.0, "DNS": 4.0, "Telemost": 5.0, "Live Streaming": 6.0}
+# Stable numeric category codes used by tensor vectors.  Machine semantics must
+# depend on immutable service IDs, not on localized display names.
+SERVICE_CODES = {
+    "SVC_VOICE": 1.0,
+    "SVC_VLC": 2.0,
+    "SVC_FTP": 3.0,
+    "SVC_DNS": 4.0,
+    "SVC_TELEMOST": 5.0,
+    "SVC_LIVE": 6.0,
+}
 TRAFFIC_TO_SERVICE_CODE = {
-    TrafficKind.VOICE: SERVICE_CODES["Voice"],
-    TrafficKind.BROADCAST_MP3: SERVICE_CODES["VLC AV"],
-    TrafficKind.VLC_AV: SERVICE_CODES["VLC AV"],
-    TrafficKind.FTP: SERVICE_CODES["FTP"],
-    TrafficKind.DNS: SERVICE_CODES["DNS"],
-    TrafficKind.VIDEO_CONFERENCE: SERVICE_CODES["Telemost"],
-    TrafficKind.LIVE_STREAMING: SERVICE_CODES["Live Streaming"],
+    TrafficKind.VOICE: SERVICE_CODES["SVC_VOICE"],
+    TrafficKind.VLC_AV: SERVICE_CODES["SVC_VLC"],
+    TrafficKind.FTP: SERVICE_CODES["SVC_FTP"],
+    TrafficKind.DNS: SERVICE_CODES["SVC_DNS"],
+    TrafficKind.VIDEO_CONFERENCE: SERVICE_CODES["SVC_TELEMOST"],
+    TrafficKind.LIVE_STREAMING: SERVICE_CODES["SVC_LIVE"],
 }
 ACCESS_TYPE_CODES = {"fixed": 0.0, "mobile": 1.0}
 PLACEMENT_ROLE_CODES = {
@@ -32,6 +39,8 @@ PLACEMENT_ROLE_CODES = {
     "fixed-subscriber": 2.0,
     "aggregation-switch": 3.0,
     "core-router": 4.0,
+    "radio-access-node": 5.0,
+    "optical-line-terminal": 6.0,
     "arbitrator": 7.0,
     "service-server": 8.0,
 }
@@ -91,13 +100,11 @@ L1_ACCESS_GRADE_BASELINE = {
 
 L1_PROCESSING_DELAY_MS = {
     ("mobile", TrafficKind.VOICE): 18.0,
-    ("mobile", TrafficKind.BROADCAST_MP3): 24.0,
     ("mobile", TrafficKind.VLC_AV): 28.0,
     ("mobile", TrafficKind.VIDEO_CONFERENCE): 22.0,
     ("mobile", TrafficKind.LIVE_STREAMING): 32.0,
     ("mobile", TrafficKind.FTP): 55.0,
     ("mobile", TrafficKind.DNS): 12.0,
-    ("fixed", TrafficKind.BROADCAST_MP3): 10.0,
     ("fixed", TrafficKind.VLC_AV): 11.0,
     ("fixed", TrafficKind.VIDEO_CONFERENCE): 9.0,
     ("fixed", TrafficKind.LIVE_STREAMING): 14.0,
@@ -124,6 +131,22 @@ L2_EQUIPMENT_BASELINE = {
         "traffic_distribution_code": 0.58,
         "capex_opex_cost": 0.64,
         "stability_margin": 0.78,
+    },
+    "radio-access-node": {
+        "ram_used_gb": 4.5,
+        "ram_load_percent": 28.0,
+        "cpu_load_percent": 18.0,
+        "traffic_distribution_code": 0.62,
+        "capex_opex_cost": 0.52,
+        "stability_margin": 0.74,
+    },
+    "optical-line-terminal": {
+        "ram_used_gb": 3.0,
+        "ram_load_percent": 25.0,
+        "cpu_load_percent": 10.0,
+        "traffic_distribution_code": 0.50,
+        "capex_opex_cost": 0.46,
+        "stability_margin": 0.76,
     },
 }
 
@@ -203,22 +226,66 @@ L5_BY_ROLE = {
         "percolation_threshold": 0.64,
         "reconfiguration_time_s": 20.0,
     },
+    "radio-access-node": {
+        "protocol_code": 4.0,
+        "socket_binding_present": 1.0,
+        "routing_mode_code": 1.0,
+        "remap_algorithm_code": 1.0,
+        "percolation_threshold": 0.56,
+        "reconfiguration_time_s": 8.0,
+    },
+    "optical-line-terminal": {
+        "protocol_code": 2.5,
+        "socket_binding_present": 1.0,
+        "routing_mode_code": 1.0,
+        "remap_algorithm_code": 1.0,
+        "percolation_threshold": 0.58,
+        "reconfiguration_time_s": 14.0,
+    },
 }
 
 L6_BY_ROLE = {
     "core-router": {
         "power_supply_code": 3.0,
-        "nominal_power_kw": 0.85,
+        # Cisco publishes 240 W typical output power for NCS-5501 at 25 C.
+        "nominal_power_kw": 0.240,
         "backup_autonomy_hours": 4.0,
         "energy_reserve_ratio": 0.85,
         "capex_opex_cost": 0.92,
     },
     "aggregation-switch": {
         "power_supply_code": 2.0,
-        "nominal_power_kw": 0.45,
+        # Cisco does not publish a typical C9500-24Y4C draw. 250 W is an
+        # explicit t0 scenario assumption below its 426 W thermal-equivalent
+        # upper bound (1454 BTU/h in the selected data sheet).
+        "nominal_power_kw": 0.250,
         "backup_autonomy_hours": 2.0,
         "energy_reserve_ratio": 0.82,
         "capex_opex_cost": 0.66,
+    },
+    "radio-access-node": {
+        "power_supply_code": 2.0,
+        "nominal_power_kw": 0.085,
+        "backup_autonomy_hours": 1.0,
+        "energy_reserve_ratio": 0.74,
+        "capex_opex_cost": 0.48,
+    },
+    "optical-line-terminal": {
+        "power_supply_code": 2.0,
+        "nominal_power_kw": 0.120,
+        "backup_autonomy_hours": 1.5,
+        "energy_reserve_ratio": 0.78,
+        "capex_opex_cost": 0.44,
+    },
+    "service-server": {
+        "power_supply_code": 4.0,
+        # 450 W is a selected healthy-load input-draw assumption for this
+        # laboratory R660 configuration. It is deliberately not copied from
+        # the 800 W PSU nameplate rating; two PSUs work as 1+1 redundancy.
+        "nominal_power_kw": 0.450,
+        "backup_autonomy_hours": 0.25,
+        "energy_reserve_ratio": 0.90,
+        "capex_opex_cost": 0.78,
     },
     "mobile-subscriber": {
         "power_supply_code": 1.0,
@@ -240,19 +307,19 @@ L6_BY_ROLE = {
 # L7 is a healthy no-remap decision vector. Future experiments can mutate these
 # values when attacks, overload or physical relocation are introduced.
 L7_ARBITRATOR_BASELINE = {
-    "hausdorff_distance": 0.0,
-    "lyapunov_value": 0.12,
-    "lyapunov_delta": -0.04,
-    "koopman_residual": 0.02,
+    "gold_threat_minimum_distance_ms": 0.0,
+    "lyapunov_value": 0.0,
+    "lyapunov_delta": 0.0,
+    "koopman_residual": 0.0,
     "remap_pressure": 0.0,
     "decision_confidence": 0.91,
-    "action_cost": 0.18,
+    "action_cost": 0.0,
 }
 
 
 def l0_service_tensor(profile: ServiceProfile) -> dict[str, float]:
     return {
-        "service_code": SERVICE_CODES[profile.name],
+        "service_code": SERVICE_CODES[profile.service_id],
         "bitrate_mbps": profile.bitrate_mbps,
         "latency_budget_ms": profile.latency_ms_max,
         "jitter_budget_ms": profile.jitter_ms_max,
@@ -335,7 +402,7 @@ def l4_infrastructure_tensor(
 
 
 def l5_role_tensor(role: str) -> dict[str, float]:
-    return L5_BY_ROLE["core-router" if role == "core-router" else "aggregation-switch"]
+    return L5_BY_ROLE[role]
 
 
 def l6_power_tensor(role: str) -> dict[str, float]:

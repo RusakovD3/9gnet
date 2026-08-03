@@ -19,7 +19,13 @@ ARBITRATOR_OBSERVED_METRICS = {
     "L2": ("cpu_load_percent", "ram_load_percent", "stability_margin"),
     "EDGE": ("loss_probability", "stability_margin", "utilization"),
     "L8": ("terrain_risk",),
-    "L7": ("hausdorff_distance", "lyapunov_value", "lyapunov_delta", "koopman_residual", "remap_pressure"),
+    "L7": (
+        "gold_threat_minimum_distance_ms",
+        "lyapunov_value",
+        "lyapunov_delta",
+        "koopman_residual",
+        "remap_pressure",
+    ),
 }
 
 STATE_VECTOR_METRICS = (
@@ -32,7 +38,7 @@ STATE_VECTOR_METRICS = (
     ("EDGE", "stability_margin", "min"),
     ("EDGE", "utilization", "mean"),
     ("L8", "terrain_risk", "max"),
-    ("L7", "hausdorff_distance", "mean"),
+    ("L7", "gold_threat_minimum_distance_ms", "mean"),
     ("L7", "koopman_residual", "mean"),
     ("L7", "remap_pressure", "mean"),
 )
@@ -68,7 +74,10 @@ def build_arbitrator_view(
         "level_metric_aggregates": aggregates,
         "state_vector": state_vector,
         "analysis": {
-            "hausdorff_distance": l7_metrics.get("hausdorff_distance", 0.0),
+            "gold_threat_minimum_distance_ms": l7_metrics.get(
+                "gold_threat_minimum_distance_ms",
+                0.0,
+            ),
             "lyapunov_value": lyapunov_value,
             "lyapunov_delta": l7_metrics.get("lyapunov_delta", 0.0),
             "koopman_residual": koopman_residual,
@@ -134,11 +143,27 @@ def build_state_vector(
     observation = observation or {}
     attacks = observation.get("attacks", {})
     traffic = observation.get("traffic", {})
+    routing = attacks.get("routing", observation.get("routing", {}))
+    sla_tiers = {
+        str(item.get("sla_grade")): item
+        for item in attacks.get("sla_restoration", {}).get("tiers", [])
+    }
     observed_names = [
         "OBS.attack_active_count", "OBS.attack_intensity_ratio", "OBS.attack_rate_mbps",
         "OBS.legitimate_loss_ratio", "OBS.legitimate_delivery_ratio",
         "OBS.impacted_gold_flow_count", "OBS.gold_sla_compliance_ratio",
         "OBS.maximum_target_utilization_percent",
+        "OBS.precursor_count", "OBS.precursor_confidence",
+        "OBS.suspicious_source_count", "OBS.source_entropy_ratio",
+        "OBS.scan_rate_pps", "OBS.traffic_acceleration_ratio",
+        "OBS.syn_backlog_growth_ratio", "OBS.power_control_anomaly_ratio",
+        "OBS.power_voltage_sag_ratio", "OBS.battery_discharge_rate_ratio",
+        "OBS.target_concentration_ratio",
+        "OBS.rerouted_gold_flow_count", "OBS.rerouted_silver_flow_count",
+        "OBS.rerouted_bronze_flow_count", "OBS.isolated_flow_count",
+        "OBS.service_failover_count", "OBS.route_change_ratio",
+        "OBS.maximum_post_remap_utilization_percent",
+        "OBS.gold_delivery_ratio", "OBS.silver_delivery_ratio", "OBS.bronze_delivery_ratio",
     ]
     observed_vector = [
         float(attacks.get("active_count", 0.0)),
@@ -149,11 +174,40 @@ def build_state_vector(
         float(attacks.get("impacted_gold_flow_count", 0.0)),
         float(attacks.get("gold_sla_compliance_ratio", 1.0)),
         float(attacks.get("maximum_target_utilization_percent", 0.0)),
+        float(attacks.get("precursor_count", 0.0)),
+        float(attacks.get("precursor_confidence", 0.0)),
+        float(attacks.get("suspicious_source_count", 0.0)),
+        float(attacks.get("source_entropy_ratio", 0.0)),
+        float(attacks.get("scan_rate_pps", 0.0)),
+        float(attacks.get("traffic_acceleration_ratio", 0.0)),
+        float(attacks.get("syn_backlog_growth_ratio", 0.0)),
+        float(attacks.get("power_control_anomaly_ratio", 0.0)),
+        float(attacks.get("power_voltage_sag_ratio", 0.0)),
+        float(attacks.get("battery_discharge_rate_ratio", 0.0)),
+        float(attacks.get("target_concentration_ratio", 0.0)),
+        float(routing.get("by_sla", {}).get("gold", {}).get("rerouted_flow_count", 0.0)),
+        float(routing.get("by_sla", {}).get("silver", {}).get("rerouted_flow_count", 0.0)),
+        float(routing.get("by_sla", {}).get("bronze", {}).get("rerouted_flow_count", 0.0)),
+        float(routing.get("isolated_flow_count", 0.0)),
+        float(routing.get("service_failover_flow_count", 0.0)),
+        float(routing.get("route_change_ratio", 0.0)),
+        float(routing.get("maximum_projected_utilization_percent", 0.0)),
+        _tier_compliance_ratio(sla_tiers, "gold"),
+        _tier_compliance_ratio(sla_tiers, "silver"),
+        _tier_compliance_ratio(sla_tiers, "bronze"),
     ]
     return {
         "metric_names": metric_names + observed_names,
         "vector": vector + observed_vector,
     }
+
+
+def _tier_compliance_ratio(tiers: dict[str, dict[str, Any]], grade: str) -> float:
+    """Вернуть долю SLA-совместимых потоков уровня, сохранив идеальный t0=1."""
+    tier = tiers.get(grade)
+    if not tier:
+        return 1.0
+    return float(tier.get("sla_compliant_flow_count", 0.0)) / max(float(tier.get("flow_count", 0.0)), 1.0)
 
 
 def remap_pressure_from_tensors(
@@ -187,12 +241,16 @@ def _attack_signals(observation: dict[str, Any]) -> dict[str, float]:
     resource = float(attacks.get("target_resource_pressure", 0.0))
     loss = float(attacks.get("legitimate_loss_ratio", 0.0))
     gold_compliance = float(attacks.get("gold_sla_compliance_ratio", 1.0))
+    precursor_confidence = float(attacks.get("precursor_confidence", 0.0))
     attack_pressure = max(resource, intensity * 0.65, min(1.0, loss * 4.0), 1.0 - gold_compliance)
     return {
         "attack_active_count": active_count,
         "attack_intensity_ratio": intensity,
         "attack_pressure": round(attack_pressure, 6),
         "gold_sla_compliance_ratio": gold_compliance,
+        "precursor_active_count": float(attacks.get("precursor_count", 0.0)),
+        "precursor_confidence": precursor_confidence,
+        "early_warning_pressure": round(precursor_confidence, 6),
     }
 
 
