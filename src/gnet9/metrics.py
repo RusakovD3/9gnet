@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable, Any
+from dataclasses import dataclass
+from typing import Iterable, Any, Mapping
 
 import networkx as nx
+import numpy as np
 
 from .routing import (
     DATA_PLANE_TRANSIT_ROLES,
@@ -13,6 +15,415 @@ from .routing import (
     data_plane_routing_view,
     shortest_data_path_length,
 )
+
+
+# The value is deliberately much larger than the normalised dynamic state
+# thresholds.  It makes an entity identifier part of the metric space: a
+# changed C1 tensor may not silently be matched to C2 just because their
+# current numerical values look similar.
+STATE_HAUSDORFF_LABEL_MISMATCH_COST = 10.0
+STATE_HAUSDORFF_ALERT_DISTANCE = 1.0
+_COORDINATE_METRICS = {"x", "y", "x_mid", "y_mid", "coordinate_norm"}
+
+
+@dataclass(frozen=True)
+class StateTensorHausdorffReference:
+    """Precomputed invariant part of a state-Hausdorff comparison with ``t0``."""
+
+    records: Mapping[str, Mapping[str, Any]]
+    record_ids: tuple[str, ...]
+    basis: tuple[tuple[str, str], ...]
+    basis_index: Mapping[tuple[str, str], int]
+    scales: Mapping[tuple[str, str], float]
+    vectors: np.ndarray
+    coordinate_indices: tuple[int, ...]
+
+
+def prepare_state_hausdorff_reference(
+    reference_tensor_state: Mapping[str, Any],
+) -> StateTensorHausdorffReference:
+    """Compile the invariant ``t0`` half of the sparse state metric once."""
+    records = _tensor_records(reference_tensor_state)
+    record_ids = tuple(sorted(records))
+    basis = tuple(_state_metric_basis(records))
+    basis_index = {item: index for index, item in enumerate(basis)}
+    scales = _state_metric_scales(records, records, list(basis))
+    vectors = _state_delta_vectors(
+        list(record_ids), records, records, basis_index, scales
+    )
+    vectors.setflags(write=False)
+    coordinate_indices = tuple(
+        index for index, (_, metric_name) in enumerate(basis)
+        if metric_name in _COORDINATE_METRICS
+    )
+    return StateTensorHausdorffReference(
+        records=records,
+        record_ids=record_ids,
+        basis=basis,
+        basis_index=basis_index,
+        scales=scales,
+        vectors=vectors,
+        coordinate_indices=coordinate_indices,
+    )
+
+
+def state_tensor_hausdorff_view(
+    reference_tensor_state: Mapping[str, Any],
+    current_tensor_state: Mapping[str, Any],
+    *,
+    time_index: int,
+    prepared_reference: StateTensorHausdorffReference | None = None,
+) -> dict[str, Any]:
+    """Measure divergence of the current sparse G-Net state from ``t0``.
+
+    Each tensor-bearing graph object is a labelled point in an augmented
+    metric space.  Its coordinate is the vector of metric changes normalised
+    by the ``t0`` scale.  The label has a finite discrete distance, so the
+    usual symmetric Hausdorff calculation preserves object identity while
+    still reporting added/removed tensor-bearing objects as structural drift.
+
+    The returned distance has the requested monotonic interpretation: zero is
+    the reference state and a larger value is worse.  It is not a distance to
+    a failure set, where the opposite interpretation would apply.
+    """
+    current = _tensor_records(current_tensor_state)
+    compiled_reference = prepared_reference or prepare_state_hausdorff_reference(
+        reference_tensor_state
+    )
+    reference = compiled_reference.records
+    reference_ids = list(compiled_reference.record_ids)
+    current_ids = sorted(current)
+    if not reference_ids and not current_ids:
+        return _empty_state_hausdorff(time_index)
+
+    current_basis = _state_metric_basis(current)
+    if set(current_basis).issubset(compiled_reference.basis_index):
+        basis = list(compiled_reference.basis)
+        basis_index = compiled_reference.basis_index
+        scales = compiled_reference.scales
+        reference_vectors = compiled_reference.vectors
+        coordinate_indices = list(compiled_reference.coordinate_indices)
+    else:
+        # Preserve the full metric if a later snapshot introduces a new
+        # coordinate that was absent at t0.
+        basis = sorted(set(compiled_reference.basis) | set(current_basis))
+        basis_index = {item: index for index, item in enumerate(basis)}
+        scales = _state_metric_scales(reference, current, basis)
+        reference_vectors = _state_delta_vectors(
+            reference_ids, reference, reference, basis_index, scales
+        )
+        coordinate_indices = [
+            index for index, (_, metric_name) in enumerate(basis)
+            if metric_name in _COORDINATE_METRICS
+        ]
+    current_vectors = _state_delta_vectors(
+        current_ids, current, reference, basis_index, scales
+    )
+    directed_reference, directed_current, reference_index, current_index = (
+        _labelled_state_hausdorff(
+            reference_ids,
+            reference_vectors,
+            current_ids,
+            current_vectors,
+        )
+    )
+    distance = max(directed_reference, directed_current)
+    coordinate_distance = _projected_hausdorff_distance(
+        reference_ids,
+        reference_vectors,
+        current_ids,
+        current_vectors,
+        coordinate_indices,
+    )
+    missing = sorted(set(reference_ids) - set(current_ids))
+    added = sorted(set(current_ids) - set(reference_ids))
+    contributors = _state_hausdorff_contributors(
+        current_ids,
+        current_vectors,
+        basis,
+        limit=8,
+    )
+    return {
+        "metric": "label_preserving_sparse_state_tensor_hausdorff",
+        "higher_is_worse": True,
+        "distance": _finite_or_none(distance),
+        "normalized_distance": _normalise_state_hausdorff(distance),
+        "alert_distance": STATE_HAUSDORFF_ALERT_DISTANCE,
+        "directed_t0_to_current": _finite_or_none(directed_reference),
+        "directed_current_to_t0": _finite_or_none(directed_current),
+        "coordinate_hausdorff_distance": _finite_or_none(coordinate_distance),
+        "time_index": int(time_index),
+        "tensor_representation": {
+            "storage": "sparse_coordinate_view_over_snapshot_history",
+            "rank": 5,
+            "axes": ["entity", "layer", "relation", "metric", "time"],
+            "reference_time_index": 0,
+            "current_time_index": int(time_index),
+            "dense_allocation": "not_used",
+            "point_count_t0": len(reference_ids),
+            "point_count_current": len(current_ids),
+            "metric_coordinate_count": len(basis),
+        },
+        "base_metric": {
+            "formula": "d((id,z),(id',z')) = ||z-z'||_2 + 10*1[id!=id']",
+            "state_coordinate": "z_k=(x_k(t)-x_k(t0))/s_k",
+            "scale_semantics": "t0_magnitude_or_natural_unit_scale",
+            "label_mismatch_cost": STATE_HAUSDORFF_LABEL_MISMATCH_COST,
+            "hausdorff_formula": "max{sup_a inf_b d(a,b), sup_b inf_a d(a,b)}",
+        },
+        "structural_difference": {
+            "missing_reference_tensor_ids": missing,
+            "added_current_tensor_ids": added,
+            "has_structural_difference": bool(missing or added),
+        },
+        "witnesses": {
+            "t0_to_current_tensor_id": (
+                reference_ids[reference_index] if reference_index is not None else None
+            ),
+            "current_to_t0_tensor_id": (
+                current_ids[current_index] if current_index is not None else None
+            ),
+        },
+        "top_current_contributors": contributors,
+    }
+
+
+def _tensor_records(tensor_state: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    records: dict[str, dict[str, Any]] = {}
+    for level, items in tensor_state.get("by_level", {}).items():
+        for item in items:
+            scope = str(item.get("scope", "node"))
+            if scope == "edge":
+                endpoints = "--".join(sorted((str(item.get("source")), str(item.get("target")))))
+                object_id = f"edge:{endpoints}"
+            else:
+                object_id = f"node:{item.get('node_id')}"
+            tensor_name = str(item.get("tensor_name", "tensor"))
+            record_id = f"{object_id}:{tensor_name}"
+            records[record_id] = {
+                "level": str(item.get("level", level)),
+                "metrics": {
+                    str(name): float(value)
+                    for name, value in item.get("metrics", {}).items()
+                    if math.isfinite(float(value))
+                },
+                "units": {str(name): str(unit) for name, unit in item.get("units", {}).items()},
+            }
+    return records
+
+
+def _state_metric_basis(
+    records: Mapping[str, Mapping[str, Any]],
+) -> list[tuple[str, str]]:
+    return sorted(
+        {
+            (str(record["level"]), metric_name)
+            for record in records.values()
+            for metric_name in record["metrics"]
+        }
+    )
+
+
+def _state_metric_scales(
+    reference: Mapping[str, Mapping[str, Any]],
+    current: Mapping[str, Mapping[str, Any]],
+    basis: list[tuple[str, str]],
+) -> dict[tuple[str, str], float]:
+    coordinate_magnitudes = [
+        abs(float(record["metrics"].get(metric_name, 0.0)))
+        for record in reference.values()
+        for metric_name in _COORDINATE_METRICS
+        if metric_name in record["metrics"]
+    ]
+    coordinate_scale = max(max(coordinate_magnitudes, default=0.0), 1.0)
+    scales: dict[tuple[str, str], float] = {}
+    for level, metric_name in basis:
+        values = [
+            abs(float(record["metrics"].get(metric_name, 0.0)))
+            for record in reference.values()
+            if record["level"] == level and metric_name in record["metrics"]
+        ]
+        unit = next(
+            (
+                record["units"].get(metric_name, "")
+                for record in [*reference.values(), *current.values()]
+                if record["level"] == level and metric_name in record["units"]
+            ),
+            "",
+        )
+        if metric_name in _COORDINATE_METRICS or unit == "model-coordinate":
+            scales[(level, metric_name)] = coordinate_scale
+        elif unit in {"ratio", "boolean", "normalized"}:
+            scales[(level, metric_name)] = 1.0
+        elif unit == "%":
+            scales[(level, metric_name)] = 100.0
+        else:
+            scales[(level, metric_name)] = max(max(values, default=0.0), 1.0)
+    return scales
+
+
+def _state_delta_vectors(
+    record_ids: list[str],
+    records: Mapping[str, Mapping[str, Any]],
+    reference: Mapping[str, Mapping[str, Any]],
+    basis_index: Mapping[tuple[str, str], int],
+    scales: Mapping[tuple[str, str], float],
+) -> np.ndarray:
+    vectors = np.zeros((len(record_ids), len(basis_index)), dtype=float)
+    for row, record_id in enumerate(record_ids):
+        record = records[record_id]
+        baseline = reference.get(record_id, {})
+        baseline_metrics = baseline.get("metrics", {})
+        for metric_name, value in record["metrics"].items():
+            key = (str(record["level"]), metric_name)
+            column = basis_index[key]
+            vectors[row, column] = (
+                float(value) - float(baseline_metrics.get(metric_name, 0.0))
+            ) / max(float(scales[key]), 1e-12)
+    return vectors
+
+
+def _labelled_state_hausdorff(
+    ids_a: list[str],
+    vectors_a: np.ndarray,
+    ids_b: list[str],
+    vectors_b: np.ndarray,
+) -> tuple[float, float, int | None, int | None]:
+    """Exact labelled Hausdorff distance without an O(N²) allocation.
+
+    The dense pairwise matrix is mathematically convenient but needlessly
+    allocates hundreds of megabytes for every dynamics tick.  Computing rows
+    in bounded chunks gives the same minima and witnesses while retaining the
+    sparse-state model's intended memory behaviour.
+    """
+    if not ids_a and not ids_b:
+        return 0.0, 0.0, None, None
+    if not ids_a or not ids_b:
+        return math.inf, math.inf, None, None
+    # In the normal dynamics path every tensor keeps its identity.  When the
+    # corresponding labelled distance is below the fixed mismatch cost, that
+    # same-label point is provably closer than any other label (whose distance
+    # is at least the mismatch cost).  This exact short path is O(N·K); the
+    # chunked all-pairs fallback below remains for a true structural change or
+    # an exceptionally large state excursion.
+    if len(ids_a) == len(ids_b) and set(ids_a) == set(ids_b):
+        b_index_by_id = {item_id: index for index, item_id in enumerate(ids_b)}
+        matching_b_indices = np.asarray(
+            [b_index_by_id[item_id] for item_id in ids_a], dtype=int
+        )
+        same_label_distances = np.linalg.norm(
+            vectors_a - vectors_b[matching_b_indices], axis=1
+        )
+        if float(np.max(same_label_distances)) < STATE_HAUSDORFF_LABEL_MISMATCH_COST:
+            a_index = int(np.argmax(same_label_distances))
+            return (
+                float(same_label_distances[a_index]),
+                float(same_label_distances[a_index]),
+                a_index,
+                int(matching_b_indices[a_index]),
+            )
+    b_min = np.full(len(ids_b), math.inf, dtype=float)
+    a_min = np.empty(len(ids_a), dtype=float)
+    b_ids = np.asarray(ids_b, dtype=object)
+    chunk_size = 32
+    for start in range(0, len(ids_a), chunk_size):
+        stop = min(len(ids_a), start + chunk_size)
+        euclidean = np.linalg.norm(
+            vectors_a[start:stop, None, :] - vectors_b[None, :, :], axis=2
+        )
+        penalty = np.not_equal(
+            np.asarray(ids_a[start:stop], dtype=object)[:, None], b_ids[None, :]
+        ).astype(float) * STATE_HAUSDORFF_LABEL_MISMATCH_COST
+        distances = euclidean + penalty
+        a_min[start:stop] = distances.min(axis=1)
+        b_min = np.minimum(b_min, distances.min(axis=0))
+    a_to_b = a_min
+    b_to_a = b_min
+    a_index = int(np.argmax(a_to_b))
+    b_index = int(np.argmax(b_to_a))
+    return float(a_to_b[a_index]), float(b_to_a[b_index]), a_index, b_index
+
+
+def _projected_hausdorff_distance(
+    reference_ids: list[str],
+    reference_vectors: np.ndarray,
+    current_ids: list[str],
+    current_vectors: np.ndarray,
+    indices: list[int],
+) -> float:
+    if not indices:
+        return 0.0
+    first, second, _, _ = _labelled_state_hausdorff(
+        reference_ids,
+        reference_vectors[:, indices],
+        current_ids,
+        current_vectors[:, indices],
+    )
+    return max(first, second)
+
+
+def _state_hausdorff_contributors(
+    current_ids: list[str],
+    current_vectors: np.ndarray,
+    basis: list[tuple[str, str]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    if not current_ids:
+        return []
+    scores = np.linalg.norm(current_vectors, axis=1)
+    result: list[dict[str, Any]] = []
+    for index in np.argsort(scores)[::-1][:limit]:
+        score = float(scores[int(index)])
+        if score <= 1e-12:
+            continue
+        components = np.argsort(np.abs(current_vectors[int(index)]))[::-1][:3]
+        result.append(
+            {
+                "tensor_id": current_ids[int(index)],
+                "normalized_state_distance": round(score, 8),
+                "largest_metric_deltas": [
+                    {
+                        "level": basis[int(component)][0],
+                        "metric": basis[int(component)][1],
+                        "normalized_delta": round(
+                            float(current_vectors[int(index), int(component)]), 8
+                        ),
+                    }
+                    for component in components
+                    if abs(float(current_vectors[int(index), int(component)])) > 1e-12
+                ],
+            }
+        )
+    return result
+
+
+def _normalise_state_hausdorff(distance: float) -> float:
+    if not math.isfinite(distance):
+        return 1.0
+    return round(min(1.0, max(0.0, distance / STATE_HAUSDORFF_ALERT_DISTANCE)), 8)
+
+
+def _finite_or_none(value: float) -> float | None:
+    return None if not math.isfinite(value) else round(float(value), 8)
+
+
+def _empty_state_hausdorff(time_index: int) -> dict[str, Any]:
+    return {
+        "metric": "label_preserving_sparse_state_tensor_hausdorff",
+        "higher_is_worse": True,
+        "distance": 0.0,
+        "normalized_distance": 0.0,
+        "coordinate_hausdorff_distance": 0.0,
+        "time_index": int(time_index),
+        "tensor_representation": {
+            "storage": "sparse_coordinate_view_over_snapshot_history",
+            "rank": 5,
+            "axes": ["entity", "layer", "relation", "metric", "time"],
+            "dense_allocation": "not_used",
+        },
+        "top_current_contributors": [],
+    }
 
 
 def vertex_proximity_index(graph: nx.Graph, nodes: Iterable[str]) -> dict[str, float]:
@@ -127,26 +538,13 @@ def gold_threat_proximity_view(model, attack_state: dict) -> dict[str, Any]:
         "normalization_scale_semantics": (
             "transit_core_latency_diameter_plus_two_maximum_physical_endpoint_attachments"
         ),
-        "distance": round(minimum_distance, 6),
-        "symmetric_distance": round(weighted_distance, 6),
-        "normalized_distance": round(normalized, 6),
         "proximity_risk": round(proximity_risk, 6),
         "maximum_exposure": round(maximum_exposure, 6),
         "weighted_mean_exposure": round(weighted_mean, 6),
         "decay_tau_ms": tau_ms,
         "decay_tau_origin": "gnet9_calibrated_scenario_assumption",
-        "legacy_aliases": {
-            "distance": "minimum_threat_to_gold_latency_ms",
-            "symmetric_distance": "weighted_mean_threat_to_gold_latency_ms",
-            "normalized_distance": "normalized_weighted_proximity_distance",
-        },
         "affected_nodes": affected_nodes,
     }
-
-
-def attack_hausdorff_view(model, attack_state: dict) -> dict[str, Any]:
-    """Совместимый alias; каноническая функция не является Hausdorff-метрикой."""
-    return gold_threat_proximity_view(model, attack_state)
 
 
 def gold_route_hausdorff_view(model, flows: Iterable[dict[str, Any]]) -> dict[str, Any]:

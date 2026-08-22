@@ -1,4 +1,9 @@
-from src.gnet9.attacks import MITRE_DEMO_ATTACKS, attack_catalog
+from src.gnet9.attacks import (
+    MITRE_DEMO_ATTACKS,
+    MITRE_T1110_001_ATTEMPTS_PER_SECOND,
+    attack_catalog,
+    mitre_tensor_mapping_catalog,
+)
 from src.gnet9.constants import SUBSCRIBER_COUNT
 from src.gnet9.dynamics import DynamicsConfig, simulate_stationary_dynamics
 from src.gnet9.routing import path_uses_only_data_plane_transit
@@ -11,7 +16,7 @@ MODEL = GNetBaselineBuilder().build()
 def test_attack_catalog_uses_official_mitre_techniques_and_explicit_assumptions() -> None:
     catalog = attack_catalog()
     assert {item["mitre_technique_id"] for item in catalog} == {
-        "T1498.001", "T1498.002", "T1499.001", "T0831", "T1529"
+        "T1498.001", "T1498.002", "T1499.001", "T1110.001", "T0831", "T1529"
     }
     power = [item for item in catalog if item["kind"] == "power_attack"]
     assert {item["power_failure_mode"] for item in power} == {
@@ -24,9 +29,15 @@ def test_attack_catalog_uses_official_mitre_techniques_and_explicit_assumptions(
     assert next(item for item in power if item["power_failure_mode"] == "cyber_shutdown")[
         "mitre_technique_id"
     ] == "T1529"
-    assert {item["kind"] for item in catalog} == {"dos", "ddos", "syn_flood", "power_attack"}
+    assert {item["kind"] for item in catalog} == {
+        "dos", "ddos", "syn_flood", "brute_force", "power_attack"
+    }
     assert all(item["mitre_url"].startswith("https://attack.mitre.org/techniques/") for item in catalog)
-    assert all(item["technical"]["value_origin"] == "scenario_assumption" for item in catalog)
+    assert all(
+        item["technical"]["value_origin"] == "scenario_assumption"
+        for item in catalog
+        if item["kind"] != "brute_force"
+    )
     assert all(item["temporal"]["duration_steps"] >= 1 for item in catalog)
     dos = next(item for item in catalog if item["kind"] == "dos")
     ddos = next(item for item in catalog if item["kind"] == "ddos")
@@ -35,6 +46,24 @@ def test_attack_catalog_uses_official_mitre_techniques_and_explicit_assumptions(
     assert ddos["technical"]["on_wire_size_bytes"] == 1_200 + 66
     assert syn["technical"]["packet_size_bytes"] == 40
     assert syn["technical"]["on_wire_size_bytes"] == 84
+    brute_force = next(item for item in catalog if item["kind"] == "brute_force")
+    assert brute_force["mitre_technique_id"] == "T1110.001"
+    assert (
+        brute_force["technical"]["value_origin"]
+        == "mitre_t1110_001_apt28_procedure_example_lower_bound"
+    )
+    assert (
+        brute_force["technical"]["authentication_attempt_rate_per_second"]
+        == MITRE_T1110_001_ATTEMPTS_PER_SECOND
+    )
+    assert brute_force["technical"]["authentication_attempt_rate_origin"].startswith(
+        "mitre_t1110_001_apt28_procedure_example"
+    )
+    assert brute_force["technical"]["authentication_attempt_rate_reference_url"] == (
+        "https://attack.mitre.org/techniques/T1110/001/"
+    )
+    assert brute_force["technical"]["offered_rate_mbps"] == 0.0
+    assert any(item["technique_id"] == "T1110.001" for item in mitre_tensor_mapping_catalog())
 
 
 def test_gold_routes_mark_critical_nodes_and_safe_remap_limit() -> None:
@@ -53,7 +82,7 @@ def test_mitre_demo_schedule_and_network_reaction() -> None:
     )
     snapshots = dynamics["snapshots"]
     active_steps = [snapshot["step_index"] for snapshot in snapshots if snapshot["attacks"]["active"]]
-    assert active_steps == [2, 3, 5, 6, 8, 9, 10]
+    assert active_steps == [2, 3, 4, 5, 6, 7, 8, 9, 10]
     assert snapshots[0]["attacks"]["attack_rate_mbps"] == 0.0
     assert snapshots[0]["attacks"]["legitimate_loss_ratio"] == 0.0
     assert snapshots[0]["koopman"]["forecast_horizon_seconds"] == 5
@@ -68,18 +97,53 @@ def test_mitre_demo_schedule_and_network_reaction() -> None:
     assert all(
         "SRV_MEDIA" not in flow.get("route", [])
         for flow in snapshots[6]["traffic"]["flows"]
-        if not flow.get("is_attack_traffic") and flow.get("original_server_node") == "SRV_MEDIA"
+        if (
+            not flow.get("is_attack_traffic")
+            and flow.get("original_server_node") == "SRV_MEDIA"
+            # M1_01 is concurrently the safe T1110.001 account target.  Its
+            # legitimate service path is protected, not failed over.
+            and flow.get("client_node") != "M1_01"
+        )
     )
     assert snapshots[6]["attacks"]["raw_target_resource_pressure"] >= 0.90
     assert snapshots[6]["arbitrator"]["analysis"]["attack_pressure"] < snapshots[6]["attacks"]["raw_target_resource_pressure"]
     assert snapshots[6]["arbitrator"]["analysis"]["koopman_forecast_risk"] > 0.50
     assert snapshots[6]["arbitrator"]["remap"]["reason"] == "mitre_attack_observed_with_koopman_confirmation"
-    assert snapshots[7]["attacks"]["active"] is False
+    assert {event["kind"] for event in snapshots[7]["attacks"]["events"]} == {"brute_force"}
+    assert snapshots[7]["attacks"]["attack_rate_mbps"] == 0.0
     assert snapshots[10]["attacks"]["active_count"] == 2
     assert {event["kind"] for event in snapshots[10]["attacks"]["events"]} == {"power_attack"}
     assert snapshots[10]["attacks"]["attack_rate_mbps"] == 0.0
     assert snapshots[10]["arbitrator"]["analysis"]["lyapunov_value"] > snapshots[0]["arbitrator"]["analysis"]["lyapunov_value"]
     assert snapshots[10]["arbitrator"]["remap"]["koopman_forecast"]["attack_kind"] == "power_attack"
+
+
+def test_slow_brute_force_is_safe_authentication_telemetry() -> None:
+    dynamics = simulate_stationary_dynamics(
+        MODEL,
+        DynamicsConfig(step_count=4, snapshot_detail="summary", packet_detail="flows", attack_scenario="mitre-demo"),
+    )
+    snapshot = dynamics["snapshots"][4]
+    assert {event["kind"] for event in snapshot["attacks"]["events"]} == {"brute_force"}
+    assert snapshot["attacks"]["attack_rate_mbps"] == 0.0
+    assert snapshot["attacks"]["legitimate_loss_ratio"] == 0.0
+    assert snapshot["attacks"]["authentication_failure_rate_per_second"] > 0.0
+    assert (
+        snapshot["attacks"]["authentication_failure_rate_per_second"]
+        <= MITRE_T1110_001_ATTEMPTS_PER_SECOND
+    )
+    observation = snapshot["attacks"]["target_observations"][0]
+    assert observation["authentication_parameter_origin"].startswith(
+        "mitre_t1110_001_apt28_procedure_example"
+    )
+    assert observation["authentication_parameter_reference_url"] == (
+        "https://attack.mitre.org/techniques/T1110/001/"
+    )
+    assert not [flow for flow in snapshot["traffic"]["flows"] if flow.get("is_attack_traffic")]
+    state = snapshot["state_vector"]
+    rate_index = state["metric_names"].index("OBS.authentication_failure_rate_per_second")
+    assert state["vector"][rate_index] > 0.0
+    assert snapshot["arbitrator"]["analysis"]["state_hausdorff"]["higher_is_worse"] is True
 
 
 def test_attack_flows_are_visible_and_separate_from_legitimate_flows() -> None:
@@ -93,7 +157,7 @@ def test_attack_flows_are_visible_and_separate_from_legitimate_flows() -> None:
     assert len(legitimate_flows) == SUBSCRIBER_COUNT
     assert {flow["application"] for flow in attack_flows} == {"ATTACK_DOS"}
     assert all(flow["mitre_technique_id"] == "T1498.001" for flow in attack_flows)
-    assert len(MITRE_DEMO_ATTACKS) == 5
+    assert len(MITRE_DEMO_ATTACKS) == 6
 
 
 def test_koopman_predictor_exports_causal_forecast_and_residual() -> None:
@@ -132,12 +196,12 @@ def test_koopman_warns_five_seconds_before_every_attack_onset() -> None:
         DynamicsConfig(step_count=10, snapshot_detail="summary", packet_detail="flows", attack_scenario="mitre-demo"),
     )
     evaluation = dynamics["koopman_evaluation"]
-    assert evaluation["attack_onset_count"] == 5
-    assert evaluation["predicted_before_onset_count"] == 5
+    assert evaluation["attack_onset_count"] == 6
+    assert evaluation["predicted_before_onset_count"] == 6
     assert evaluation["minimum_observed_lead_seconds"] >= 5
     assert evaluation["false_positive_attack_id_count"] == 0
     assert evaluation["all_attacks_predicted_at_least_one_step_ahead"] is True
-    assert evaluation["preventive_defense_applied_count"] == 5
+    assert evaluation["preventive_defense_applied_count"] == 6
 
     for record in evaluation["records"]:
         warning = dynamics["snapshots"][record["warning_step"]]

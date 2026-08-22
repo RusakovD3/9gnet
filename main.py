@@ -14,6 +14,8 @@ from src.gnet9.attacks import (
     PREDICTIVE_DEMO_STEP_COUNT,
     PREDICTIVE_DEMO_STEP_SECONDS,
     attack_catalog,
+    mitre_tensor_mapping_catalog,
+    predictive_demo_minimum_steps,
 )
 from src.gnet9.debug_visualizer import DebugFlowWindow, RuntimeCallTracer, export_debug_artifacts
 from src.gnet9.dynamics import DynamicsConfig, simulate_stationary_dynamics
@@ -166,6 +168,7 @@ def export_attack_catalog(
     payload = {
         # `attacks` оставлен совместимым alias для прежнего mitre-demo.
         "attacks": attack_catalog(model, "mitre-demo"),
+        "tensor_mappings": mitre_tensor_mapping_catalog(),
         "scenarios": {
             "mitre-demo": attack_catalog(model, "mitre-demo"),
             "predictive-demo": attack_catalog(
@@ -354,7 +357,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="CSV",
         help=(
             "Проверить обезличенную внешнюю телеметрию: хронологически подобрать "
-            "порог по ранней части ряда и проверить его на независимом holdout. "
+            "порог по ранней части ряда и проверить его на независимой проверочной "
+            "части (holdout). "
             "Создаёт output/telemetry_validation_report.json и не запускает сеть."
         ),
     )
@@ -364,7 +368,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         metavar="JSON",
         help=(
-            "Применить только прошедший holdout отчёт внешней телеметрии как порог "
+            "Применить только прошедший независимую проверку (holdout) отчёт внешней "
+            "телеметрии как порог "
             "предупреждения для симуляции. Автоматических изменений реальной сети не выполняет."
         ),
     )
@@ -453,7 +458,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("none", "mitre-demo", "predictive-demo"),
         default="none",
         help=(
-            "Сценарий: none, совместимый mitre-demo или predictive-demo "
+            "Сценарий: none, фиксированный mitre-demo или predictive-demo "
             "с причинным прогнозом, взвешенными атаками и приоритетным переназначением Gold."
         ),
     )
@@ -462,6 +467,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("интерактивная карта потоков требует пакетную модель; уберите --no-packet-simulation")
     if args.no_packet_simulation and args.attack_scenario != "none":
         parser.error("сценарий атак требует пакетную модель; уберите --no-packet-simulation")
+    if args.attack_scenario == "predictive-demo":
+        resolved_step_seconds = args.step_seconds or PREDICTIVE_DEMO_STEP_SECONDS
+        resolved_step_count = (
+            args.dynamics_steps
+            if args.dynamics_steps is not None
+            else PREDICTIVE_DEMO_STEP_COUNT
+        )
+        minimum_steps = predictive_demo_minimum_steps(resolved_step_seconds)
+        if resolved_step_count < minimum_steps:
+            parser.error(
+                "predictive-demo требует не менее "
+                f"{minimum_steps} шагов при длительности шага "
+                f"{resolved_step_seconds} с: нужны причинные предвестники и место для атаки"
+            )
     if args.validate_telemetry_csv and args.calibration_report:
         parser.error("используйте либо --validate-telemetry-csv, либо --calibration-report, но не оба аргумента")
     return args

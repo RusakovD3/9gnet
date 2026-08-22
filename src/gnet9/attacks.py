@@ -1,9 +1,10 @@
 """Воспроизводимые сценарии отказа в обслуживании по MITRE ATT&CK.
 
-MITRE ATT&CK задаёт таксономию и поведение атак, но не нормативные скорости.
-Численные интенсивности ниже являются явными параметрами лабораторного сценария:
-они подобраны относительно ёмкости связей GNet9 и сохраняются вместе с источником
-значения, чтобы будущие расчёты не смешивали стандарт и допущение модели.
+MITRE ATT&CK задаёт таксономию и поведение атак, а не универсальные нормативные
+скорости. Большинство численных интенсивностей ниже являются явными параметрами
+лабораторного сценария. Исключение отмечено отдельно: для T1110.001 используется
+нижняя граница из официального примера процедуры MITRE. Это всё равно не стандарт
+для любой сети и не повод выполнять реальный подбор паролей.
 """
 
 from __future__ import annotations
@@ -21,12 +22,22 @@ from .routing import has_data_path, shortest_data_path
 
 
 MITRE_ATTACK_SOURCE = "https://attack.mitre.org/techniques/"
+MITRE_T1110_001_APT28_PROCEDURE_URL = "https://attack.mitre.org/techniques/T1110/001/"
+# MITRE's APT28 procedure example says "over 300 authentication attempts per
+# hour per targeted account".  The simulator uses 300/h only as the documented
+# lower-bound reference (one expected failed login every 12 seconds), not as a
+# universal attack rate or as a real traffic generator.
+MITRE_T1110_001_APT28_MIN_ATTEMPTS_PER_HOUR = 300
+MITRE_T1110_001_ATTEMPTS_PER_SECOND = (
+    MITRE_T1110_001_APT28_MIN_ATTEMPTS_PER_HOUR / 3_600
+)
 
 
 class AttackKind(str, Enum):
     DOS = "dos"
     DDOS = "ddos"
     SYN_FLOOD = "syn_flood"
+    BRUTE_FORCE = "brute_force"
     POWER_ATTACK = "power_attack"
 
 
@@ -59,6 +70,10 @@ class AttackTechnicalCharacteristics:
     traffic_origin_semantics: str = "direct_from_listed_ingress_nodes"
     initiator_count: int | None = None
     external_reflector_count: int = 0
+    authentication_attempt_rate_per_second: float | None = None
+    authentication_failure_ratio: float = 0.0
+    authentication_attempt_rate_origin: str = "not_applicable"
+    authentication_attempt_rate_reference_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -140,12 +155,95 @@ class AttackProfile:
             f"{MITRE_ATTACK_SOURCE}{technique_id.replace('.', '/')}/"
             for technique_id in self.related_technique_ids
         ]
-        data["mitre_semantics"] = "behavior_taxonomy_not_numeric_rate_standard"
+        data["mitre_semantics"] = (
+            "behavior_taxonomy_not_a_universal_numeric_rate_standard; "
+            "a separately-labelled procedure-example value may be used where available"
+        )
         data["impact_semantics"] = (
             "computed_from_path_bottleneck_and_target_resource_budget; "
             "numeric budgets are labelled GNet9 scenario assumptions"
         )
         return data
+
+
+@dataclass(frozen=True)
+class MitreTensorMapping:
+    """Explicit link between an ATT&CK technique and observable G-Net state."""
+
+    technique_id: str
+    technique_name: str
+    attack_kind: AttackKind
+    gnet_levels: tuple[str, ...]
+    tensor_metrics: tuple[str, ...]
+    observation_metrics: tuple[str, ...]
+    mitigation_ids: tuple[str, ...]
+    mitigation_actions: tuple[str, ...]
+    scope: str = "safe_in_memory_simulation"
+
+    @property
+    def mitre_url(self) -> str:
+        return f"{MITRE_ATTACK_SOURCE}{self.technique_id.replace('.', '/')}/"
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["attack_kind"] = self.attack_kind.value
+        data["mitre_url"] = self.mitre_url
+        data["mapping_semantics"] = (
+            "expert_declared_observable_mapping; not a claim that all ATT&CK techniques are covered"
+        )
+        return data
+
+
+MITRE_TENSOR_MAPPINGS = (
+    MitreTensorMapping(
+        "T1498.001", "Direct Network Flood", AttackKind.DOS,
+        ("L1", "L2", "EDGE", "L7"),
+        ("L1.sla_margin", "L2.cpu_load_percent", "EDGE.utilization", "EDGE.loss_probability"),
+        ("attack_rate_mbps", "traffic_acceleration_ratio", "target_concentration_ratio"),
+        (), ("ingress_acl_or_policer", "source_quarantine"),
+    ),
+    MitreTensorMapping(
+        "T1498.002", "Reflection Amplification", AttackKind.DDOS,
+        ("L1", "L2", "EDGE", "L7"),
+        ("L1.sla_margin", "L2.cpu_load_percent", "EDGE.utilization", "EDGE.loss_probability"),
+        ("attack_rate_mbps", "suspicious_source_count", "source_entropy_ratio"),
+        (), ("upstream_flowspec", "scrubbing_center", "ingress_acl_or_policer"),
+    ),
+    MitreTensorMapping(
+        "T1499.001", "OS Exhaustion Flood", AttackKind.SYN_FLOOD,
+        ("L1", "L2", "EDGE", "L7"),
+        ("L1.sla_margin", "L2.stability_margin", "EDGE.loss_probability"),
+        ("syn_backlog_growth_ratio", "maximum_target_utilization_percent"),
+        (), ("syn_proxy", "syn_cookies", "connection_rate_limit"),
+    ),
+    MitreTensorMapping(
+        "T1110.001", "Password Guessing", AttackKind.BRUTE_FORCE,
+        ("L1", "L7"),
+        ("L1.authentication_failure_rate_per_second", "L1.sla_margin"),
+        ("authentication_failure_rate_per_second", "authentication_failure_ratio", "account_lockout_pressure"),
+        ("M1036", "M1032", "M1027", "M1018"),
+        ("account_lockout_policy", "multi_factor_authentication", "conditional_access"),
+    ),
+    MitreTensorMapping(
+        "T0831", "Manipulation of Control", AttackKind.POWER_ATTACK,
+        ("L6", "L7"),
+        ("L6.energy_reserve_ratio",),
+        ("power_control_anomaly_ratio", "power_voltage_sag_ratio", "battery_discharge_rate_ratio"),
+        (), ("revoke_management_session", "transfer_to_independent_power_domain"),
+    ),
+    MitreTensorMapping(
+        "T1529", "System Shutdown/Reboot", AttackKind.POWER_ATTACK,
+        ("L0", "L6", "L7"),
+        ("L0.service_health", "L6.energy_reserve_ratio"),
+        ("power_control_anomaly_ratio", "power_service_unavailability_ratio"),
+        (), ("revoke_management_session", "failover_service_to_standby"),
+    ),
+)
+
+
+def mitre_tensor_mapping_catalog() -> list[dict[str, Any]]:
+    """Return the explicitly supported, observable ATT&CK-to-tensor mappings."""
+    return [item.to_dict() for item in MITRE_TENSOR_MAPPINGS]
 
 
 # Расписание рассчитано на стандартные 10 переходов по 5 секунд.
@@ -197,6 +295,28 @@ MITRE_DEMO_ATTACKS = (
         "Поток SYN заполняет очередь полуоткрытых соединений и радиоканал Gold-абонента M1_01.",
     ),
     AttackProfile(
+        "BRUTE_FORCE_GOLD_ACCOUNT", "Медленный подбор пароля к учётной записи Gold", AttackKind.BRUTE_FORCE,
+        "T1110.001", "Password Guessing", ("T1110",), "M1_01", "mobile-subscriber", ("F3_40",),
+        AttackTemporalCharacteristics(4, 4, 3, "slow-constant-authentication-attempts"),
+        AttackTechnicalCharacteristics(
+            "HTTPS/TLS authentication", 0, 0.0, 0, 1, 1.0, 0.0,
+            value_origin="mitre_t1110_001_apt28_procedure_example_lower_bound",
+            resource_axis="online_authentication_failure_counter_and_account_lockout_policy",
+            traffic_origin_semantics="single_external_identity_attempting_known_account_without_packet_emission",
+            initiator_count=1,
+            authentication_attempt_rate_per_second=MITRE_T1110_001_ATTEMPTS_PER_SECOND,
+            authentication_failure_ratio=1.0,
+            authentication_attempt_rate_origin=(
+                "mitre_t1110_001_apt28_procedure_example_lower_bound_300_attempts_per_hour_per_account"
+            ),
+            authentication_attempt_rate_reference_url=MITRE_T1110_001_APT28_PROCEDURE_URL,
+        ),
+        0.0, 0.0, 0.06,
+        "Нижняя граница из примера процедуры MITRE: 300 неуспешных попыток в час на учётную "
+        "запись, то есть одна ожидаемая попытка за 12 секунд. Это не норматив MITRE, а безопасная "
+        "модель журнальных событий T1110.001: она не генерирует пакеты и не выполняет подбор паролей.",
+    ),
+    AttackProfile(
         "POWER_AGG_A3", "Воздействие на питание агрегирующего коммутатора A3", AttackKind.POWER_ATTACK,
         "T0831", "Manipulation of Control", ("T1078", "T0826"),
         "A3", "aggregation-switch", (),
@@ -239,6 +359,25 @@ PREDICTIVE_DEMO_DEFAULT_SEED = 42
 PREDICTIVE_DEMO_STEP_SECONDS = 2
 PREDICTIVE_DEMO_STEP_COUNT = 60
 PREDICTIVE_DEMO_PRECURSOR_SECONDS = 20
+
+
+def predictive_demo_minimum_steps(step_seconds: int) -> int:
+    """Return the shortest runnable predictive-demo window.
+
+    The scenario needs its 20-second causal precursor window (at least two
+    samples) and enough trailing frames to begin and finish a scheduled event.
+    Keeping this calculation next to the schedule avoids a different
+    constraint in the CLI, simulator and documentation.
+    """
+    if step_seconds <= 0:
+        raise ValueError("Длительность шага predictive-demo должна быть положительной")
+    precursor_steps = max(
+        2,
+        math.ceil(PREDICTIVE_DEMO_PRECURSOR_SECONDS / step_seconds),
+    )
+    return precursor_steps + 5
+
+
 # k < 1 задаёт убывающую интенсивность отказов (hazard) и тяжёлый хвост.
 # Это не самовозбуждающийся процесс и не доказательство координации ботнета;
 # число является только воспроизводимым допущением лабораторного сценария.
@@ -273,6 +412,7 @@ PREVENTIVE_DEFENSE_EFFECTIVENESS = {
     AttackKind.DOS.value: 0.70,
     AttackKind.DDOS.value: 0.78,
     AttackKind.SYN_FLOOD.value: 0.84,
+    AttackKind.BRUTE_FORCE.value: 0.95,
     AttackKind.POWER_ATTACK.value: 0.68,
 }
 SLA_PROTECTION_FACTOR = {"gold": 1.0, "silver": 0.72, "bronze": 0.45}
@@ -429,7 +569,7 @@ def predictive_demo_weibull_schedule(
     if shape <= 0.0 or not math.isfinite(shape):
         raise ValueError("Параметр формы Вейбулла должен быть конечным и положительным")
     resolved_precursor_steps = (
-        max(2, math.ceil(PREDICTIVE_DEMO_PRECURSOR_SECONDS / step_seconds))
+        predictive_demo_minimum_steps(step_seconds) - 5
         if precursor_steps is None
         else int(precursor_steps)
     )
@@ -437,7 +577,11 @@ def predictive_demo_weibull_schedule(
     last_start_step = step_count - 3
     available_slots = last_start_step - first_start_step + 1
     if resolved_precursor_steps < 2 or available_slots < 1:
-        minimum_steps = resolved_precursor_steps + 5
+        minimum_steps = (
+            predictive_demo_minimum_steps(step_seconds)
+            if precursor_steps is None
+            else resolved_precursor_steps + 5
+        )
         raise ValueError(
             f"Для окна предвестника {resolved_precursor_steps} шагов требуется не менее {minimum_steps} шагов "
             f"при окне предвестника {resolved_precursor_steps} шагов"
@@ -1102,6 +1246,10 @@ def _attack_capacity_context(
         processing_ratio = 0.0
         peak_pressure = float(profile.target_resource_pressure)
         pressure_basis = f"stateful_{profile.power_failure_mode or 'power_event'}_scenario"
+    elif profile.kind == AttackKind.BRUTE_FORCE:
+        processing_ratio = 0.0
+        peak_pressure = float(profile.target_resource_pressure)
+        pressure_basis = "slow_authentication_attempts_below_data_plane_saturation"
     elif profile.kind == AttackKind.SYN_FLOOD:
         budget = float(TARGET_SYN_STATE_BUDGET_PPS[target_type])
         processing_ratio = packet_rate / budget
@@ -1275,6 +1423,18 @@ def active_attack_events(
             "effective_offered_rate_mbps": round(profile.technical.offered_rate_mbps * intensity, 4),
             "effective_packet_rate_pps": int(profile.technical.packet_rate_pps * intensity),
         }
+        if profile.kind == AttackKind.BRUTE_FORCE:
+            event["effective_authentication_attempt_rate_per_second"] = round(
+                float(profile.technical.authentication_attempt_rate_per_second or 0.0)
+                * intensity,
+                6,
+            )
+            event["effective_failed_authentication_attempt_count"] = round(
+                float(event["effective_authentication_attempt_rate_per_second"])
+                * resolved_step_seconds
+                * float(profile.technical.authentication_failure_ratio),
+                6,
+            )
         if profile.kind == AttackKind.DDOS:
             event["effective_request_rate_mbps"] = round(
                 float(route_context["request_offered_rate_mbps"]) * intensity,
@@ -1871,6 +2031,11 @@ def apply_attack_effects(
         _target_observation(model, event, mitigation_ratio=event_mitigation[event["attack_id"]])
         for event in events
     ]
+    authentication_observations = [
+        observation
+        for event, observation in zip(events, target_observations, strict=True)
+        if event.get("kind") == AttackKind.BRUTE_FORCE.value
+    ]
     precursor_summary = _precursor_summary(precursor_events)
     active_power = [
         (event, observation)
@@ -1953,6 +2118,32 @@ def apply_attack_effects(
         "raw_target_resource_pressure": round(raw_max_pressure, 6),
         "target_resource_pressure": round(max_pressure, 6),
         "target_observations": target_observations,
+        "authentication_failure_rate_per_second": round(
+            sum(
+                float(item.get("authentication_attempt_rate_per_second", 0.0))
+                * float(item.get("authentication_failure_ratio", 0.0))
+                for item in authentication_observations
+            ),
+            6,
+        ),
+        "authentication_failure_ratio": round(
+            max(
+                (float(item.get("authentication_failure_ratio", 0.0)) for item in authentication_observations),
+                default=0.0,
+            ),
+            6,
+        ),
+        "failed_authentication_attempt_count": round(
+            sum(float(item.get("failed_authentication_attempt_count", 0.0)) for item in authentication_observations),
+            6,
+        ),
+        "account_lockout_pressure": round(
+            max(
+                (float(item.get("account_lockout_pressure", 0.0)) for item in authentication_observations),
+                default=0.0,
+            ),
+            6,
+        ),
         "power_runtime_state": power_records,
         "power_ride_through_active_count": sum(
             bool(item.get("ride_through_active")) for item in power_records
@@ -2022,6 +2213,10 @@ def apply_attack_effects(
 
 
 def _flow_is_affected(flow: dict[str, Any], event: dict[str, Any]) -> bool:
+    if event.get("kind") == AttackKind.BRUTE_FORCE.value:
+        # T1110.001 remains an authentication-log scenario.  It is not a
+        # traffic generator and must never manufacture a data-plane loss.
+        return False
     target = event["target_id"]
     return target in flow.get("route", []) or target in {
         flow.get("client_node"), flow.get("server_node"), flow.get("service_node")
@@ -2514,6 +2709,7 @@ def _target_observation(
     network_utilization = raw_network_utilization * (1.0 - mitigation_ratio)
     power_reserve = _power_reserve_ratio(attrs)
     power_attack = event["kind"] == AttackKind.POWER_ATTACK.value
+    brute_force = event["kind"] == AttackKind.BRUTE_FORCE.value
     runtime = event.get("power_runtime")
     if power_attack and isinstance(runtime, Mapping):
         # Электрический вход, выход ИБП и доступность сервиса — разные
@@ -2536,6 +2732,16 @@ def _target_observation(
         )
         estimated_resource_utilization = baseline_cpu * service_availability
         estimated_queue_utilization = 0.0
+    elif brute_force:
+        # T1110.001 is represented as low-rate authentication telemetry, not
+        # as a data-plane flood.  A failed login must not manufacture packet
+        # loss or an outage in an unrelated subscriber service.
+        service_availability = 1.0
+        output_availability = 1.0
+        input_voltage_ratio = 1.0
+        energy_reserve = power_reserve
+        estimated_resource_utilization = baseline_cpu
+        estimated_queue_utilization = 0.0
     else:
         service_availability = max(0.0, 1.0 - pressure * 0.92)
         output_availability = 1.0
@@ -2545,6 +2751,22 @@ def _target_observation(
         energy_reserve = power_reserve
         estimated_resource_utilization = min(100.0, baseline_cpu + pressure * 88.0)
         estimated_queue_utilization = min(100.0, pressure * 100.0)
+    authentication_attempt_rate = (
+        float(event.get("effective_authentication_attempt_rate_per_second", 0.0))
+        * (1.0 - mitigation_ratio)
+        if brute_force
+        else 0.0
+    )
+    authentication_failure_ratio = (
+        float(event["technical"].get("authentication_failure_ratio", 0.0))
+        if brute_force
+        else 0.0
+    )
+    failed_authentication_attempts = (
+        authentication_attempt_rate
+        * float(event.get("interval_seconds", 1))
+        * authentication_failure_ratio
+    )
     return {
         "target_id": event["target_id"],
         "target_type": event["target_type"],
@@ -2588,6 +2810,22 @@ def _target_observation(
         "syn_backlog_exhaustion_ratio": round(
             pressure * float(event["technical"].get("incomplete_handshake_ratio", 0.0)), 6
         ),
+        "authentication_attempt_rate_per_second": round(authentication_attempt_rate, 6),
+        "authentication_failure_ratio": round(authentication_failure_ratio, 6),
+        "failed_authentication_attempt_count": round(failed_authentication_attempts, 6),
+        "account_lockout_pressure": round(
+            min(1.0, authentication_attempt_rate), 6
+        ),
+        "authentication_parameter_origin": (
+            str(event["technical"].get("authentication_attempt_rate_origin", "not_applicable"))
+            if brute_force
+            else "not_applicable"
+        ),
+        "authentication_parameter_reference_url": (
+            event["technical"].get("authentication_attempt_rate_reference_url")
+            if brute_force
+            else None
+        ),
         "critical_protection": attrs.get("critical_protection", {}),
     }
 
@@ -2599,7 +2837,7 @@ def _build_attack_flows(
     quarantined_sources: set[str] | None = None,
     identities: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    if event["kind"] == AttackKind.POWER_ATTACK.value:
+    if event["kind"] in {AttackKind.POWER_ATTACK.value, AttackKind.BRUTE_FORCE.value}:
         return []
     is_reflection = event["kind"] == AttackKind.DDOS.value
     routes = event.get("response_routes" if is_reflection else "routes", [])
@@ -2745,6 +2983,9 @@ def _precursor_signals(
         confidence, acceleration, syn_growth, power_anomaly, concentration = (0.82, 0.86, 0.0, 0.0, 0.89)
     elif profile.kind == AttackKind.SYN_FLOOD:
         confidence, acceleration, syn_growth, power_anomaly, concentration = (0.88, 0.76, 0.93, 0.0, 0.97)
+    elif profile.kind == AttackKind.BRUTE_FORCE:
+        confidence, acceleration, syn_growth, power_anomaly, concentration = (0.76, 0.0, 0.0, 0.0, 1.0)
+        scan_rate = 0.0
     else:
         power_anomaly = 0.94 if profile.power_failure_mode == "cyber_shutdown" else 0.0
         confidence, acceleration, syn_growth, concentration = (0.90, 0.0, 0.0, 1.0)
@@ -2762,6 +3003,17 @@ def _precursor_signals(
     )
     power_sag = 0.12 * visible_fraction if brownout else 0.0
     battery_discharge = 0.75 * visible_fraction if brownout else 0.0
+    authentication_rate = (
+        float(profile.technical.authentication_attempt_rate_per_second or 0.0)
+        * visible_fraction
+        if profile.kind == AttackKind.BRUTE_FORCE
+        else 0.0
+    )
+    authentication_failure_ratio = (
+        float(profile.technical.authentication_failure_ratio)
+        if profile.kind == AttackKind.BRUTE_FORCE
+        else 0.0
+    )
     return {
         "signal_confidence": round(confidence * (0.50 + 0.50 * ramp), 6),
         "suspicious_source_count": max(1, round(source_count * visible_fraction)),
@@ -2773,6 +3025,9 @@ def _precursor_signals(
         "ups_input_voltage_ratio": round(1.0 - power_sag, 6),
         "power_voltage_sag_ratio": round(power_sag, 6),
         "battery_discharge_rate_ratio": round(battery_discharge, 6),
+        "authentication_failure_rate_per_second": round(authentication_rate, 6),
+        "authentication_failure_ratio": round(authentication_failure_ratio, 6),
+        "account_lockout_pressure": round(min(1.0, authentication_rate), 6),
         "target_concentration_ratio": round(0.30 + (concentration - 0.30) * ramp, 6),
     }
 
@@ -2789,6 +3044,15 @@ def _precursor_summary(precursors: list[dict[str, Any]]) -> dict[str, Any]:
         "power_control_anomaly_ratio": max((float(item.get("power_control_anomaly_ratio", 0.0)) for item in signals), default=0.0),
         "power_voltage_sag_ratio": max((float(item.get("power_voltage_sag_ratio", 0.0)) for item in signals), default=0.0),
         "battery_discharge_rate_ratio": max((float(item.get("battery_discharge_rate_ratio", 0.0)) for item in signals), default=0.0),
+        "authentication_failure_rate_per_second": sum(
+            float(item.get("authentication_failure_rate_per_second", 0.0)) for item in signals
+        ),
+        "authentication_failure_ratio": max(
+            (float(item.get("authentication_failure_ratio", 0.0)) for item in signals), default=0.0
+        ),
+        "account_lockout_pressure": max(
+            (float(item.get("account_lockout_pressure", 0.0)) for item in signals), default=0.0
+        ),
         "target_concentration_ratio": max((float(item.get("target_concentration_ratio", 0.0)) for item in signals), default=0.0),
     }
 

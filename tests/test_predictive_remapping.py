@@ -5,11 +5,13 @@ import math
 
 import networkx as nx
 import numpy as np
+import pytest
 
 from src.gnet9.attacks import (
     active_attack_events,
     attack_catalog,
     observe_attack_precursors,
+    predictive_demo_minimum_steps,
     predictive_demo_weibull_schedule,
 )
 from src.gnet9.constants import SUBSCRIBER_COUNT
@@ -20,7 +22,12 @@ from src.gnet9.koopman import (
     _operator_from_covariances,
     forecast_horizon_steps_for_sample_period,
 )
-from src.gnet9.metrics import directed_hausdorff_distance, hausdorff_distance
+from src.gnet9.metrics import (
+    directed_hausdorff_distance,
+    hausdorff_distance,
+    prepare_state_hausdorff_reference,
+    state_tensor_hausdorff_view,
+)
 from src.gnet9.packet_simulator import simulate_packet_snapshot
 from src.gnet9.remapping import apply_gold_first_remap
 from src.gnet9.routing import path_uses_only_data_plane_transit
@@ -96,7 +103,8 @@ def test_predictive_catalog_is_weighted_reproducible_and_uses_l1_sources() -> No
         for item in first if item["kind"] == "power_attack"
     )
     assert {item["mitre_semantics"] for item in first} == {
-        "behavior_taxonomy_not_numeric_rate_standard"
+        "behavior_taxonomy_not_a_universal_numeric_rate_standard; "
+        "a separately-labelled procedure-example value may be used where available"
     }
     assert all(item["mitre_url"].startswith("https://attack.mitre.org/techniques/") for item in first)
     expected_mitre = {
@@ -312,6 +320,21 @@ def test_approved_external_threshold_is_explicitly_propagated_to_koopman() -> No
     assert koopman["warning_risk_threshold"] == 0.77
     assert koopman["warning_threshold_origin"] == "chronological_external_telemetry_calibration"
     assert koopman["probability_is_calibrated"] is False
+
+
+def test_predictive_simulation_rejects_a_window_shorter_than_its_precursor() -> None:
+    required = predictive_demo_minimum_steps(2)
+    with pytest.raises(ValueError, match=f"at least {required} steps"):
+        simulate_stationary_dynamics(
+            MODEL,
+            DynamicsConfig(
+                step_seconds=2,
+                step_count=required - 1,
+                snapshot_detail="summary",
+                packet_detail="summary",
+                attack_scenario="predictive-demo",
+            ),
+        )
 
 
 def test_representative_overlapping_failures_preserve_gold_and_release_overlay() -> None:
@@ -950,6 +973,51 @@ def test_hausdorff_functions_match_an_elementary_geometry() -> None:
     assert math.isinf(hausdorff_distance(left, []))
     assert directed_hausdorff_distance([], right) == 0.0
     assert math.isinf(directed_hausdorff_distance(left, []))
+
+
+def test_sparse_state_hausdorff_is_zero_at_t0_and_grows_with_drift() -> None:
+    reference = {
+        "by_level": {
+            "L1": [
+                {
+                    "scope": "node",
+                    "node_id": "M1_01",
+                    "tensor_name": "state",
+                    "level": "L1",
+                    "metrics": {"sla_margin": 0.50},
+                    "units": {"sla_margin": "ratio"},
+                }
+            ]
+        }
+    }
+    current = {
+        "by_level": {
+            "L1": [
+                {
+                    "scope": "node",
+                    "node_id": "M1_01",
+                    "tensor_name": "state",
+                    "level": "L1",
+                    "metrics": {"sla_margin": 0.20},
+                    "units": {"sla_margin": "ratio"},
+                }
+            ]
+        }
+    }
+    baseline = state_tensor_hausdorff_view(reference, reference, time_index=0)
+    drift = state_tensor_hausdorff_view(reference, current, time_index=1)
+    cached_drift = state_tensor_hausdorff_view(
+        reference,
+        current,
+        time_index=1,
+        prepared_reference=prepare_state_hausdorff_reference(reference),
+    )
+    assert baseline["distance"] == 0.0
+    assert baseline["higher_is_worse"] is True
+    assert drift["distance"] > baseline["distance"]
+    assert cached_drift == drift
+    assert drift["directed_t0_to_current"] == drift["directed_current_to_t0"]
+    assert drift["witnesses"]["t0_to_current_tensor_id"] == "node:M1_01:state"
 
 
 def test_exported_weibull_hazard_and_survival_match_declared_formulas() -> None:

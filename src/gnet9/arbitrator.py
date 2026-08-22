@@ -49,6 +49,7 @@ def build_arbitrator_view(
     tensor_state: dict[str, Any],
     *,
     observation: dict[str, Any] | None = None,
+    state_hausdorff: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return L7 analysis and a no-remap decision for the current snapshot.
 
@@ -61,11 +62,21 @@ def build_arbitrator_view(
     l7_tensor = model.graph.nodes["ARB"].get("tensor") if "ARB" in model.graph.nodes else None
     l7_metrics = tensor_metrics(l7_tensor) if isinstance(l7_tensor, StateTensor) else {}
     observation = observation or {}
+    state_hausdorff = state_hausdorff or {}
     attack_signals = _attack_signals(observation)
-    remap_pressure = remap_pressure_from_tensors(aggregates, l7_metrics, attack_pressure=attack_signals["attack_pressure"])
+    remap_pressure = remap_pressure_from_tensors(
+        aggregates,
+        l7_metrics,
+        attack_pressure=attack_signals["attack_pressure"],
+        state_hausdorff_drift=float(state_hausdorff.get("normalized_distance", 0.0)),
+    )
     lyapunov_value = lyapunov_value_from_tensors(aggregates, l7_metrics, remap_pressure)
     koopman_residual = koopman_residual_from_tensors(aggregates, l7_metrics, remap_pressure)
-    state_vector = build_state_vector(full_aggregates, observation=observation)
+    state_vector = build_state_vector(
+        full_aggregates,
+        observation=observation,
+        state_hausdorff=state_hausdorff,
+    )
     attack_active = bool(observation.get("attacks", {}).get("active", False))
 
     return {
@@ -83,6 +94,7 @@ def build_arbitrator_view(
             "koopman_residual": koopman_residual,
             "remap_pressure": remap_pressure,
             "decision_confidence": decision_confidence(remap_pressure, l7_metrics),
+            "state_hausdorff": state_hausdorff,
             **attack_signals,
         },
         "observations": observation,
@@ -130,6 +142,7 @@ def build_state_vector(
     aggregates: dict[str, dict[str, Any]],
     *,
     observation: dict[str, Any] | None = None,
+    state_hausdorff: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a compact numeric vector for Koopman/DMD and Lyapunov pipelines."""
     metric_names = [
@@ -159,6 +172,10 @@ def build_state_vector(
         "OBS.syn_backlog_growth_ratio", "OBS.power_control_anomaly_ratio",
         "OBS.power_voltage_sag_ratio", "OBS.battery_discharge_rate_ratio",
         "OBS.target_concentration_ratio",
+        "OBS.authentication_failure_rate_per_second",
+        "OBS.authentication_failure_ratio", "OBS.account_lockout_pressure",
+        "OBS.state_hausdorff_distance", "OBS.state_hausdorff_normalized",
+        "OBS.coordinate_hausdorff_distance",
         "OBS.rerouted_gold_flow_count", "OBS.rerouted_silver_flow_count",
         "OBS.rerouted_bronze_flow_count", "OBS.isolated_flow_count",
         "OBS.service_failover_count", "OBS.route_change_ratio",
@@ -185,6 +202,12 @@ def build_state_vector(
         float(attacks.get("power_voltage_sag_ratio", 0.0)),
         float(attacks.get("battery_discharge_rate_ratio", 0.0)),
         float(attacks.get("target_concentration_ratio", 0.0)),
+        float(attacks.get("authentication_failure_rate_per_second", 0.0)),
+        float(attacks.get("authentication_failure_ratio", 0.0)),
+        float(attacks.get("account_lockout_pressure", 0.0)),
+        float((state_hausdorff or {}).get("distance") or 0.0),
+        float((state_hausdorff or {}).get("normalized_distance", 0.0)),
+        float((state_hausdorff or {}).get("coordinate_hausdorff_distance") or 0.0),
         float(routing.get("by_sla", {}).get("gold", {}).get("rerouted_flow_count", 0.0)),
         float(routing.get("by_sla", {}).get("silver", {}).get("rerouted_flow_count", 0.0)),
         float(routing.get("by_sla", {}).get("bronze", {}).get("rerouted_flow_count", 0.0)),
@@ -215,12 +238,21 @@ def remap_pressure_from_tensors(
     l7_metrics: dict[str, float],
     *,
     attack_pressure: float = 0.0,
+    state_hausdorff_drift: float = 0.0,
 ) -> float:
     l1_min_sla = aggregate_metric(aggregates, "L1", "sla_margin", "min", 1.0)
     l2_max_cpu = aggregate_metric(aggregates, "L2", "cpu_load_percent", "max", 0.0)
     edge_min_stability = aggregate_metric(aggregates, "EDGE", "stability_margin", "min", 1.0)
     edge_max_loss = aggregate_metric(aggregates, "EDGE", "loss_probability", "max", 0.0)
     terrain_max_risk = aggregate_metric(aggregates, "L8", "terrain_risk", "max", 0.0)
+    # A non-zero state Hausdorff value records routine observed-versus-t0
+    # variation as well as damage. It remains visible to the analyst and the
+    # predictor, but only a material normalised divergence can independently
+    # request remapping; otherwise a healthy packet snapshot would create a
+    # false L7 pressure.
+    state_hausdorff_remap_pressure = max(
+        0.0, (state_hausdorff_drift - 0.25) / 0.75
+    )
 
     pressures = [
         (0.60 - l1_min_sla) / 0.60,
@@ -230,8 +262,13 @@ def remap_pressure_from_tensors(
         (terrain_max_risk - 0.50) / 0.50,
         l7_metrics.get("remap_pressure", 0.0),
         attack_pressure,
+        state_hausdorff_remap_pressure,
     ]
-    return round(max(0.0, min(1.0, max(pressures))), 6)
+    pressure = max(0.0, min(1.0, max(pressures)))
+    # Keep every positive mathematical component in the diagnostic value.  The
+    # remapping decision has its own 0.20 control threshold, so small values
+    # remain observable without creating a false mitigation action.
+    return round(pressure, 6)
 
 
 def _attack_signals(observation: dict[str, Any]) -> dict[str, float]:

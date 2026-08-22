@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 
+from .attacks import MITRE_T1110_001_ATTEMPTS_PER_SECOND
 from .metrics import gold_threat_proximity_view
 
 
@@ -38,6 +39,12 @@ THREAT_METRICS = {
     "OBS.power_control_anomaly_ratio",
     "OBS.power_voltage_sag_ratio",
     "OBS.battery_discharge_rate_ratio",
+    "OBS.authentication_failure_rate_per_second",
+    "OBS.authentication_failure_ratio",
+    "OBS.account_lockout_pressure",
+    "OBS.state_hausdorff_distance",
+    "OBS.state_hausdorff_normalized",
+    "OBS.coordinate_hausdorff_distance",
     "OBS.target_concentration_ratio",
     "OBS.rerouted_gold_flow_count",
     "OBS.rerouted_silver_flow_count",
@@ -623,9 +630,6 @@ class KoopmanOnlineAnalyzer:
                 else "stable"
             ),
             "threat_proximity": threat_proximity,
-            "legacy_aliases": {
-                "hausdorff": "threat_proximity",
-            },
             "route_hausdorff": route_hausdorff,
             "predicted_next_vector": {
                 "metric_names": self.metric_names,
@@ -692,13 +696,6 @@ def apply_koopman_to_arbitrator(snapshot: dict[str, Any], koopman: dict[str, Any
     analysis["gold_threat_proximity_risk"] = float(
         threat_proximity["proximity_risk"]
     )
-    legacy_aliases = analysis.setdefault("legacy_aliases", {})
-    legacy_aliases["hausdorff_distance"] = analysis[
-        "gold_threat_minimum_distance_ms"
-    ]
-    legacy_aliases["hausdorff_proximity_risk"] = analysis[
-        "gold_threat_proximity_risk"
-    ]
     analysis["route_hausdorff_distance_ms"] = float(
         koopman.get("route_hausdorff", {}).get("distance_ms", 0.0)
     )
@@ -731,7 +728,11 @@ def apply_koopman_to_arbitrator(snapshot: dict[str, Any], koopman: dict[str, Any
     predictive_pressure = float(koopman["protective_pressure"])
     stability_pressure = float(koopman.get("lyapunov_remap_pressure", 0.0))
     current_pressure = float(analysis.get("remap_pressure", 0.0))
-    new_pressure = round(max(current_pressure, predictive_pressure, stability_pressure), 6)
+    new_pressure = max(current_pressure, predictive_pressure, stability_pressure)
+    # ``remap_pressure`` is a continuous diagnostic score.  Actioning it is
+    # separately gated below at 0.20, which keeps the Lyapunov contribution
+    # visible and preserves the aggregation invariant exactly.
+    new_pressure = round(new_pressure, 6)
     analysis["remap_pressure"] = new_pressure
     remap = arbitrator.setdefault("remap", {})
     attack_active = bool(snapshot.get("attacks", {}).get("active"))
@@ -1241,6 +1242,14 @@ def _attack_score(metric_names: list[str], vector: np.ndarray) -> float:
         min(1.0, values.get("OBS.impacted_gold_flow_count", 0.0) / 80.0),
         min(1.0, max(0.0, 1.0 - values.get("OBS.gold_sla_compliance_ratio", 1.0)) * 3.0),
         min(1.0, values.get("OBS.maximum_target_utilization_percent", 0.0) / 100.0),
+        min(
+            1.0,
+            values.get("OBS.authentication_failure_rate_per_second", 0.0)
+            / MITRE_T1110_001_ATTEMPTS_PER_SECOND,
+        ),
+        min(1.0, values.get("OBS.authentication_failure_ratio", 0.0)),
+        min(1.0, values.get("OBS.account_lockout_pressure", 0.0)),
+        min(1.0, values.get("OBS.state_hausdorff_normalized", 0.0)),
         min(1.0, values.get("OBS.isolated_flow_count", 0.0) / 80.0),
         min(1.0, max(0.0, 1.0 - values.get("OBS.gold_delivery_ratio", 1.0)) * 3.0),
     )
@@ -1259,6 +1268,13 @@ def _precursor_score(metric_names: list[str], vector: np.ndarray) -> float:
         min(1.0, values.get("OBS.power_control_anomaly_ratio", 0.0) * 0.98),
         min(1.0, values.get("OBS.power_voltage_sag_ratio", 0.0) / 0.15),
         min(1.0, values.get("OBS.battery_discharge_rate_ratio", 0.0)),
+        min(
+            1.0,
+            values.get("OBS.authentication_failure_rate_per_second", 0.0)
+            / MITRE_T1110_001_ATTEMPTS_PER_SECOND,
+        ),
+        min(1.0, values.get("OBS.authentication_failure_ratio", 0.0)),
+        min(1.0, values.get("OBS.account_lockout_pressure", 0.0)),
     )
 
 
@@ -1298,6 +1314,11 @@ def _classify_precursor_signals(signals: dict[str, Any]) -> str:
     анализатор проверяет два последовательных отсчёта, поэтому одиночный
     выброс не авторизует превентивную защиту.
     """
+    if (
+        float(signals.get("authentication_failure_rate_per_second", 0.0)) >= 0.05
+        and float(signals.get("authentication_failure_ratio", 0.0)) >= 0.8
+    ):
+        return "brute_force"
     if (
         float(signals.get("power_control_anomaly_ratio", 0.0)) >= 0.18
         or float(signals.get("power_voltage_sag_ratio", 0.0)) >= 0.02
@@ -1412,6 +1433,14 @@ def _recommendation(
         )
     if "syn_flood" in predicted_attack:
         actions.extend(["enable_syn_protection", "protect_endpoint_queue"])
+    if "brute_force" in predicted_attack:
+        actions.extend(
+            [
+                "enforce_account_lockout_policy",
+                "require_multi_factor_authentication",
+                "review_failed_authentication_events",
+            ]
+        )
     entities = _forecast_entities(attack_state)
     defense_plan = None
     # В predictive-demo одно измерение ещё не исполняет сетевое действие:
@@ -1530,6 +1559,14 @@ def _defense_plan(
         mitigation_controls.extend(["syn_proxy", "syn_cookies", "connection_rate_limit"])
     if "power_attack" in kinds:
         mitigation_controls.extend(["revoke_management_session", "transfer_to_independent_power_domain"])
+    if "brute_force" in kinds:
+        mitigation_controls.extend(
+            [
+                "account_lockout_policy",
+                "multi_factor_authentication",
+                "conditional_access",
+            ]
+        )
     routing_control = {
         "valid_from_step": valid_from_step,
         "valid_until_step": max(valid_from_step, valid_until_step),
@@ -1537,7 +1574,9 @@ def _defense_plan(
         "attack_kinds": list(entities["attack_kinds"]),
         "source_ids": list(entities.get("source_ids", [])),
         "quarantine_sources": (
-            list(entities.get("source_ids", [])) if attack_confirmed else []
+            list(entities.get("source_ids", []))
+            if attack_confirmed and kinds & {"dos", "ddos", "syn_flood"}
+            else []
         ),
         "protection_stage": (
             "confirmed_active_mitigation" if attack_confirmed else "predictive_prestage"
@@ -1552,7 +1591,11 @@ def _defense_plan(
             "reroute_around_network_target",
             "failover_service_to_standby",
             "protect_endpoint_with_acl_or_syn_proxy",
-            "quarantine_observed_attack_sources",
+            *(
+                ["quarantine_observed_attack_sources"]
+                if kinds & {"dos", "ddos", "syn_flood"}
+                else []
+            ),
         ],
         "mitigation_controls": mitigation_controls,
         "ddos_routing_semantics": (
@@ -1639,6 +1682,30 @@ def _inject_precursor_forecast(
         "OBS.maximum_target_utilization_percent",
         min(100.0, precursor_score * (80.0 + 4.0 * max(0, horizon_steps - 1))),
     )
+    signals = [item.get("signals", {}) for item in precursors]
+    authentication_rate = sum(
+        float(item.get("authentication_failure_rate_per_second", 0.0))
+        for item in signals
+    )
+    authentication_failure_ratio = max(
+        (float(item.get("authentication_failure_ratio", 0.0)) for item in signals),
+        default=0.0,
+    )
+    account_lockout_pressure = max(
+        (float(item.get("account_lockout_pressure", 0.0)) for item in signals),
+        default=0.0,
+    )
+    if authentication_rate > 0.0:
+        set_at_least(
+            "OBS.authentication_failure_rate_per_second",
+            authentication_rate * activation,
+        )
+        set_at_least(
+            "OBS.authentication_failure_ratio", authentication_failure_ratio,
+        )
+        set_at_least(
+            "OBS.account_lockout_pressure", account_lockout_pressure * activation,
+        )
     return result
 
 
