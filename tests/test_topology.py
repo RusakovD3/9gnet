@@ -411,26 +411,32 @@ def test_dynamics_chart_series_exposes_sla_traffic_and_arbitrator_metrics() -> N
     assert len(series["packet_count"]) == 2
     assert min(series["packet_count"]) > 0.0
     assert min(series["traffic_rate_mbps"]) > 0.0
-    assert series["remap_pressure"] == [0.0, 0.0]
+    # Небольшой диагностический шум допустим, но здоровый шаг не должен
+    # пересекать управляющий порог планирования переназначения 0.20.
+    assert max(series["remap_pressure"]) < 0.20
+    assert series["state_hausdorff_normalized"][0] == 0.0
+    assert len(series["state_hausdorff_normalized"]) == 2
     applications = extract_application_series(dynamics)
     assert set(applications) == {"DNS", "FTP_DATA", "LIVE_HLS", "RTP_OPUS", "RTP_TELEMOST", "RTP_VLC_AV"}
     assert all(len(values["offered_rate_mbps"]) == 2 for values in applications.values())
 
 
-def test_chart_export_removes_stale_weibull_artifact_without_arrivals(
+def test_chart_export_keeps_only_the_compact_current_chart_set(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    stale = tmp_path / "attack_arrival_weibull.png"
-    stale.write_bytes(b"old predictive-demo chart")
-    for name in (
-        "_plot_health_dashboard",
-        "_plot_traffic_composition",
-        "_plot_link_capacity",
-        "_plot_arbitrator",
-        "_plot_attacks",
-        "_plot_remapping",
-    ):
+    stale_names = (
+        "dynamics_health.png",
+        "traffic_composition.png",
+        "link_capacity.png",
+        "dynamics_arbitrator.png",
+        "dynamics_attacks.png",
+        "dynamics_remapping.png",
+        "attack_arrival_weibull.png",
+    )
+    for stale_name in stale_names:
+        (tmp_path / stale_name).write_bytes(b"obsolete chart")
+    for name in ("_plot_dynamics_overview", "_plot_capacity_bottlenecks"):
         monkeypatch.setattr(dynamics_charts, name, lambda *args, **kwargs: None)
 
     paths = dynamics_charts.export_dynamics_charts(
@@ -438,5 +444,5 @@ def test_chart_export_removes_stale_weibull_artifact_without_arrivals(
         tmp_path,
     )
 
-    assert "arrival" not in paths
-    assert not stale.exists()
+    assert set(paths) == {"overview", "capacity"}
+    assert all(not (tmp_path / stale_name).exists() for stale_name in stale_names)

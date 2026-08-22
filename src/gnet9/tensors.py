@@ -60,6 +60,7 @@ STATE_TENSOR_SPECS: dict[str, StateTensorSpec] = {
             "processing_delay_ms",
             "capex_opex_cost",
             "sla_margin",
+            "authentication_failure_rate_per_second",
         ),
         {
             "request_rate_pps": "packets/s",
@@ -70,8 +71,9 @@ STATE_TENSOR_SPECS: dict[str, StateTensorSpec] = {
             "processing_delay_ms": "ms",
             "capex_opex_cost": "normalized",
             "sla_margin": "ratio",
+            "authentication_failure_rate_per_second": "attempts/s",
         },
-        "L1 subscriber request, service, processing, queue and cost state.",
+        "L1 subscriber request, service, processing, queue, authentication and cost state.",
     ),
     "L2": StateTensorSpec(
         "L2",

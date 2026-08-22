@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from main import export_l1_monitoring, export_stationary_dynamics, parse_args
+from src.gnet9.attacks import predictive_demo_minimum_steps
 from src.gnet9.constants import SUBSCRIBER_COUNT
 from src.gnet9.dynamics import DynamicsConfig
 from src.gnet9.topology_builder import GNetBaselineBuilder
@@ -79,6 +80,19 @@ def test_cli_rejects_zero_step_duration() -> None:
 def test_cli_rejects_attack_scenario_without_packet_model() -> None:
     with pytest.raises(SystemExit):
         parse_args(["--no-packet-simulation", "--attack-scenario", "predictive-demo"])
+
+
+def test_cli_rejects_predictive_window_shorter_than_its_precursor() -> None:
+    required = predictive_demo_minimum_steps(2)
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--attack-scenario",
+                "predictive-demo",
+                "--dynamics-steps",
+                str(required - 1),
+            ]
+        )
 
 
 def test_cli_rejects_simultaneous_validation_and_calibration_profile() -> None:

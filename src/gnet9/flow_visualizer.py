@@ -589,10 +589,6 @@ def ensure_interactive_backend() -> None:
         ) from exc
 
 
-# Обратная совместимость для внутренних вызовов предыдущих версий проекта.
-_ensure_interactive_backend = ensure_interactive_backend
-
-
 def _draw_topology(ax, model, pos, *, loads=None, max_bytes: int = 1) -> None:
     for source, target in model.graph.edges():
         x1, y1 = pos[source]
@@ -960,6 +956,7 @@ def _snapshot_summary(snapshot, flows, loads, paused: bool, model) -> str:
         for tier in attacks.get("sla_restoration", {}).get("tiers", [])
     }
     route_hausdorff = routing.get("gold_route_hausdorff") or koopman.get("route_hausdorff", {})
+    state_hausdorff = snapshot.get("arbitrator", {}).get("analysis", {}).get("state_hausdorff", {})
     restoration_values = [
         by_sla.get(grade, {}).get("restoration_ratio", 1.0) * 100.0
         for grade in ("gold", "silver", "bronze")
@@ -1006,6 +1003,7 @@ def _snapshot_summary(snapshot, flows, loads, paused: bool, model) -> str:
         f"Отклонено кандидатов: сеть {routing.get('network_capacity_rejected_candidate_count', 0)}, "
         f"сервер {routing.get('server_resource_rejected_candidate_count', 0)}\n"
         f"Хаусдорф маршрутов золотого класса: {route_hausdorff.get('normalized_distance', 0.0):.3f}\n"
+        f"Хаусдорф состояния относительно t0 (больше = хуже): {state_hausdorff.get('normalized_distance', 0.0):.3f}\n"
         f"Ляпунов: V={koopman.get('lyapunov_value', 0.0):.4f} · "
         f"dV/dt={koopman.get('lyapunov_derivative_per_second', 0.0):+.4f} 1/с"
         if routing.get("plan_active") or routing.get("rerouted_flow_count") or routing.get("isolated_flow_count")

@@ -18,6 +18,7 @@ from .attacks import (
     advance_power_runtime_state,
     attack_catalog,
     observe_attack_precursors,
+    predictive_demo_minimum_steps,
 )
 from .arbitrator import build_arbitrator_view, tensor_metrics
 from .constants import (
@@ -31,6 +32,11 @@ from .koopman import (
     KOOPMAN_WARNING_RISK_THRESHOLD,
     KoopmanOnlineAnalyzer,
     apply_koopman_to_arbitrator,
+)
+from .metrics import (
+    StateTensorHausdorffReference,
+    prepare_state_hausdorff_reference,
+    state_tensor_hausdorff_view,
 )
 from .models import NetworkModel, StateTensor
 from .packet_simulator import TRAFFIC_APPS, simulate_packet_snapshot
@@ -91,6 +97,26 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
         defense_plan=None,
         power_runtime_state=power_runtime_state,
     )
+    reference_tensor_state = reference_snapshot.pop("_analysis_tensor_state")
+    state_hausdorff_reference = prepare_state_hausdorff_reference(
+        reference_tensor_state
+    )
+    reference_hausdorff = state_tensor_hausdorff_view(
+        reference_tensor_state,
+        reference_tensor_state,
+        time_index=0,
+        prepared_reference=state_hausdorff_reference,
+    )
+    reference_snapshot["arbitrator"] = build_arbitrator_view(
+        model,
+        reference_tensor_state,
+        observation={
+            "traffic": reference_snapshot.get("traffic", {}).get("summary", {}),
+            "attacks": reference_snapshot.get("attacks", {}),
+        },
+        state_hausdorff=reference_hausdorff,
+    )
+    reference_snapshot["state_vector"] = reference_snapshot["arbitrator"]["state_vector"]
     koopman_analyzer = KoopmanOnlineAnalyzer.from_t0(
         model,
         reference_snapshot["state_vector"],
@@ -111,8 +137,11 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
                 step_index * config.step_seconds,
                 defense_plan=pending_defense_plan,
                 power_runtime_state=power_runtime_state,
+                reference_tensor_state=reference_tensor_state,
+                state_hausdorff_reference=state_hausdorff_reference,
             )
         )
+        snapshot.pop("_analysis_tensor_state", None)
         koopman_view = koopman_analyzer.analyze_step(
             model,
             snapshot["state_vector"],
@@ -634,6 +663,8 @@ def _snapshot(
     *,
     defense_plan: dict[str, Any] | None = None,
     power_runtime_state: dict[str, dict[str, Any]] | None = None,
+    reference_tensor_state: dict[str, Any] | None = None,
+    state_hausdorff_reference: StateTensorHausdorffReference | None = None,
 ) -> dict[str, Any]:
     scheduled_attack_events = active_attack_events(
         model,
@@ -684,7 +715,22 @@ def _snapshot(
         "traffic": traffic.get("summary", {}),
         "attacks": traffic.get("attack_state", {}),
     }
-    arbitrator = build_arbitrator_view(model, tensor_state, observation=observation)
+    state_hausdorff = (
+        state_tensor_hausdorff_view(
+            reference_tensor_state,
+            tensor_state,
+            time_index=step_index,
+            prepared_reference=state_hausdorff_reference,
+        )
+        if reference_tensor_state is not None
+        else None
+    )
+    arbitrator = build_arbitrator_view(
+        model,
+        tensor_state,
+        observation=observation,
+        state_hausdorff=state_hausdorff,
+    )
     snapshot = {
         "step_index": step_index,
         "time_seconds": time_seconds,
@@ -703,6 +749,7 @@ def _snapshot(
                 "power_runtime_state": power_runtime,
             }
         ),
+        "_analysis_tensor_state": tensor_state,
     }
 
     if config.snapshot_detail == "full":
@@ -826,7 +873,13 @@ def _apply_observed_tensor_overlay(
             1.0 if count <= 0.0
             else float(tier.get("sla_compliant_flow_count", 0.0)) / count
         )
+    target_observations = {
+        str(item.get("target_id")): item
+        for item in attacks.get("target_observations", [])
+        if item.get("target_id")
+    }
     for item in tensor_state["by_level"].get("L1", []):
+        node_id = str(item.get("node_id", ""))
         grade = str(item.get("sla_grade", ""))
         if grade in tier_ratios:
             baseline_margin = float(item["metrics"].get("sla_margin", 0.0))
@@ -836,13 +889,17 @@ def _apply_observed_tensor_overlay(
                 baseline_margin * max(0.0, min(1.0, tier_ratios[grade])),
                 "service_aware_sla_compliance_ratio_by_grade",
             )
+        authentication = target_observations.get(node_id)
+        if authentication and float(authentication.get("authentication_failure_ratio", 0.0)) > 0.0:
+            set_metric(
+                item,
+                "authentication_failure_rate_per_second",
+                float(authentication.get("authentication_attempt_rate_per_second", 0.0))
+                * float(authentication.get("authentication_failure_ratio", 0.0)),
+                "t1110_failed_authentication_telemetry",
+            )
 
     # L2: target observation меняет CPU и запас устойчивости только у цели.
-    target_observations = {
-        str(item.get("target_id")): item
-        for item in attacks.get("target_observations", [])
-        if item.get("target_id")
-    }
     for item in tensor_state["by_level"].get("L2", []):
         observation = target_observations.get(str(item.get("node_id", "")))
         if not observation:
@@ -1444,6 +1501,14 @@ def _validate_config(config: DynamicsConfig) -> None:
         raise ValueError("DynamicsConfig.packet_detail must be one of: summary, flows, sample")
     if config.attack_scenario not in {"none", "mitre-demo", "predictive-demo"}:
         raise ValueError("DynamicsConfig.attack_scenario must be one of: none, mitre-demo, predictive-demo")
+    if config.attack_scenario == "predictive-demo":
+        minimum_steps = predictive_demo_minimum_steps(config.step_seconds)
+        if config.step_count < minimum_steps:
+            raise ValueError(
+                "predictive-demo requires at least "
+                f"{minimum_steps} steps for a {config.step_seconds}-second step "
+                "so its causal precursor window and an attack fit in the run"
+            )
     if config.attack_scenario != "none" and not config.include_packet_simulation:
         raise ValueError("Сценарий атак требует включённой пакетной симуляции")
     if (
