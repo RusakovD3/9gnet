@@ -97,6 +97,7 @@ def build_arbitrator_view(
             "state_hausdorff": state_hausdorff,
             **attack_signals,
         },
+        "critical_node_hierarchy": critical_node_hierarchy(model),
         "observations": observation,
         "remap": {
             "needed": remap_pressure > 0.20,
@@ -109,6 +110,150 @@ def build_arbitrator_view(
                 "rate_limit_attack_traffic", "protect_gold_paths", "reroute_high_pressure_flows"
             ],
         },
+    }
+
+
+def critical_node_hierarchy(model: NetworkModel, *, limit: int = 12) -> list[dict[str, Any]]:
+    """Return the ranked L2 КВУ view used by the arbitrator and UI.
+
+    It intentionally reads the hierarchy prepared by ``mark_critical_nodes``
+    instead of recalculating routes in the control loop.
+    """
+    rows = []
+    for node_id, attrs in model.graph.nodes(data=True):
+        protection = attrs.get("critical_protection", {})
+        if attrs.get("level") != "L2" or protection.get("kvu_rank") is None:
+            continue
+        rows.append(
+            {
+                "node_id": node_id,
+                "role": attrs.get("role"),
+                "kvu_rank": int(protection["kvu_rank"]),
+                "kvu_tier": protection.get("kvu_tier"),
+                "is_kvu": bool(protection.get("is_kvu")),
+                "gold_subscriber_count": int(protection.get("gold_subscriber_count", 0)),
+                "direct_gold_subscriber_count": int(protection.get("direct_gold_subscriber_count", 0)),
+                "gold_transit_flow_count": int(protection.get("gold_transit_flow_count", 0)),
+            }
+        )
+    return sorted(rows, key=lambda row: (row["kvu_rank"], row["node_id"]))[:limit]
+
+
+def evaluate_defense_game(
+    model: NetworkModel,
+    *,
+    target_ids: list[str],
+    threat_pressure: float,
+    matrix_koopman_pressure: float,
+) -> dict[str, Any]:
+    """Evaluate a small defender--attacker normal-form game for L7.
+
+    The result is a transparent finite game, not a claim that an adversary
+    actually follows the model.  A pure Nash equilibrium is reported only when
+    mutual best responses exist.  Otherwise the output names its conservative
+    maximin fallback rather than mislabelling it as Nash equilibrium.
+    """
+    hierarchy = critical_node_hierarchy(model, limit=100)
+    max_gold = max((row["gold_subscriber_count"] for row in hierarchy), default=0)
+    target_rows = []
+    for target_id in target_ids:
+        attrs = model.graph.nodes[target_id] if target_id in model.graph else {}
+        protection = attrs.get("critical_protection", {})
+        target_rows.append(
+            {
+                "target_id": target_id,
+                "gold_subscriber_count": int(protection.get("gold_subscriber_count", 0)),
+                "gold_transit_flow_count": int(protection.get("gold_transit_flow_count", 0)),
+                "critical_involvement_coefficient": float(
+                    protection.get("critical_involvement_coefficient", 0.0)
+                ),
+                "kvu_rank": protection.get("kvu_rank"),
+            }
+        )
+    target_criticality = max(
+        (
+            max(
+                row["gold_subscriber_count"] / max(max_gold, 1),
+                row["critical_involvement_coefficient"],
+            )
+            for row in target_rows
+        ),
+        default=(0.25 if hierarchy else 0.0),
+    )
+    target_criticality = min(1.0, max(0.0, target_criticality))
+    effective_threat = min(
+        1.0,
+        max(float(threat_pressure), 0.35 * float(matrix_koopman_pressure)),
+    )
+    defender_actions = (
+        ("NO_REMAP", 0.00, 0.00),
+        ("OBSERVE_PRECURSOR", 0.12, 0.025),
+        ("PLAN_REMAP", 0.58, 0.12),
+        ("ISOLATE_CONFIRMED_SOURCES_AND_REMAP", 0.76, 0.23),
+    )
+    attacker_actions = (("MAINTAIN", 0.72), ("ESCALATE", 1.00), ("DISTRIBUTE", 0.88))
+    matrix: list[dict[str, Any]] = []
+    for defense_name, effectiveness, action_cost in defender_actions:
+        for attack_name, attack_multiplier in attacker_actions:
+            damage = min(
+                1.0,
+                effective_threat * attack_multiplier * (0.25 + 0.75 * target_criticality) * (1.0 - effectiveness),
+            )
+            matrix.append(
+                {
+                    "defender_action": defense_name,
+                    "attacker_action": attack_name,
+                    "defender_payoff": round(1.0 - damage - action_cost, 6),
+                    "attacker_payoff": round(damage, 6),
+                }
+            )
+
+    pure_equilibria: list[dict[str, Any]] = []
+    for cell in matrix:
+        defender_best = max(
+            item["defender_payoff"]
+            for item in matrix
+            if item["attacker_action"] == cell["attacker_action"]
+        )
+        attacker_best = max(
+            item["attacker_payoff"]
+            for item in matrix
+            if item["defender_action"] == cell["defender_action"]
+        )
+        if cell["defender_payoff"] >= defender_best - 1e-12 and cell["attacker_payoff"] >= attacker_best - 1e-12:
+            pure_equilibria.append(cell)
+    if pure_equilibria:
+        selected = max(pure_equilibria, key=lambda cell: cell["defender_payoff"])
+        selection_mode = "pure_strategy_nash_equilibrium"
+    else:
+        worst_case = {
+            action: min(
+                item["defender_payoff"] for item in matrix if item["defender_action"] == action
+            )
+            for action, _, _ in defender_actions
+        }
+        selected_action = max(worst_case, key=worst_case.get)
+        selected = max(
+            (item for item in matrix if item["defender_action"] == selected_action),
+            key=lambda item: item["attacker_payoff"],
+        )
+        selection_mode = "maximin_fallback_no_pure_nash_equilibrium"
+    return {
+        "model": "finite_defender_attacker_normal_form_game",
+        "semantics_ru": (
+            "Игровая оценка помогает арбитру сравнить цену защиты и ожидаемый ущерб; "
+            "она не моделирует волю реального нарушителя и не заменяет подтверждение телеметрией."
+        ),
+        "target_rows": target_rows,
+        "target_criticality": round(target_criticality, 6),
+        "threat_pressure": round(effective_threat, 6),
+        "matrix_koopman_pressure": round(float(matrix_koopman_pressure), 6),
+        "payoff_matrix": matrix,
+        "pure_nash_equilibria": pure_equilibria,
+        "equilibrium_found": bool(pure_equilibria),
+        "selection_mode": selection_mode,
+        "selected": selected,
+        "recommended_action": selected["defender_action"],
     }
 
 

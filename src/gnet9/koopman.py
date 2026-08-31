@@ -17,7 +17,10 @@ from typing import Any
 import numpy as np
 
 from .attacks import MITRE_T1110_001_ATTEMPTS_PER_SECOND
+from .arbitrator import evaluate_defense_game
 from .metrics import gold_threat_proximity_view
+from .sdn_controller import compile_sdn_intent
+from .tensor_matrix import TensorKroneckerKoopman, TensorMatrixView
 
 
 THREAT_METRICS = {
@@ -121,6 +124,7 @@ class KoopmanOnlineAnalyzer:
     operator_revision: int = 0
     nominal_observation_count: int = 0
     last_observed_threat_step: int | None = None
+    tensor_koopman: TensorKroneckerKoopman | None = None
 
     @classmethod
     def from_t0(
@@ -128,6 +132,7 @@ class KoopmanOnlineAnalyzer:
         model,
         state_vector: dict[str, Any],
         *,
+        tensor_matrices: TensorMatrixView | None = None,
         step_seconds: int,
         required_prediction_lead_seconds: int = 10,
         warning_risk_threshold: float | None = None,
@@ -186,6 +191,11 @@ class KoopmanOnlineAnalyzer:
                 else min(1.0, max(0.0, float(warning_risk_threshold)))
             ),
             warning_threshold_origin=warning_threshold_origin,
+            tensor_koopman=(
+                TensorKroneckerKoopman.from_reference(tensor_matrices)
+                if tensor_matrices is not None
+                else None
+            ),
         )
 
     def analyze_step(
@@ -193,6 +203,7 @@ class KoopmanOnlineAnalyzer:
         model,
         state_vector: dict[str, Any],
         *,
+        tensor_matrices: TensorMatrixView | None = None,
         attack_state: dict[str, Any],
         step_index: int,
         time_seconds: int,
@@ -210,6 +221,15 @@ class KoopmanOnlineAnalyzer:
         operator_fingerprint_used = _matrix_fingerprint(operator_used)
         lyapunov_fingerprint_used = _matrix_fingerprint(lyapunov_matrix_used)
         current = np.asarray(state_vector["vector"], dtype=float)
+        tensor_matrix_koopman = (
+            self.tensor_koopman.analyze(tensor_matrices)
+            if self.tensor_koopman is not None and tensor_matrices is not None
+            else {
+                "model": "factorised_kronecker_tensor_koopman",
+                "available": False,
+                "semantics_ru": "Матрицы тензоров не переданы в этот вызов анализатора.",
+            }
+        )
         z_current = self._normalize(current)
         residual = 0.0
         transition_residual_vector = np.zeros_like(z_current)
@@ -509,6 +529,7 @@ class KoopmanOnlineAnalyzer:
             "future_schedule_used_by_predictor": False,
             "horizon_forecasts": horizon_forecasts,
             "forecast_component_ablation": component_ablation,
+            "tensor_matrix_koopman": tensor_matrix_koopman,
             # Одношаговые поля сохранены как совместимый с прежним JSON интерфейс.
             "forecast_horizon_seconds": self.step_seconds,
             "forecast_horizon_steps": 1,
@@ -665,7 +686,12 @@ class KoopmanOnlineAnalyzer:
         return True
 
 
-def apply_koopman_to_arbitrator(snapshot: dict[str, Any], koopman: dict[str, Any]) -> dict[str, Any] | None:
+def apply_koopman_to_arbitrator(
+    snapshot: dict[str, Any],
+    koopman: dict[str, Any],
+    *,
+    model=None,
+) -> dict[str, Any] | None:
     """Передать прогноз в L7 и вернуть защитный план для следующего шага."""
     snapshot["koopman"] = koopman
     arbitrator = snapshot.get("arbitrator", {})
@@ -724,6 +750,12 @@ def apply_koopman_to_arbitrator(snapshot: dict[str, Any], koopman: dict[str, Any
     ]
     analysis["koopman_early_warning"] = bool(koopman["forecast_is_early_warning"])
     analysis["koopman_precursor_score"] = float(koopman["precursor_score"])
+    tensor_matrix_koopman = koopman.get("tensor_matrix_koopman", {})
+    matrix_residual = float(tensor_matrix_koopman.get("one_step_residual", 0.0))
+    matrix_maximum_residual = float(tensor_matrix_koopman.get("maximum_residual", 0.0))
+    matrix_pressure = min(1.0, max(matrix_residual, matrix_maximum_residual * 0.25))
+    analysis["kronecker_tensor_koopman_residual"] = matrix_residual
+    analysis["kronecker_tensor_koopman_pressure"] = round(matrix_pressure, 6)
 
     predictive_pressure = float(koopman["protective_pressure"])
     stability_pressure = float(koopman.get("lyapunov_remap_pressure", 0.0))
@@ -764,6 +796,32 @@ def apply_koopman_to_arbitrator(snapshot: dict[str, Any], koopman: dict[str, Any
         remap["action"] = "NO_REMAP"
         remap["reason"] = "healthy_stationary_baseline"
         remap["candidate_actions"] = []
+    if model is not None:
+        target_ids = list(koopman.get("forecast_target_ids", [])) or list(
+            koopman.get("current_attack_target_ids", [])
+        )
+        game = evaluate_defense_game(
+            model,
+            target_ids=target_ids,
+            threat_pressure=max(
+                float(koopman.get("forecast_risk_score", 0.0)),
+                new_pressure,
+            ),
+            matrix_koopman_pressure=matrix_pressure,
+        )
+        arbitrator["game_theory"] = game
+        remap["game_recommended_action"] = game["recommended_action"]
+        remap["game_selection_mode"] = game["selection_mode"]
+        if remap.get("needed") and game["recommended_action"] == "ISOLATE_CONFIRMED_SOURCES_AND_REMAP":
+            remap["candidate_actions"] = sorted(
+                set(remap.get("candidate_actions", [])) | {"isolate_confirmed_attack_sources"}
+            )
+    else:
+        game = {
+            "model": "finite_defender_attacker_normal_form_game",
+            "available": False,
+            "semantics_ru": "Для игровой оценки нужен граф модели.",
+        }
     remap["koopman_forecast"] = {
         "alert_level": koopman["alert_level"],
         "risk_score_next_step": koopman.get("horizon_forecasts", [{}])[0].get(
@@ -799,6 +857,15 @@ def apply_koopman_to_arbitrator(snapshot: dict[str, Any], koopman: dict[str, Any
     }
     recommendation = koopman.get("arbitrator_recommendation", {})
     defense_plan = recommendation.get("defense_plan")
+    sdn_intent = compile_sdn_intent(
+        step_index=int(snapshot.get("step_index", 0)),
+        remap=remap,
+        defense_plan=defense_plan,
+        game=game,
+    )
+    remap["sdn_intent"] = sdn_intent
+    if defense_plan is not None:
+        defense_plan["sdn_intent"] = sdn_intent
     attacks = snapshot.get("attacks", {})
     armed_status = (
         "ARMED_FOR_NEXT_STEP"

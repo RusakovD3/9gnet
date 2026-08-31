@@ -1343,7 +1343,14 @@ def _protection_hover(attrs: dict[str, Any]) -> str:
         f"\nПотоков золотого класса через узел: {protection.get('gold_transit_flow_count', 0)}"
         f" · резервных: {protection.get('gold_recovery_reserve_flow_count', 0)}"
         f" · КВУ: {protection.get('critical_involvement_coefficient', 0.0):.3f}"
-        f"\nПредел загрузки при переназначении: {protection.get('maximum_safe_utilization_percent', 80.0):.0f}%"
+        + (
+            f"\nИерархия КВУ: {protection.get('kvu_tier')} · место {protection.get('kvu_rank')}"
+            f" · Gold-абонентов в пути: {protection.get('gold_subscriber_count', 0)}"
+            f" (на доступе: {protection.get('direct_gold_subscriber_count', 0)})"
+            if protection.get("kvu_rank") is not None
+            else ""
+        )
+        + f"\nПредел загрузки при переназначении: {protection.get('maximum_safe_utilization_percent', 80.0):.0f}%"
     )
 
 

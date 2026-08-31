@@ -18,6 +18,7 @@ from src.gnet9.attacks import (
     predictive_demo_minimum_steps,
 )
 from src.gnet9.debug_visualizer import DebugFlowWindow, RuntimeCallTracer, export_debug_artifacts
+from src.gnet9.decision_dialogue import export_algorithm_dialogue
 from src.gnet9.dynamics import DynamicsConfig, simulate_stationary_dynamics
 from src.gnet9.dynamics_charts import export_dynamics_charts
 from src.gnet9.flow_visualizer import (
@@ -27,6 +28,7 @@ from src.gnet9.flow_visualizer import (
     show_visualization_windows,
 )
 from src.gnet9.service_catalog import CODEC_CATALOG
+from src.gnet9.standards_audit import build_standards_and_equipment_audit
 from src.gnet9.telemetry_validation import (
     TelemetryValidationConfig,
     TelemetryValidationError,
@@ -603,6 +605,9 @@ def main() -> None:
         "d0sl_parsed": output_dir / "l1_d0sl_parsed.json",
         "d0sl_source": output_dir / "l1_policies.d0sl",
         "dynamics": output_dir / "network_dynamics.json",
+        "algorithm_dialogue_json": output_dir / "algorithm_dialogue.json",
+        "algorithm_dialogue_md": output_dir / "algorithm_dialogue.md",
+        "standards_audit": output_dir / "standards_and_equipment_audit.json",
         "charts_dir": output_dir / "charts",
         "network_png": output_dir / "network_logic.png",
         "layers_png": output_dir / "layer_scheme.png",
@@ -624,6 +629,10 @@ def main() -> None:
     export_l1_monitoring(model, artifacts["l1_monitoring"])
     export_l2_equipment_profiles(model, artifacts["l2_profiles"])
     export_l0_server_service_catalog(model, artifacts["l0_servers"])
+    artifacts["standards_audit"].write_text(
+        json.dumps(build_standards_and_equipment_audit(model), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     export_ip_address_plan(model, artifacts["ip_plan"])
     export_attack_catalog(
         model,
@@ -636,6 +645,11 @@ def main() -> None:
         artifacts["dynamics"],
         dynamics_config,
         packet_detail=export_packet_detail,
+    )
+    export_algorithm_dialogue(
+        dynamics,
+        artifacts["algorithm_dialogue_json"],
+        artifacts["algorithm_dialogue_md"],
     )
     flow_snapshots = dynamics["snapshots"] if dynamics_config.include_packet_simulation else []
     if flow_snapshots:
@@ -723,6 +737,8 @@ def main() -> None:
     if artifacts["remapped_flows_png"].exists():
         print(f"Карта наиболее активного переназначения: {artifacts['remapped_flows_png']}")
     print(f"Карта IP-адресации: {artifacts['ip_map_png']}")
+    print(f"Диалог алгоритмов: {artifacts['algorithm_dialogue_md']}")
+    print(f"Аудит RFC и характеристик: {artifacts['standards_audit']}")
     if debug_paths:
         print("Графическая диагностика:")
         for path in debug_paths.values():

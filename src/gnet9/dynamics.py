@@ -40,6 +40,10 @@ from .metrics import (
 )
 from .models import NetworkModel, StateTensor
 from .packet_simulator import TRAFFIC_APPS, simulate_packet_snapshot
+from .tensor_matrix import (
+    build_tensor_matrix_view,
+    tensor_matrix_export,
+)
 
 
 TENSOR_LEVELS = ("L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8", "EDGE")
@@ -98,6 +102,11 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
         power_runtime_state=power_runtime_state,
     )
     reference_tensor_state = reference_snapshot.pop("_analysis_tensor_state")
+    reference_tensor_matrices = build_tensor_matrix_view(reference_tensor_state)
+    reference_snapshot["tensor_matrices"] = tensor_matrix_export(
+        reference_tensor_matrices,
+        include_values=config.snapshot_detail in {"full", "tensor"},
+    )
     state_hausdorff_reference = prepare_state_hausdorff_reference(
         reference_tensor_state
     )
@@ -120,6 +129,7 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
     koopman_analyzer = KoopmanOnlineAnalyzer.from_t0(
         model,
         reference_snapshot["state_vector"],
+        tensor_matrices=reference_tensor_matrices,
         step_seconds=config.step_seconds,
         required_prediction_lead_seconds=_resolved_prediction_slo_seconds(config),
         warning_risk_threshold=_resolved_warning_risk_threshold(config),
@@ -141,15 +151,29 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
                 state_hausdorff_reference=state_hausdorff_reference,
             )
         )
-        snapshot.pop("_analysis_tensor_state", None)
+        if step_index == 0:
+            analysis_tensor_state = reference_tensor_state
+            tensor_matrices = reference_tensor_matrices
+        else:
+            analysis_tensor_state = snapshot.pop("_analysis_tensor_state")
+            tensor_matrices = build_tensor_matrix_view(analysis_tensor_state)
+            snapshot["tensor_matrices"] = tensor_matrix_export(
+                tensor_matrices,
+                include_values=config.snapshot_detail in {"full", "tensor"},
+            )
         koopman_view = koopman_analyzer.analyze_step(
             model,
             snapshot["state_vector"],
+            tensor_matrices=tensor_matrices,
             attack_state=snapshot.get("attacks", {}),
             step_index=step_index,
             time_seconds=step_index * config.step_seconds,
         )
-        proposed_plan = apply_koopman_to_arbitrator(snapshot, koopman_view)
+        proposed_plan = apply_koopman_to_arbitrator(
+            snapshot,
+            koopman_view,
+            model=model,
+        )
         pending_defense_plan = _plan_for_next_step(
             current_plan=pending_defense_plan,
             proposed_plan=proposed_plan,
@@ -190,6 +214,14 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
             snapshots,
             step_seconds=config.step_seconds,
         ),
+        "tensor_matrix_contract": {
+            "representation": "one_dense_entity_by_named_metric_matrix_per_level",
+            "levels": list(TENSOR_LEVELS),
+            "koopman_input": "factorised_kronecker_observables_derived_from_complete_matrices",
+            "summary_export_semantics": (
+                "summary stores matrix axes, hashes and norms; full and tensor store every value"
+            ),
+        },
         "snapshots": snapshots,
     }
 
