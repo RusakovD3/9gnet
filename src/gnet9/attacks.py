@@ -515,6 +515,12 @@ def attack_catalog(
         step_count=resolved_step_count,
     )
     catalog = [profile.to_dict() for profile in profiles]
+    if model is not None:
+        for item in catalog:
+            item["target_device_context"] = target_device_context(
+                model,
+                str(item.get("target_id", "")),
+            )
     if scenario == "predictive-demo":
         arrival_schedule = predictive_demo_weibull_schedule(
             seed=resolved_seed,
@@ -540,6 +546,48 @@ def attack_catalog(
                 arrival_schedule.raw_interarrival_seconds[realization_index]
             )
     return catalog
+
+
+def target_device_context(model: NetworkModel, target_id: str) -> dict[str, Any]:
+    """Bind an attack target's ВВХ/ТТХ interpretation to its model profile.
+
+    A subscriber target inherits its explicit RAN/OLT access profile.  This
+    makes the numerical scenario traceable to a concrete model envelope while
+    preserving the distinction between vendor-published fields and assumptions.
+    """
+    if target_id not in model.graph:
+        return {"status": "target_not_present_in_model"}
+    attrs = model.graph.nodes[target_id]
+    device_id = target_id
+    device_attrs = attrs
+    binding = "direct_target_profile"
+    if attrs.get("level") == "L1":
+        candidate = str(attrs.get("home_access", ""))
+        if candidate in model.graph:
+            device_id = candidate
+            device_attrs = model.graph.nodes[candidate]
+            binding = "subscriber_target_inherits_home_access_profile"
+    l2_profile = device_attrs.get("l2_profile", {})
+    server_profile = device_attrs.get("server_profile", {})
+    profile = l2_profile if isinstance(l2_profile, Mapping) and l2_profile else server_profile
+    profile = profile if isinstance(profile, Mapping) else {}
+    vendor = str(profile.get("vendor", "Dell" if device_attrs.get("role") == "service-server" else ""))
+    return {
+        "binding": binding,
+        "target_node_id": target_id,
+        "capacity_device_id": device_id,
+        "capacity_device_role": device_attrs.get("role"),
+        "profile_name": profile.get("name", profile.get("model", device_attrs.get("platform_profile"))),
+        "vendor": vendor or "GNet9 scenario",
+        "source_url": profile.get("source_url", profile.get("source_url")),
+        "verified_fields": list(profile.get("verified_fields", [])),
+        "assumed_fields": list(profile.get("assumed_fields", [])),
+        "power_semantics": device_attrs.get("power_architecture", {}).get("value_origin"),
+        "semantics_ru": (
+            "Параметры ВВХ/ТТХ атаки сопоставлены с профилем целевой ёмкости; "
+            "сценарные поля не выдаются за паспортные характеристики."
+        ),
+    }
 
 
 @lru_cache(maxsize=128)
@@ -1139,22 +1187,31 @@ def _predictive_attack_text(
 
 
 def mark_critical_nodes(model: NetworkModel) -> dict[str, Any]:
-    """Пометить узлы, которые обслуживают хотя бы один Gold-поток.
+    """Построить иерархию КВУ по фактически обслуживаемым Gold-абонентам.
 
-    КВУ здесь — коэффициент критической вовлечённости: доля Gold-маршрутов,
-    проходящих через узел, с дополнительным весом для сервиса и его сервера.
-    Это подготовительный приоритет защиты, а не решение о переназначении.
+    Для каждого Gold-абонента берётся его безопасный путь данных до сервиса.
+    L2-узел получает один счётчик за абонента, если обслуживает его как точка
+    доступа или находится на его маршруте.  Поэтому ``gold_subscriber_count``
+    означает не общую степень графа, а число Gold-подписок, для которых этот
+    маршрутизатор/коммутатор находится в рабочем пути.  Максимальный счётчик
+    образует КВУ первого ранга; остальные ранги делают приоритет прозрачным.
+    Это приоритет защиты для арбитра, а не самостоятельная команда ремаппинга.
     """
     gold_subscribers = [
         node for node, attrs in model.graph.nodes(data=True)
         if attrs.get("level") == "L1" and attrs.get("sla_grade") == "gold"
     ]
     transit_counts = {node: 0 for node in model.graph.nodes}
+    gold_subscriber_counts = {node: 0 for node in model.graph.nodes}
+    direct_gold_subscriber_counts = {node: 0 for node in model.graph.nodes}
     service_counts = {node: 0 for node in model.graph.nodes}
     recovery_reserve_counts = {node: 0 for node in model.graph.nodes}
     routes: list[list[str]] = []
     for subscriber in gold_subscribers:
         attrs = model.graph.nodes[subscriber]
+        home_access = str(attrs.get("home_access", ""))
+        if home_access in direct_gold_subscriber_counts:
+            direct_gold_subscriber_counts[home_access] += 1
         service = TRAFFIC_SERVICE_NODES.get(attrs.get("traffic_kind"))
         if service not in model.graph:
             continue
@@ -1163,6 +1220,8 @@ def mark_critical_nodes(model: NetworkModel) -> dict[str, Any]:
         routes.append(route)
         for node in route:
             transit_counts[node] += 1
+            if model.graph.nodes[node].get("level") == "L2":
+                gold_subscriber_counts[node] += 1
         service_counts[service] += 1
         service_counts[server] += 1
         for standby in model.graph.nodes[service].get("standby_hosts", []):
@@ -1170,6 +1229,31 @@ def mark_critical_nodes(model: NetworkModel) -> dict[str, Any]:
                 recovery_reserve_counts[standby] += 1
 
     denominator = max(len(routes), 1)
+    l2_ranked = sorted(
+        (
+            node
+            for node, attrs in model.graph.nodes(data=True)
+            if attrs.get("level") == "L2" and gold_subscriber_counts[node] > 0
+        ),
+        key=lambda node: (-gold_subscriber_counts[node], -transit_counts[node], str(node)),
+    )
+    rank_by_node = {node: index + 1 for index, node in enumerate(l2_ranked)}
+    highest_gold_subscriber_count = max(
+        (gold_subscriber_counts[node] for node in l2_ranked), default=0
+    )
+
+    def kvu_tier(node: str) -> str | None:
+        rank = rank_by_node.get(node)
+        if rank is None:
+            return None
+        if gold_subscriber_counts[node] == highest_gold_subscriber_count:
+            return "K1"
+        if rank <= max(2, math.ceil(len(l2_ranked) * 0.20)):
+            return "K2"
+        if rank <= max(4, math.ceil(len(l2_ranked) * 0.50)):
+            return "K3"
+        return "K4"
+
     critical_nodes: list[str] = []
     for node, attrs in model.graph.nodes(data=True):
         transit = transit_counts[node]
@@ -1183,10 +1267,24 @@ def mark_critical_nodes(model: NetworkModel) -> dict[str, Any]:
             + (0.20 if hosted else 0.0)
             + 0.15 * reserve / denominator,
         )
+        network_gold_count = gold_subscriber_counts[node]
+        rank = rank_by_node.get(node)
         attrs["critical_protection"] = {
             "is_critical": is_critical,
             "protection_priority": 1 if is_critical else 3,
             "gold_transit_flow_count": transit,
+            "gold_subscriber_count": network_gold_count,
+            "direct_gold_subscriber_count": direct_gold_subscriber_counts[node],
+            "kvu_rank": rank,
+            "kvu_tier": kvu_tier(node),
+            "is_kvu": bool(
+                attrs.get("level") == "L2"
+                and network_gold_count == highest_gold_subscriber_count
+                and network_gold_count > 0
+            ),
+            "kvu_definition": (
+                "L2 node ranked by number of Gold subscribers whose access or data path it serves"
+            ),
             "gold_service_flow_count": hosted,
             "gold_recovery_reserve_flow_count": reserve,
             "critical_involvement_coefficient": round(involvement, 6),
@@ -1198,6 +1296,24 @@ def mark_critical_nodes(model: NetworkModel) -> dict[str, Any]:
     return {
         "gold_subscriber_count": len(gold_subscribers),
         "gold_route_count": len(routes),
+        "kvu_count": sum(
+            1
+            for node in l2_ranked
+            if gold_subscriber_counts[node] == highest_gold_subscriber_count
+        ),
+        "kvu_hierarchy": [
+            {
+                "node_id": node,
+                "role": model.graph.nodes[node].get("role"),
+                "gold_subscriber_count": gold_subscriber_counts[node],
+                "direct_gold_subscriber_count": direct_gold_subscriber_counts[node],
+                "gold_transit_flow_count": transit_counts[node],
+                "kvu_rank": rank_by_node[node],
+                "kvu_tier": kvu_tier(node),
+                "is_kvu": gold_subscriber_counts[node] == highest_gold_subscriber_count,
+            }
+            for node in l2_ranked
+        ],
         "critical_node_count": len(critical_nodes),
         "critical_nodes": sorted(critical_nodes),
     }
@@ -1418,6 +1534,7 @@ def active_attack_events(
             "intensity_ratio": intensity,
             **route_context,
             "target_criticality": target_criticality,
+            "target_device_context": target_device_context(model, profile.target_id),
             "scenario_peak_pressure_prior": profile.target_resource_pressure,
             **capacity_context,
             "effective_offered_rate_mbps": round(profile.technical.offered_rate_mbps * intensity, 4),

@@ -465,6 +465,7 @@ def _control_context(
         ),
         "target_kinds": target_kinds,
         "attack_kinds": plan_kinds,
+        "sdn_intent": dict(defense_plan.get("sdn_intent", {})),
     }
 
 
@@ -1200,6 +1201,7 @@ def _build_summary(
         "valid_from_step": valid_from,
         "valid_until_step": valid_until,
         "policy": "gold_then_silver_then_bronze",
+        "sdn_control": context.get("sdn_intent", {}),
         "protection_stage": str(context.get("protection_stage", "inactive")),
         "source_quarantine_policy": str(
             context.get("source_quarantine_policy", "explicit_plan_only")
