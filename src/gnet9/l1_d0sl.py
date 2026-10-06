@@ -8,6 +8,8 @@ that text into typed Python objects used by the topology builder.
 from __future__ import annotations
 
 import re
+import math
+import math
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
@@ -464,26 +466,29 @@ def _mm1k_stationary_metrics(
     capacity: int,
 ) -> tuple[float, float, float, float, float]:
     """Return ``p_K, λ_eff, L, Lq, W_ms`` for a stationary M/M/1/K queue."""
-    if arrival_rate < 0.0 or service_rate <= 0.0 or capacity < 1:
+    if not math.isfinite(arrival_rate) or not math.isfinite(service_rate) or arrival_rate < 0.0 or service_rate <= 0.0 or capacity < 1:
         raise ValueError("Некорректные параметры очереди M/M/1/K")
     rho = arrival_rate / service_rate
-    if abs(rho - 1.0) <= 1e-12:
+    if arrival_rate == 0.0:
+        return (0.0, 0.0, 0.0, 0.0, 0.0)
+    if abs(rho - 1.0) <= 1e-8:
         p0 = 1.0 / (capacity + 1.0)
         blocking = p0
         mean_system = capacity / 2.0
     else:
-        rho_k = rho**capacity
-        rho_k1 = rho_k * rho
-        denominator = 1.0 - rho_k1
-        p0 = (1.0 - rho) / denominator
-        blocking = p0 * rho_k
-        mean_system = (
-            rho
-            * (1.0 - (capacity + 1.0) * rho_k + capacity * rho_k1)
-            / ((1.0 - rho) * denominator)
-        )
-    effective_arrival = arrival_rate * (1.0 - blocking)
+        # Считаем распределение с конца при перегрузке: rho**K может
+        # переполнить число даже у очереди на 128 пакетов.
+        indices = np.arange(capacity + 1, dtype=float)
+        powers = indices if rho < 1.0 else indices - capacity
+        log_rho = math.log(arrival_rate) - math.log(service_rate)
+        weights = np.exp(powers * log_rho)
+        probabilities = weights / weights.sum()
+        p0, blocking = float(probabilities[0]), float(probabilities[-1])
+        mean_system = float(probabilities @ indices)
     busy_probability = 1.0 - p0
+    # При сильной перегрузке p_K округляется до 1. Считаем обслуженный
+    # поток через занятость канала, иначе вычитание даёт ложный ноль.
+    effective_arrival = service_rate * busy_probability if rho >= 1.0 else arrival_rate * (1.0 - blocking)
     mean_queue = max(0.0, mean_system - busy_probability)
     mean_system_time_ms = (
         0.0

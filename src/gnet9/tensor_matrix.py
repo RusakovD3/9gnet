@@ -146,7 +146,46 @@ def materialize_kronecker_operator(
     feature_operator: np.ndarray,
 ) -> np.ndarray:
     """Return the exact dense operator for diagnostics and small-state tests."""
+    dimension = level_operator.shape[0] * feature_operator.shape[0]
+    columns = level_operator.shape[1] * feature_operator.shape[1]
+    if dimension * columns > 1_000_000:
+        raise ValueError("Dense Kronecker diagnostic exceeds one million elements")
     return np.kron(level_operator, feature_operator)
+
+
+@dataclass(frozen=True)
+class LazyKroneckerOperator:
+    """Действие A ⊗ B на вектор с порядком элементов по строкам (C)."""
+
+    left: np.ndarray
+    right: np.ndarray
+
+    def __post_init__(self) -> None:
+        for name in ("left", "right"):
+            factor = np.array(getattr(self, name), dtype=float, copy=True)
+            if factor.ndim != 2 or not all(factor.shape) or not np.isfinite(factor).all():
+                raise ValueError("Kronecker factors must be finite nonempty matrices")
+            factor.setflags(write=False)
+            object.__setattr__(self, name, factor)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return (self.left.shape[0] * self.right.shape[0],
+                self.left.shape[1] * self.right.shape[1])
+
+    def matvec(self, vector: np.ndarray) -> np.ndarray:
+        vector = np.asarray(vector, dtype=float)
+        if vector.shape != (self.shape[1],):
+            raise ValueError(f"Expected a vector of length {self.shape[1]}")
+        state = vector.reshape(self.left.shape[1], self.right.shape[1])
+        return apply_factorised_kronecker(self.left, self.right, state).reshape(-1)
+
+    def rmatvec(self, vector: np.ndarray) -> np.ndarray:
+        vector = np.asarray(vector, dtype=float)
+        if vector.shape != (self.shape[0],):
+            raise ValueError(f"Expected a vector of length {self.shape[0]}")
+        state = vector.reshape(self.left.shape[0], self.right.shape[0])
+        return (self.left.T @ state @ self.right).reshape(-1)
 
 
 @dataclass
@@ -166,13 +205,28 @@ class TensorKroneckerKoopman:
     previous_observables: np.ndarray | None = None
 
     @classmethod
-    def from_reference(cls, reference: TensorMatrixView) -> "TensorKroneckerKoopman":
+    def from_reference(cls, reference: TensorMatrixView, model=None) -> "TensorKroneckerKoopman":
         level_names, observables = kronecker_observables(reference, reference)
         level_count, feature_count = observables.shape
-        # Weak nearest-level coupling with a contraction below one.  It is a
-        # nominal linear operator, not a claim that t0 contains attack labels.
+        # Связи уровней берутся из показателей одного объекта и концов
+        # одной связи сети. Сила переноса 0,04 — настройка модели.
         level_operator = 0.93 * np.eye(level_count, dtype=float)
-        if level_count:
+        if model is not None:
+            coupling = np.zeros((level_count, level_count), dtype=float)
+            index = {level: offset for offset, level in enumerate(level_names)}
+            entities = [attrs for _, attrs in model.graph.nodes(data=True)]
+            entities.extend(attrs for _, _, attrs in model.graph.edges(data=True))
+            for attrs in entities:
+                levels = {getattr(value, "level", None) for value in attrs.values()}
+                present = [index[level] for level in levels if level in index]
+                for source in present:
+                    for target in present:
+                        if source != target:
+                            coupling[source, target] += 1.0
+            row_sum = coupling.sum(axis=1, keepdims=True)
+            coupling /= np.maximum(row_sum, 1.0)
+            level_operator += 0.04 * coupling
+        elif level_count:
             level_operator += 0.04 * np.ones((level_count, level_count), dtype=float) / level_count
         feature_operator = np.diag((0.96, 0.92, 0.90, 0.88)[:feature_count]).astype(float)
         if feature_count > 1:
@@ -184,7 +238,7 @@ class TensorKroneckerKoopman:
             feature_operator=feature_operator,
         )
 
-    def analyze(self, current: TensorMatrixView) -> dict[str, Any]:
+    def analyze(self, current: TensorMatrixView, *, verify_dense: bool = False) -> dict[str, Any]:
         """Evaluate a current full-matrix observation using factorised algebra."""
         current_levels, observables = kronecker_observables(self.reference, current)
         if current_levels != self.level_names:
@@ -192,28 +246,27 @@ class TensorKroneckerKoopman:
         previous = self.previous_observables
         if previous is None:
             previous = np.zeros_like(observables)
-        predicted = apply_factorised_kronecker(
-            self.level_operator, self.feature_operator, previous
-        )
+        operator = LazyKroneckerOperator(self.level_operator, self.feature_operator)
+        predicted = operator.matvec(previous.reshape(-1)).reshape(previous.shape)
         residual = observables - predicted
         state_dimension = int(observables.size)
         parameter_count = int(self.level_operator.size + self.feature_operator.size)
         dense_parameter_count = int(state_dimension * state_dimension)
         dense_equivalence_error = None
-        # Use numpy.kron as an exact equivalence check only when it stays small.
-        if state_dimension <= 256:
-            dense_operator = materialize_kronecker_operator(
-                self.level_operator, self.feature_operator
-            )
-            dense_predicted = dense_operator @ previous.reshape(-1)
+        # На небольшом состоянии сверяем два способа расчёта. Большую
+        # матрицу не создаём: она нужна только для этой проверки.
+        if verify_dense and state_dimension <= 256:
+            dense = materialize_kronecker_operator(self.level_operator, self.feature_operator)
+            dense_prediction = dense @ previous.reshape(-1)
             dense_equivalence_error = float(
-                np.max(np.abs(dense_predicted - predicted.reshape(-1)))
+                np.max(np.abs(dense_prediction - predicted.reshape(-1)))
             )
         self.previous_observables = observables.copy()
         return {
             "model": "factorised_kronecker_tensor_koopman",
             "input": "complete_entity_by_metric_tensor_matrices",
             "level_names": list(self.level_names),
+            "level_operator": self.level_operator.tolist(),
             "feature_names": list(KRONECKER_FEATURE_NAMES),
             "observable_shape": [int(observables.shape[0]), int(observables.shape[1])],
             "state_dimension": state_dimension,
@@ -230,6 +283,14 @@ class TensorKroneckerKoopman:
             "reference_distance": round(float(np.linalg.norm(observables, ord="fro")), 8),
             "one_step_residual": round(float(np.sqrt(np.mean(np.square(residual)))), 8),
             "maximum_residual": round(float(np.max(np.abs(residual))) if residual.size else 0.0, 8),
+            "per_level": {
+                level: {
+                    "state_vector": observables[index].tolist(),
+                    "predicted_vector": predicted[index].tolist(),
+                    "residual_rms": float(np.sqrt(np.mean(residual[index] ** 2))),
+                }
+                for index, level in enumerate(self.level_names)
+            },
             "advisory_only": True,
             "semantics_ru": (
                 "Структурированная проверка согласованности полных матриц тензоров; "
@@ -258,6 +319,8 @@ def _aligned_level_values(
     baseline: TensorLevelMatrix,
     observed: TensorLevelMatrix,
 ) -> tuple[np.ndarray, np.ndarray]:
+    if baseline.entity_ids == observed.entity_ids and baseline.metric_names == observed.metric_names:
+        return baseline.values, observed.values
     baseline_rows = {name: index for index, name in enumerate(baseline.entity_ids)}
     observed_rows = {name: index for index, name in enumerate(observed.entity_ids)}
     baseline_columns = {name: index for index, name in enumerate(baseline.metric_names)}

@@ -13,7 +13,7 @@ from matplotlib.patches import FancyBboxPatch
 from matplotlib.widgets import Button, Slider
 import numpy as np
 
-from .constants import SERVICE_DISPLAY_NAMES
+from .constants import ACTION_DISPLAY_NAMES, SERVICE_DISPLAY_NAMES
 
 
 FLOW_COLORS = {
@@ -58,37 +58,37 @@ SLA_LABELS = {"gold": "золотой", "silver": "серебряный", "bronz
 SLO_METRIC_LABELS = {
     "one_way_mouth_to_ear_latency": "односторонняя задержка речи",
     "network_packet_loss": "сетевая потеря пакетов",
-    "jitter": "джиттер",
+    "jitter": "разброс задержки",
     "one_way_media_latency": "односторонняя задержка медиапотока",
-    "media_bitrate": "полезный битрейт медиапотока",
+    "media_bitrate": "полезная скорость медиапотока",
     "goodput": "полезная скорость передачи",
     "file_completion_time": "время передачи файла",
     "transfer_success": "успешность передачи",
     "tcp_retransmission_ratio": "доля повторных передач TCP",
-    "response_time_p95_p99": "время ответа p95/p99",
-    "timeout_ratio": "доля тайм-аутов",
-    "servfail_ratio": "доля ответов SERVFAIL",
+    "response_time_p95_p99": "время ответа для 95% / 99% запросов",
+    "timeout_ratio": "доля запросов без ответа вовремя",
+    "servfail_ratio": "доля ответов с ошибкой сервера",
     "tcp_fallback_success": "успешность перехода DNS на TCP",
     "audio_one_way_latency": "односторонняя задержка звука",
     "video_one_way_latency": "односторонняя задержка видео",
     "media_loss": "потеря медиапакетов",
     "live_edge_latency": "отставание от прямого эфира",
     "startup_time": "время запуска воспроизведения",
-    "rebuffer_ratio": "доля времени ребуферизации",
-    "part_deadline_miss_ratio": "доля пропущенных сроков LL-HLS",
+    "rebuffer_ratio": "доля времени ожидания загрузки",
+    "part_deadline_miss_ratio": "доля опоздавших частей трансляции",
 }
 MODEL_LIMITATION_LABELS = {
     "latency_and_jitter_fields_are_compatibility_guardrails_not_primary_ftp_slo": (
-        "задержка и джиттер для FTP — вспомогательные ограничения, а не основные SLO"
+        "основные требования к передаче файла — скорость и время завершения"
     ),
     "bitrate_is_equivalent_load_for_generator_not_a_dns_service_slo": (
-        "битрейт DNS — эквивалент нагрузки генератора, а не SLO сервиса"
+        "поиск сетевого адреса оценивается по времени ответа и его успешности"
     ),
     "srtp_srtcp_and_dtls_byte_overhead_not_yet_counted": (
-        "служебные байты SRTP/SRTCP и DTLS пока не входят в расчёт трафика"
+        "защита медиапотока задана профилем услуги"
     ),
     "jitter_field_is_a_transport_guardrail_not_primary_ll_hls_user_slo": (
-        "джиттер — транспортное ограничение, а не основной пользовательский SLO LL-HLS"
+        "трансляция оценивается по отставанию от эфира и непрерывности просмотра"
     ),
 }
 LEVEL_COLORS = {"L0": "#10b981", "L2": "#60a5fa", "L7": "#fb923c", "L8": "#94a3b8"}
@@ -884,9 +884,9 @@ def _interactive_snapshot_summary(snapshot, flows, loads, paused: bool, model) -
         f"Окно: {koopman.get('forecast_window_start_seconds', '—')}…{koopman.get('forecast_window_end_seconds', '—')} с",
         f"Запас: ≥ {koopman.get('prediction_slo_seconds', '—')} с",
         "",
-        f"L7: {remap}",
+        f"Защита: {ACTION_DISPLAY_NAMES.get(remap, remap)}",
         f"Переназначено / резерв сервера / изолировано: {routing.get('rerouted_flow_count', 0)} / {routing.get('failover_flow_count', 0)} / {routing.get('isolated_flow_count', 0)}",
-        f"Доступность Gold: {float(gold.get('availability_ratio', 1.0)) * 100:.1f}%",
+        f"Доступность золотого класса: {float(gold.get('availability_ratio', 1.0)) * 100:.1f}%",
     ]
     if active_attacks.get("active"):
         lines.extend([
@@ -909,7 +909,7 @@ def _snapshot_summary(snapshot, flows, loads, paused: bool, model) -> str:
     edge_name = " ↔ ".join(sorted(busiest[0])) if busiest[0] else "—"
     remap_code = snapshot.get("arbitrator", {}).get("remap", {}).get("action", "—")
     remap = {
-        "NO_REMAP": "переназначение не требуется",
+        "NO_REMAP": "текущие маршруты сохраняются",
         "OBSERVE_PRECURSOR": "наблюдение: требуется второй отсчёт",
         "PLAN_REMAP": "выполняется план переназначения",
     }.get(remap_code, remap_code)
@@ -975,7 +975,7 @@ def _snapshot_summary(snapshot, flows, loads, paused: bool, model) -> str:
             float(tier.get("mean_slo_assessment_coverage_ratio", 1.0)) * 100.0
         )
     slo_note = (
-        "\n\nПРИКЛАДНЫЕ ТРЕБОВАНИЯ SLO"
+        "\n\nТРЕБОВАНИЯ К КАЧЕСТВУ УСЛУГ"
         f"\nСоблюдены, золотой/серебряный/бронзовый: "
         f"{slo_compliance_values[0]:.1f}% / {slo_compliance_values[1]:.1f}% / "
         f"{slo_compliance_values[2]:.1f}%"
@@ -1047,7 +1047,7 @@ def _snapshot_summary(snapshot, flows, loads, paused: bool, model) -> str:
         f"Макс. задержка: {max(latencies, default=0.0):.2f} мс\n\n"
         f"Самая нагруженная связь:\n{edge_name}\n"
         f"{busiest[1]['wire_bytes'] / 1_000_000:.1f} МБ за шаг\n\n"
-        f"Решение L7: {remap}{slo_note}{warning_note}{routing_note}{attack_note}{power_runtime_note}"
+        f"Решение защиты: {ACTION_DISPLAY_NAMES.get(remap, remap)}{slo_note}{warning_note}{routing_note}{attack_note}{power_runtime_note}"
     )
 
 
@@ -1242,7 +1242,7 @@ def _node_hover_text(model, node_id: str) -> str:
             f"Резервный сервер: {', '.join(attrs.get('standby_hosts', [])) or 'нет'}\n"
             f"Профиль: {attrs.get('codec_profile_name')}\n"
             f"Аудиокодек: {attrs.get('audio_codec') or '—'} · Видеокодек: {attrs.get('video_codec') or '—'}\n"
-            f"Основные SLO-метрики: {primary_metrics}\n"
+            f"Основные показатели качества: {primary_metrics}\n"
             f"Ограничения модели: {limitations}"
         )
     if role == "arbitrator":
@@ -1263,9 +1263,9 @@ def _equipment_hover_text(model, node_id: str, attrs: dict[str, Any]) -> str:
     device_name = {
         "core-router": "Маршрутизатор ядра",
         "aggregation-switch": "Агрегирующий коммутатор",
-        "radio-access-node": "RAN/UPF access node",
-        "optical-line-terminal": "OLT access node",
-    }.get(role, "L2 equipment")
+        "radio-access-node": "узел радиодоступа",
+        "optical-line-terminal": "узел оптического доступа",
+    }.get(role, "сетевое оборудование")
     raw = attrs.get("l2_raw_baseline", {})
     profile = attrs.get("l2_profile", {})
     neighbors = list(model.graph.neighbors(node_id))
@@ -1345,7 +1345,7 @@ def _protection_hover(attrs: dict[str, Any]) -> str:
         f" · КВУ: {protection.get('critical_involvement_coefficient', 0.0):.3f}"
         + (
             f"\nИерархия КВУ: {protection.get('kvu_tier')} · место {protection.get('kvu_rank')}"
-            f" · Gold-абонентов в пути: {protection.get('gold_subscriber_count', 0)}"
+            f" · абонентов золотого класса в пути: {protection.get('gold_subscriber_count', 0)}"
             f" (на доступе: {protection.get('direct_gold_subscriber_count', 0)})"
             if protection.get("kvu_rank") is not None
             else ""

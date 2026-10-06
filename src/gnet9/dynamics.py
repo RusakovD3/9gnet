@@ -70,6 +70,8 @@ class DynamicsConfig:
     packet_sample_limit: int = 48
     attack_scenario: AttackScenario = "none"
     attack_seed: int = 42
+    attack_start_step: int | None = None
+    attack_interval_steps: int | None = None
     prediction_slo_seconds: int | None = None
     warning_risk_threshold: float | None = None
     warning_threshold_origin: str = "model_default_not_externally_validated"
@@ -93,6 +95,11 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
     start_step = 0 if config.include_t0 else 1
     snapshots: list[dict[str, Any]] = []
     power_runtime_state: dict[str, dict[str, Any]] = {}
+    catalog = attack_catalog(model, config.attack_scenario, config=config)
+    first_precursor_step = min(
+        (item["temporal"]["start_step"] - item["temporal"]["precursor_steps"] for item in catalog),
+        default=config.step_count + 1,
+    )
     reference_snapshot = _snapshot(
         model,
         config,
@@ -174,6 +181,18 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
             koopman_view,
             model=model,
         )
+        if step_index == 0:
+            phase = "reference"
+        elif step_index < first_precursor_step:
+            phase = "nominal_training"
+        else:
+            phase = "observation_and_protection"
+        snapshot["training"] = {
+            "phase": phase,
+            "clean_training_steps": min(config.step_count, max(0, first_precursor_step - 1)),
+            "nominal_transitions": koopman_view["observed_nominal_transition_count_after_update"],
+            "operator_updated": koopman_view["update_applied_for_next_step"],
+        }
         pending_defense_plan = _plan_for_next_step(
             current_plan=pending_defense_plan,
             proposed_plan=proposed_plan,
@@ -198,10 +217,13 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
             else "stationary_healthy_baseline"
         ),
         "config": config.to_dict(),
-        "attack_catalog": (
-            attack_catalog(model, config.attack_scenario, config=config)
-            if config.attack_scenario != "none" else []
-        ),
+        "attack_catalog": catalog,
+        "training_summary": {
+            "clean_training_steps": min(config.step_count, max(0, first_precursor_step - 1)),
+            "first_precursor_step": first_precursor_step if catalog else None,
+            "first_attack_step": min((item["temporal"]["start_step"] for item in catalog), default=None),
+            "nominal_transitions": koopman_analyzer.nominal_observation_count,
+        },
         "health": health,
         "ideal_t0": ideal_t0,
         "snapshot_count": len(snapshots),
@@ -214,6 +236,7 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
             snapshots,
             step_seconds=config.step_seconds,
         ),
+        "attack_response_evaluation": _attack_response_evaluation(snapshots),
         "tensor_matrix_contract": {
             "representation": "one_dense_entity_by_named_metric_matrix_per_level",
             "levels": list(TENSOR_LEVELS),
@@ -224,6 +247,33 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
         },
         "snapshots": snapshots,
     }
+
+
+def _attack_response_evaluation(snapshots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Свести наблюдения каждого события после расчёта, сохранив его тип."""
+    records: dict[str, dict[str, Any]] = {}
+    for snapshot in snapshots:
+        analysis = snapshot["arbitrator"]["analysis"]
+        remap = snapshot["arbitrator"]["remap"]
+        routing = snapshot.get("attacks", {}).get("routing", {})
+        for event in snapshot.get("attacks", {}).get("events", []):
+            record = records.setdefault(event["attack_id"], {
+                "attack_id": event["attack_id"], "kind": event["kind"], "target_id": event["target_id"],
+                "first_step": snapshot["step_index"], "last_step": snapshot["step_index"],
+                "maximum_hausdorff": 0.0, "maximum_koopman_risk": 0.0,
+                "maximum_lyapunov_pressure": 0.0, "maximum_rerouted_flows": 0,
+                "response_stages": [], "actions": [],
+                "scope": "whole_network_snapshots_during_event_not_isolated_causal_effect",
+            })
+            record["last_step"] = snapshot["step_index"]
+            record["maximum_hausdorff"] = max(record["maximum_hausdorff"], float(analysis["state_hausdorff"].get("normalized_distance", 0.0)))
+            record["maximum_koopman_risk"] = max(record["maximum_koopman_risk"], float(snapshot["koopman"]["forecast_risk_score"]))
+            record["maximum_lyapunov_pressure"] = max(record["maximum_lyapunov_pressure"], float(snapshot["koopman"]["lyapunov_remap_pressure"]))
+            record["maximum_rerouted_flows"] = max(record["maximum_rerouted_flows"], int(routing.get("rerouted_flow_count", 0)))
+            for key, value in (("actions", remap["action"]), ("response_stages", remap["response_stage"])):
+                if value not in record[key]:
+                    record[key].append(value)
+    return list(records.values())
 
 
 def validate_ideal_t0(model: NetworkModel, snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -706,6 +756,7 @@ def _snapshot(
         step_seconds=config.step_seconds,
         step_count=config.step_count,
         seed=config.attack_seed,
+        config=config,
     )
     attack_events, power_runtime = advance_power_runtime_state(
         model,
@@ -723,6 +774,7 @@ def _snapshot(
         step_seconds=config.step_seconds,
         step_count=config.step_count,
         seed=config.attack_seed,
+        config=config,
     )
     traffic = None
     if config.include_packet_simulation:
@@ -1521,6 +1573,16 @@ def _plan_for_next_step(
 
 
 def _validate_config(config: DynamicsConfig) -> None:
+    if config.attack_interval_steps is not None and config.attack_interval_steps <= 0:
+        raise ValueError("Интервал атак должен быть положительным")
+    if config.attack_start_step is not None:
+        if not 1 <= config.attack_start_step <= config.step_count:
+            raise ValueError("Первый шаг атаки должен попадать в интервал моделирования")
+        precursor_steps = predictive_demo_minimum_steps(config.step_seconds) - 5 if config.attack_scenario == "predictive-demo" else 1
+        if config.attack_start_step <= precursor_steps:
+            raise ValueError("До первой атаки нужно оставить место для наблюдения предвестников после t0")
+    if config.attack_scenario == "none" and (config.attack_start_step is not None or config.attack_interval_steps is not None):
+        raise ValueError("Для расписания атак выберите сценарий атак")
     if config.step_seconds <= 0:
         raise ValueError("DynamicsConfig.step_seconds must be positive")
     if config.step_count < 0:

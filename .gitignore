@@ -221,10 +221,4 @@ output/
 # В каталоге doc лежат и пользовательские исходники большого объёма, и
 # поставляемая документация GNet9. Отслеживаем только актуальные файлы проекта.
 doc/*
-!doc/project_state_ru.md
 !doc/full_project_explanation_ru.md
-!doc/guide_ru.md
-!doc/external_telemetry_validation_ru.md
-!doc/math_and_attacks_ru.md
-!doc/GNet9_актуальная_техническая_документация.docx
-AGENTS.md

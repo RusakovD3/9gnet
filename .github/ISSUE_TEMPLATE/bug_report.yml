@@ -1,0 +1,22 @@
+name: Ошибка модели или инструмента
+description: Воспроизводимый дефект GNet9
+body:
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Ожидаемый и фактический результат
+      description: Какое поведение нарушено и на что оно влияет?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Воспроизведение
+      description: Команда или тест, сценарий, начальное число генератора, шаг и число шагов.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Окружение и доказательства
+      description: Версия проекта, локальные правки, система, версия Python, отчёт проверки библиотек и текст ошибки.

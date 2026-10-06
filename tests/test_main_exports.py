@@ -48,6 +48,11 @@ def test_compact_dynamics_export_keeps_runtime_flows_without_serializing_them(
         ),
         packet_detail="summary",
     )
+    with (tmp_path / "step_log.csv").open(encoding="utf-8-sig", newline="") as stream:
+        journal = list(csv.DictReader(stream))
+    assert [row["шаг"] for row in journal] == ["0", "1"]
+    assert journal[1]["фаза"] == "обучение на исправной сети"
+    assert journal[1]["решение"] == "наблюдать"
     exported = json.loads(destination.read_text(encoding="utf-8"))
 
     assert runtime["snapshots"][0]["traffic"]["flows"]

@@ -14,8 +14,8 @@ LEVEL_NAMES = {
     "L4": "Линейная инфраструктура",
     "L5": "Ядро и срезы",
     "L6": "Инфраструктура и питание",
-    "L7": "Арбитратор",
-    "L8": "Топооснова",
+    "L7": "Принятие решений",
+    "L8": "Размещение объектов",
 }
 
 # Colors are used only by the visualizer. They do not affect calculations.
@@ -46,6 +46,25 @@ SERVICE_DISPLAY_NAMES = {
     "DNS": "DNS",
     "Telemost": "Видеоконференция «Телемост»",
     "Live Streaming": "Прямая трансляция",
+}
+
+ACTION_DISPLAY_NAMES = {
+    "NO_REMAP": "сохранить текущие маршруты",
+    "OBSERVE_PRECURSOR": "продолжить наблюдение за признаками угрозы",
+    "PLAN_REMAP": "подготовить смену маршрутов",
+    "ISOLATE_CONFIRMED_SOURCES_AND_REMAP": "изолировать подтверждённые источники и сменить маршруты",
+}
+
+RESPONSE_STAGE_DISPLAY_NAMES = {
+    "observe": "наблюдать", "confirm_observation": "подтвердить наблюдение",
+    "prepare": "подготовить защиту", "protect": "применить защиту", "emergency": "срочная защита",
+}
+ATTACK_KIND_DISPLAY_NAMES = {
+    "none": "нет угрозы", "dos": "перегрузка одним источником",
+    "ddos": "перегрузка несколькими источниками", "syn_flood": "перегрузка незавершёнными соединениями",
+    "brute_force": "неудачные попытки входа", "power_attack": "нарушение питания",
+    "watch": "наблюдение", "post_incident_residual": "восстановление после события",
+    "unknown_degradation_or_attack": "неопределённое ухудшение",
 }
 
 # L1 subscriber generation settings.

@@ -24,7 +24,7 @@ def test_every_tensor_is_preserved_in_named_level_matrix() -> None:
 def test_factorised_kronecker_channel_matches_dense_numpy_kron_for_t0() -> None:
     matrices = build_tensor_matrix_view(_tensor_state_snapshot(MODEL))
     channel = TensorKroneckerKoopman.from_reference(matrices)
-    report = channel.analyze(matrices)
+    report = channel.analyze(matrices, verify_dense=True)
     dense = materialize_kronecker_operator(
         channel.level_operator,
         channel.feature_operator,

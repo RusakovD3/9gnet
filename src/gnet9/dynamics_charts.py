@@ -14,6 +14,7 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
+from .arbitrator import TRIGGER_BANDS
 
 
 AggregateSeriesSpec = tuple[str, str, str, str, float]
@@ -170,14 +171,15 @@ def _plot_dynamics_overview(
     )
 
     ax = axes[0, 1]
-    _plot_line(ax, time, series["state_hausdorff_normalized"], "Хаусдорф состояния", "#f97316")
+    _plot_line(ax, time, series["state_hausdorff_normalized"], "отличие от эталона", "#f97316")
     _plot_line(ax, time, series["koopman_forecast_risk"], "риск Купмана", "#fbbf24")
     _plot_line(ax, time, series["lyapunov_remap_pressure"], "вклад Ляпунова", "#a78bfa")
-    _plot_line(ax, time, series["remap_pressure"], "давление решения L7", "#f87171")
-    ax.axhline(0.20, color="#cbd5e1", linewidth=1.0, linestyle="--", label="порог плана 0,20")
+    _plot_line(ax, time, series["remap_pressure"], "необходимость защиты", "#f87171")
+    for bound in TRIGGER_BANDS["decision"]:
+        ax.axhline(bound, color="#cbd5e1", linewidth=0.7, linestyle="--", alpha=0.45)
     _style_axes(
         ax,
-        "2. Почему L7 подготовил защиту",
+        "2. Основания для защиты",
         "нормированная оценка 0…1",
         (0, 1.02),
         legend_columns=2,
@@ -194,13 +196,13 @@ def _plot_dynamics_overview(
     _style_axes(ax, "3. Какие меры защита реально применила", "число потоков", (0, upper), legend_columns=1)
 
     ax = axes[1, 1]
-    _plot_line(ax, time, series["gold_availability_percent"], "доступность Gold", "#fbbf24")
-    _plot_line(ax, time, series["legitimate_delivery_percent"], "доставка легитимного трафика", "#34d399")
+    _plot_line(ax, time, series["gold_availability_percent"], "доступность золотого класса", "#fbbf24")
+    _plot_line(ax, time, series["legitimate_delivery_percent"], "доставка полезных данных", "#34d399")
     _plot_line(ax, time, series["post_remap_utilization_percent"], "максимальная загрузка после защиты", "#38bdf8")
     ax.axhline(80.0, color="#f87171", linewidth=1.0, linestyle="--", label="предел ресурса 80 %")
     _style_axes(
         ax,
-        "4. Результат: сервис сохранён, ресурс не переполнен",
+        "4. Качество обслуживания после защиты",
         "%",
         (0, 105),
         legend_columns=1,
@@ -209,6 +211,12 @@ def _plot_dynamics_overview(
     for axis in axes.ravel():
         axis.set_xlabel("время от t0, с", color="#cbd5e1")
     _shade_attack_windows(axes, dynamics)
+    clean_steps = dynamics.get("training_summary", {}).get("clean_training_steps", 0)
+    training_end = clean_steps * dynamics.get("config", {}).get("step_seconds", 1)
+    if training_end > 0:
+        for axis in axes.ravel():
+            axis.axvspan(0, training_end, color="#22c55e", alpha=0.055, zorder=0)
+        axes[0, 0].text(0.02, 0.95, f"Исправная сеть: {clean_steps} шагов обучения", transform=axes[0, 0].transAxes, color="#86efac", fontsize=8, va="top")
     fig.text(
         0.5,
         0.925,
