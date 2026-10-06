@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 
 from .attacks import MITRE_T1110_001_ATTEMPTS_PER_SECOND
-from .arbitrator import evaluate_defense_game
+from .arbitrator import build_trigger_card, evaluate_defense_game
 from .metrics import gold_threat_proximity_view
 from .sdn_controller import compile_sdn_intent
 from .tensor_matrix import TensorKroneckerKoopman, TensorMatrixView
@@ -124,6 +124,7 @@ class KoopmanOnlineAnalyzer:
     operator_revision: int = 0
     nominal_observation_count: int = 0
     last_observed_threat_step: int | None = None
+    previous_transition_was_nominal: bool = True
     tensor_koopman: TensorKroneckerKoopman | None = None
 
     @classmethod
@@ -192,7 +193,7 @@ class KoopmanOnlineAnalyzer:
             ),
             warning_threshold_origin=warning_threshold_origin,
             tensor_koopman=(
-                TensorKroneckerKoopman.from_reference(tensor_matrices)
+                TensorKroneckerKoopman.from_reference(tensor_matrices, model=model)
                 if tensor_matrices is not None
                 else None
             ),
@@ -446,7 +447,8 @@ class KoopmanOnlineAnalyzer:
         # Обучение номинальной динамике коммитится после завершения всех
         # вычислений снимка. Новые K/P не меняют ни одно значение текущего шага.
         update_applied_for_next_step = False
-        if self.previous_vector is not None and threat_score < 0.10 and forecast_risk < 0.25:
+        nominal_now = not observable_attack_now and not observable_precursor_now and threat_score < 0.10 and forecast_risk < 0.25
+        if self.previous_vector is not None and self.previous_transition_was_nominal and nominal_now:
             z_previous_for_update = self._normalize(self.previous_vector)
             self.nominal_observation_count += 1
             update_applied_for_next_step = self._update_observed_operator(
@@ -465,6 +467,7 @@ class KoopmanOnlineAnalyzer:
         # Состояние становится предыдущим только после завершения анализа и
         # потенциального коммита модели для следующего шага.
         self.previous_vector = current.copy()
+        self.previous_transition_was_nominal = nominal_now
         self.previous_analysis_operator_revision = operator_revision_used
         self.state_history.append(z_current.copy())
         history_limit = max(
@@ -565,7 +568,7 @@ class KoopmanOnlineAnalyzer:
             "observed_nominal_transition_count_after_update": self.nominal_observation_count,
             "online_operator_update_count": operator_revision_used,
             "online_operator_update_count_after_update": operator_revision_after_update,
-            "baseline_frozen_due_to_threat": bool(threat_score >= 0.10 or forecast_risk >= 0.25),
+            "baseline_frozen_due_to_threat": not nominal_now,
             "active_attack_score": round(active_attack_score, 6),
             "precursor_score": round(precursor_score, 6),
             "predicted_attack_score": round(predicted_attack_score, 6),
@@ -667,10 +670,8 @@ class KoopmanOnlineAnalyzer:
         return self.reference_vector + normalized * self.scale_vector
 
     def _update_observed_operator(self, previous: np.ndarray, current: np.ndarray) -> bool:
-        # Детерминированная микровариация здоровой очереди не является новой
-        # динамикой и не должна постепенно сдвигать эталонный оператор t0.
-        if _rms(previous) < 0.005 and _rms(current) < 0.005:
-            return False
+        # Рабочий оператор учится и на небольших изменениях исправного трафика.
+        # reference_vector и ideal_operator остаются неизменным эталоном t0.
         forgetting_factor = 0.985
         self.online_gram = forgetting_factor * self.online_gram + np.outer(previous, previous)
         self.online_cross = forgetting_factor * self.online_cross + np.outer(current, previous)
@@ -770,9 +771,19 @@ def apply_koopman_to_arbitrator(
     attack_active = bool(snapshot.get("attacks", {}).get("active"))
     early_warning = bool(koopman.get("forecast_is_early_warning"))
     control_triggered = attack_active or early_warning
-    if new_pressure > 0.20 and control_triggered:
-        remap["needed"] = True
-        remap["action"] = "PLAN_REMAP"
+    attack_kind = str(koopman.get("forecast_attack_kind", "none"))
+    source_confirmed = any(event.get("ingress_nodes") for event in snapshot.get("attacks", {}).get("events", []))
+    trigger_card = build_trigger_card(
+        hausdorff=float(analysis.get("state_hausdorff", {}).get("normalized_distance", 0.0)),
+        risk=float(koopman["forecast_risk_score"]), lyapunov_pressure=stability_pressure,
+        decision_pressure=new_pressure, confirmed=control_triggered,
+        attack_kind=attack_kind, source_confirmed=source_confirmed,
+    )
+    arbitrator["trigger_card"] = trigger_card
+    remap["needed"] = trigger_card["action"] == "PLAN_REMAP"
+    remap["action"] = trigger_card["action"]
+    remap["response_stage"] = trigger_card["response_stage"]
+    if remap["needed"]:
         if early_warning and attack_active:
             remap["reason"] = "active_attack_and_koopman_next_attack_warning"
         elif early_warning:
@@ -784,18 +795,15 @@ def apply_koopman_to_arbitrator(
         candidates = set(remap.get("candidate_actions", []))
         candidates.update(koopman["arbitrator_recommendation"]["candidate_actions"])
         remap["candidate_actions"] = sorted(candidates)
-    elif new_pressure > 0.20:
+    elif trigger_card["action"] == "OBSERVE_PRECURSOR":
         # Первый отсчёт predictive-demo остаётся режимом наблюдения. Это
         # защищает маршрутизацию от реакции на единичный сенсорный выброс.
-        remap["needed"] = False
-        remap["action"] = "OBSERVE_PRECURSOR"
         remap["reason"] = "unconfirmed_precursor_requires_second_sample"
         remap["candidate_actions"] = []
     else:
-        remap["needed"] = False
-        remap["action"] = "NO_REMAP"
         remap["reason"] = "healthy_stationary_baseline"
         remap["candidate_actions"] = []
+    remap["candidate_actions"] = sorted(set(remap["candidate_actions"]) | set(trigger_card["controls"]))
     if model is not None:
         target_ids = list(koopman.get("forecast_target_ids", [])) or list(
             koopman.get("current_attack_target_ids", [])
@@ -812,7 +820,7 @@ def apply_koopman_to_arbitrator(
         arbitrator["game_theory"] = game
         remap["game_recommended_action"] = game["recommended_action"]
         remap["game_selection_mode"] = game["selection_mode"]
-        if remap.get("needed") and game["recommended_action"] == "ISOLATE_CONFIRMED_SOURCES_AND_REMAP":
+        if remap.get("needed") and source_confirmed and game["recommended_action"] == "ISOLATE_CONFIRMED_SOURCES_AND_REMAP":
             remap["candidate_actions"] = sorted(
                 set(remap.get("candidate_actions", [])) | {"isolate_confirmed_attack_sources"}
             )
@@ -857,6 +865,11 @@ def apply_koopman_to_arbitrator(
     }
     recommendation = koopman.get("arbitrator_recommendation", {})
     defense_plan = recommendation.get("defense_plan")
+    if not remap["needed"]:
+        defense_plan = None
+    if defense_plan is not None:
+        defense_plan["trigger_card"] = trigger_card
+        defense_plan["mitigation_strength"] = {"prepare": 0.90, "protect": 0.95, "emergency": 1.0}[trigger_card["response_stage"]]
     sdn_intent = compile_sdn_intent(
         step_index=int(snapshot.get("step_index", 0)),
         remap=remap,
@@ -1356,7 +1369,9 @@ def _forecast_risk(
 ) -> float:
     active_deviation = deviation > 0.03 or attack_score > 0.0
     residual_signal = min(1.0, residual / 0.18) if active_deviation else min(0.20, residual / 0.18)
-    drift_signal = min(1.0, operator_drift / 0.08) if active_deviation else 0.0
+    # Изменение обученного оператора само по себе не является угрозой.
+    # Его вклад уменьшается вместе с отклонением наблюдаемого состояния.
+    drift_signal = min(1.0, operator_drift * deviation / 0.25) if active_deviation else 0.0
     model_signal = max(
         min(1.0, deviation / 0.25),
         residual_signal,

@@ -236,7 +236,9 @@ def test_healthy_run_has_no_false_positive_and_keeps_t0_operator() -> None:
         assert koopman["forecast_attack_probability"] < 0.25
         assert koopman["forecast_attack_kind"] == "none"
         assert koopman["alert_level"] == "NORMAL"
-        assert koopman["online_baseline_update_applied"] is False
+        # Эталон t0 неизменен, рабочее правило учится на исправном трафике.
+        assert koopman["online_baseline_update_applied"] is (snapshot["step_index"] > 0)
+        assert koopman["operator_revision_after_update"] == snapshot["step_index"]
         assert snapshot["arbitrator"]["remap"]["action"] == "NO_REMAP"
         assert snapshot["arbitrator"]["prevention"]["status"] == "STANDBY"
     assert len(fingerprints) == 1

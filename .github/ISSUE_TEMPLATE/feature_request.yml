@@ -1,0 +1,22 @@
+name: Доработка GNet9
+description: Новая возможность с проверяемым результатом
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Задача пользователя
+      description: Кто и для чего будет использовать результат?
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Критерии приёмки
+      description: Наблюдаемое поведение, примеры входов/выходов и границы задачи.
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Ограничения и совместимость
+      description: Форматы, параметры запуска, скорость расчёта, источники данных и правила модели, которые нужно сохранить.

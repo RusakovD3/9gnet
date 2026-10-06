@@ -10,7 +10,7 @@ MITRE ATT&CK задаёт таксономию и поведение атак, �
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from functools import lru_cache
 import math
@@ -19,6 +19,7 @@ from typing import Any
 
 from .models import NetworkModel
 from .routing import has_data_path, shortest_data_path
+from .transport_queue import apply_transport_queues
 
 
 MITRE_ATTACK_SOURCE = "https://attack.mitre.org/techniques/"
@@ -357,7 +358,7 @@ MITRE_DEMO_ATTACKS = (
 # задают состав полной демонстрационной серии и вероятностные веса типов.
 PREDICTIVE_DEMO_DEFAULT_SEED = 42
 PREDICTIVE_DEMO_STEP_SECONDS = 2
-PREDICTIVE_DEMO_STEP_COUNT = 60
+PREDICTIVE_DEMO_STEP_COUNT = 100
 PREDICTIVE_DEMO_PRECURSOR_SECONDS = 20
 
 
@@ -513,6 +514,7 @@ def attack_catalog(
         seed=resolved_seed,
         step_seconds=resolved_step_seconds,
         step_count=resolved_step_count,
+        config=config,
     )
     catalog = [profile.to_dict() for profile in profiles]
     if model is not None:
@@ -521,7 +523,7 @@ def attack_catalog(
                 model,
                 str(item.get("target_id", "")),
             )
-    if scenario == "predictive-demo":
+    if scenario == "predictive-demo" and not _custom_schedule(config):
         arrival_schedule = predictive_demo_weibull_schedule(
             seed=resolved_seed,
             step_seconds=resolved_step_seconds,
@@ -545,6 +547,26 @@ def attack_catalog(
             item["arrival_sample_interval_seconds"] = (
                 arrival_schedule.raw_interarrival_seconds[realization_index]
             )
+    if _custom_schedule(config):
+        if config.attack_interval_steps is not None:
+            distribution = "fixed_interval"
+        elif scenario == "predictive-demo":
+            distribution = "shifted_weibull"
+        else:
+            distribution = "shifted_catalog"
+        start_steps = [profile.temporal.start_step for profile in profiles]
+        precursor_start = min(
+            (profile.temporal.start_step - profile.temporal.precursor_steps for profile in profiles),
+            default=None,
+        )
+        for item in catalog:
+            item["arrival_schedule"] = {
+                "distribution": distribution,
+                "realized_start_steps": list(start_steps),
+                "first_attack_step": start_steps[0] if start_steps else None,
+                "interval_steps": config.attack_interval_steps,
+                "precursor_start_step": precursor_start,
+            }
     return catalog
 
 
@@ -888,6 +910,15 @@ def predictive_demo_attack_profiles(
     return result
 
 
+def _scenario_value(explicit: int | None, configured: int | None, default: int) -> int:
+    """Приоритет: явный аргумент, настройка, стандартное значение."""
+    if explicit is not None:
+        return int(explicit)
+    if configured is not None:
+        return int(configured)
+    return default
+
+
 def _scenario_options(
     *,
     seed: int | None,
@@ -895,28 +926,14 @@ def _scenario_options(
     step_count: int | None,
     config: Any | None,
 ) -> tuple[int, int, int]:
-    config_seed = (
-        getattr(config, "attack_seed", getattr(config, "seed", None))
-        if config is not None
-        else None
-    )
-    config_step_seconds = getattr(config, "step_seconds", None) if config is not None else None
-    config_step_count = getattr(config, "step_count", None) if config is not None else None
+    config_seed = getattr(config, "attack_seed", getattr(config, "seed", None))
     return (
-        int(seed if seed is not None else config_seed if config_seed is not None else PREDICTIVE_DEMO_DEFAULT_SEED),
-        int(
-            step_seconds
-            if step_seconds is not None
-            else config_step_seconds
-            if config_step_seconds is not None
-            else PREDICTIVE_DEMO_STEP_SECONDS
+        _scenario_value(seed, config_seed, PREDICTIVE_DEMO_DEFAULT_SEED),
+        _scenario_value(
+            step_seconds, getattr(config, "step_seconds", None), PREDICTIVE_DEMO_STEP_SECONDS
         ),
-        int(
-            step_count
-            if step_count is not None
-            else config_step_count
-            if config_step_count is not None
-            else PREDICTIVE_DEMO_STEP_COUNT
+        _scenario_value(
+            step_count, getattr(config, "step_count", None), PREDICTIVE_DEMO_STEP_COUNT
         ),
     )
 
@@ -928,17 +945,42 @@ def _profiles_for_scenario(
     seed: int,
     step_seconds: int,
     step_count: int,
+    config: Any | None = None,
 ) -> tuple[AttackProfile, ...]:
     if scenario == "mitre-demo":
-        return MITRE_DEMO_ATTACKS
-    if scenario == "predictive-demo":
-        return predictive_demo_attack_profiles(
+        profiles = MITRE_DEMO_ATTACKS
+    elif scenario == "predictive-demo":
+        profiles = predictive_demo_attack_profiles(
             model,
             seed=seed,
             step_seconds=step_seconds,
             step_count=step_count,
         )
-    raise ValueError(f"Неизвестный сценарий атак: {scenario}")
+    else:
+        raise ValueError(f"Неизвестный сценарий атак: {scenario}")
+    if not _custom_schedule(config) or not profiles:
+        return profiles
+    original_first = min(profile.temporal.start_step for profile in profiles)
+    first = config.attack_start_step if config.attack_start_step is not None else original_first
+    interval = config.attack_interval_steps
+    adjusted = []
+    for index, profile in enumerate(profiles):
+        if interval is None:
+            offset = profile.temporal.start_step - original_first
+        else:
+            offset = index * interval
+        start = first + offset
+        if start <= step_count:
+            timing = replace(profile.temporal, start_step=start)
+            adjusted.append(replace(profile, temporal=timing))
+    return tuple(adjusted)
+
+
+def _custom_schedule(config: Any | None) -> bool:
+    return config is not None and (
+        getattr(config, "attack_start_step", None) is not None
+        or getattr(config, "attack_interval_steps", None) is not None
+    )
 
 
 def _predictive_node_pools(model: NetworkModel | None) -> dict[str, tuple[str, ...]]:
@@ -1490,6 +1532,7 @@ def active_attack_events(
         seed=resolved_seed,
         step_seconds=resolved_step_seconds,
         step_count=resolved_step_count,
+        config=config,
     )
     arrival_schedule = (
         predictive_demo_weibull_schedule(
@@ -1497,7 +1540,7 @@ def active_attack_events(
             step_seconds=resolved_step_seconds,
             step_count=resolved_step_count,
         )
-        if scenario == "predictive-demo"
+        if scenario == "predictive-demo" and not _custom_schedule(config)
         else None
     )
 
@@ -1896,6 +1939,7 @@ def observe_attack_precursors(
         seed=resolved_seed,
         step_seconds=resolved_step_seconds,
         step_count=resolved_step_count,
+        config=config,
     )
 
     observations: list[dict[str, Any]] = []
@@ -2071,6 +2115,7 @@ def apply_attack_effects(
             identities=identities,
         )
     ]
+    apply_transport_queues(model, flows)
     all_flows = flows + attack_flows
     for flow in flows:
         flow["slo_evaluation"] = _evaluate_flow_slo(model, flow)
@@ -2398,6 +2443,8 @@ def _evaluate_flow_slo(model: NetworkModel, flow: dict[str, Any]) -> dict[str, A
         / 1000.0
     )
     delivered_payload_kbps = offered_payload_kbps * delivery_ratio
+    if flow.get("transport") == "TCP" and "transport_queue" in flow:
+        delivered_payload_kbps = float(flow["transport_queue"]["goodput_mbps"]) * 1000.0
     loss_percent = (dropped_packets / packet_count * 100.0) if packet_count else 100.0
     available = bool(flow.get("route")) and not bool(flow.get("isolated"))
     available = available and flow.get("route_available", True) is not False
@@ -3200,7 +3247,8 @@ def _event_defense_mitigation(defense_plan: dict[str, Any] | None, event: dict[s
         matched = matched or (event.get("target_id") in targets and event.get("kind") in kinds)
     if not matched:
         return 0.0
-    return float(PREVENTIVE_DEFENSE_EFFECTIVENESS.get(str(event.get("kind")), 0.55))
+    strength = min(1.0, max(0.0, float(defense_plan.get("mitigation_strength", 1.0))))
+    return float(PREVENTIVE_DEFENSE_EFFECTIVENESS.get(str(event.get("kind")), 0.55)) * strength
 
 
 def _active_quarantined_sources(

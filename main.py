@@ -19,6 +19,7 @@ from src.gnet9.attacks import (
 )
 from src.gnet9.debug_visualizer import DebugFlowWindow, RuntimeCallTracer, export_debug_artifacts
 from src.gnet9.decision_dialogue import export_algorithm_dialogue
+from src.gnet9.constants import ATTACK_KIND_DISPLAY_NAMES, RESPONSE_STAGE_DISPLAY_NAMES
 from src.gnet9.dynamics import DynamicsConfig, simulate_stationary_dynamics
 from src.gnet9.dynamics_charts import export_dynamics_charts
 from src.gnet9.flow_visualizer import (
@@ -283,7 +284,29 @@ def export_stationary_dynamics(
     export_detail = packet_detail or str(dynamics.get("config", {}).get("packet_detail", "sample"))
     export_view = _dynamics_export_view(dynamics, export_detail)
     path.write_text(json.dumps(export_view, ensure_ascii=False, indent=2), encoding="utf-8")
+    export_step_log(dynamics, path.with_name("step_log.csv"))
     return dynamics
+
+
+def export_step_log(dynamics: dict[str, Any], path: Path) -> None:
+    """Записать короткий журнал с одной строкой на шаг."""
+    columns = ["шаг", "время_с", "фаза", "обучающих_переходов", "модель_обновлена", "Хаусдорф", "риск_Купмана", "рост_Ляпунова_в_секунду", "тип_угрозы", "решение", "причина", "изменённых_маршрутов"]
+    phases = {"reference": "эталон", "nominal_training": "обучение на исправной сети", "observation_and_protection": "наблюдение и защита"}
+    with path.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(columns)
+        for snapshot in dynamics["snapshots"]:
+            training = snapshot["training"]
+            card = snapshot["arbitrator"]["trigger_card"]
+            koopman = snapshot["koopman"]
+            writer.writerow([
+                snapshot["step_index"], snapshot["time_seconds"], phases[training["phase"]],
+                training["nominal_transitions"], "да" if training["operator_updated"] else "нет",
+                card["signals"]["hausdorff"]["value"], koopman["forecast_risk_score"],
+                koopman["lyapunov_derivative_per_second"], "; ".join(ATTACK_KIND_DISPLAY_NAMES.get(kind, "неопределённая угроза") for kind in card["attack_kind"].split("+")),
+                RESPONSE_STAGE_DISPLAY_NAMES[card["response_stage"]], card["reason_ru"],
+                snapshot.get("attacks", {}).get("routing", {}).get("rerouted_flow_count", 0),
+            ])
 
 
 def _l1_export_base(node_id: str, attrs: dict[str, Any]) -> dict[str, Any]:
@@ -320,8 +343,24 @@ def _non_negative_int(value: str) -> int:
     return parsed
 
 
+def _simulation_timing(args: argparse.Namespace) -> tuple[int, int]:
+    """Выбрать число шагов и их длительность, сохранив явно заданный ноль."""
+    if args.attack_scenario == "predictive-demo":
+        step_count = PREDICTIVE_DEMO_STEP_COUNT
+        step_seconds = PREDICTIVE_DEMO_STEP_SECONDS
+    else:
+        defaults = DynamicsConfig()
+        step_count = defaults.step_count
+        step_seconds = defaults.step_seconds
+    if args.dynamics_steps is not None:
+        step_count = args.dynamics_steps
+    if args.step_seconds is not None:
+        step_seconds = args.step_seconds
+    return step_count, step_seconds
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Создать артефакты эталонного состояния G-Net 9.")
+    parser = argparse.ArgumentParser(description="Построить модель сети GNet9 и сохранить результаты.")
     parser.add_argument(
         "--dynamics-steps",
         type=_non_negative_int,
@@ -343,12 +382,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--prediction-slo-seconds",
+        "--prediction-lead-seconds", "--prediction-slo-seconds",
+        dest="prediction_slo_seconds",
         type=_positive_int,
         default=None,
         help=(
             "Минимальное упреждение, по которому оценивается прогноз. "
-            "По умолчанию predictive-demo проверяется по SLO 10 с; "
+            "По умолчанию predictive-demo требует предупреждения минимум за 10 с; "
             "длинный аналитический прогноз Купмана сохраняется отдельно."
         ),
     )
@@ -360,7 +400,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Проверить обезличенную внешнюю телеметрию: хронологически подобрать "
             "порог по ранней части ряда и проверить его на независимой проверочной "
-            "части (holdout). "
+            "части. "
             "Создаёт output/telemetry_validation_report.json и не запускает сеть."
         ),
     )
@@ -370,7 +410,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         metavar="JSON",
         help=(
-            "Применить только прошедший независимую проверку (holdout) отчёт внешней "
+            "Применить только прошедший независимую проверку отчёт внешней "
             "телеметрии как порог "
             "предупреждения для симуляции. Автоматических изменений реальной сети не выполняет."
         ),
@@ -391,19 +431,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--telemetry-min-precision",
         type=float,
         default=0.90,
-        help="Минимальная точность допуска внешнего порога (по умолчанию 0.90).",
+        help="Минимальная доля верных предупреждений среди всех предупреждений (по умолчанию 0.90).",
     )
     parser.add_argument(
         "--telemetry-min-recall",
         type=float,
         default=0.90,
-        help="Минимальная полнота допуска внешнего порога (по умолчанию 0.90).",
+        help="Минимальная доля атак, о которых удалось предупредить (по умолчанию 0.90).",
     )
     parser.add_argument(
         "--telemetry-max-false-warnings-per-hour",
         type=float,
         default=0.10,
         help="Максимум ложных эпизодов в час для допуска внешнего порога (по умолчанию 0.10).",
+    )
+    parser.add_argument(
+        "--attack-start-step", type=_positive_int, default=None,
+        help="Шаг начала первой атаки. Предвестники появляются раньше; до них Купман обучается на исправном трафике.",
+    )
+    parser.add_argument(
+        "--attack-interval-steps", type=_positive_int, default=None,
+        help="Число шагов между началами атак. Без этого параметра сохраняются интервалы сценария.",
     )
     parser.add_argument(
         "--attack-seed",
@@ -438,7 +486,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--no-packet-simulation",
         action="store_true",
-        help="Экспортировать снимки динамики без пакетных событий TCP/IP.",
+        help="Сохранить состояния сети без расчёта передачи пакетов данных.",
     )
     parser.add_argument(
         "--show-window",
@@ -453,7 +501,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--show-debug",
         action="store_true",
-        help="Открыть окно графической диагностики и создать артефакты output/debug.",
+        help="Открыть окно диагностики и сохранить её результаты в output/debug.",
     )
     parser.add_argument(
         "--attack-scenario",
@@ -461,21 +509,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="none",
         help=(
             "Сценарий: none, фиксированный mitre-demo или predictive-demo "
-            "с причинным прогнозом, взвешенными атаками и приоритетным переназначением Gold."
+            "с прогнозом по наблюдениям и защитой прежде всего абонентов золотого класса."
         ),
     )
     args = parser.parse_args(argv)
+    if args.attack_scenario == "predictive-demo" and args.attack_start_step is None:
+        # Для обычной демонстрации оставляем 29 чистых переходов при такте 2 с.
+        # Короткие явно заданные серии сохраняют исходное расписание.
+        if args.dynamics_steps is None:
+            args.attack_start_step = 40
+    if args.attack_start_step is not None or args.attack_interval_steps is not None:
+        count, period = _simulation_timing(args)
+        precursor = predictive_demo_minimum_steps(period) - 5 if args.attack_scenario == "predictive-demo" else 1
+        if args.attack_scenario == "none":
+            parser.error("для расписания атак выберите --attack-scenario")
+        if args.attack_start_step is not None and not precursor < args.attack_start_step <= count:
+            parser.error(f"начало атаки должно быть от {precursor + 1} до {count}; предвестники должны появиться после t0")
     if args.no_packet_simulation and args.show_window:
         parser.error("интерактивная карта потоков требует пакетную модель; уберите --no-packet-simulation")
     if args.no_packet_simulation and args.attack_scenario != "none":
         parser.error("сценарий атак требует пакетную модель; уберите --no-packet-simulation")
     if args.attack_scenario == "predictive-demo":
-        resolved_step_seconds = args.step_seconds or PREDICTIVE_DEMO_STEP_SECONDS
-        resolved_step_count = (
-            args.dynamics_steps
-            if args.dynamics_steps is not None
-            else PREDICTIVE_DEMO_STEP_COUNT
-        )
+        resolved_step_count, resolved_step_seconds = _simulation_timing(args)
         minimum_steps = predictive_demo_minimum_steps(resolved_step_seconds)
         if resolved_step_count < minimum_steps:
             parser.error(
@@ -554,6 +609,7 @@ def main() -> None:
     d0sl_policy_path = project_root / "policies" / "l1_policies.d0sl"
     model = GNetBaselineBuilder(d0sl_policy_path=d0sl_policy_path).build()
     predictive_demo = args.attack_scenario == "predictive-demo"
+    step_count, step_seconds = _simulation_timing(args)
     export_packet_detail = args.packet_detail
     runtime_packet_detail = (
         "flows"
@@ -561,26 +617,16 @@ def main() -> None:
         else export_packet_detail
     )
     dynamics_config = DynamicsConfig(
-        step_count=(
-            args.dynamics_steps
-            if args.dynamics_steps is not None
-            else PREDICTIVE_DEMO_STEP_COUNT
-            if predictive_demo
-            else DynamicsConfig().step_count
-        ),
-        step_seconds=(
-            args.step_seconds
-            if args.step_seconds is not None
-            else PREDICTIVE_DEMO_STEP_SECONDS
-            if predictive_demo
-            else DynamicsConfig().step_seconds
-        ),
+        step_count=step_count,
+        step_seconds=step_seconds,
         packet_sample_limit=args.packet_sample_limit,
         include_packet_simulation=not args.no_packet_simulation,
         snapshot_detail=args.snapshot_detail,
         packet_detail=runtime_packet_detail,
         attack_scenario=args.attack_scenario,
         attack_seed=args.attack_seed,
+        attack_start_step=args.attack_start_step,
+        attack_interval_steps=args.attack_interval_steps,
         prediction_slo_seconds=args.prediction_slo_seconds,
         warning_risk_threshold=(
             calibration_profile["warning_risk_threshold"]
@@ -692,7 +738,7 @@ def main() -> None:
         debug_paths = export_debug_artifacts(runtime_tracer, artifacts["debug_dir"])
 
     print("Готово.")
-    print(f"Артефакты сохранены в: {output_dir}")
+    print(f"Результаты сохранены в: {output_dir}")
     print(
         "Динамика: "
         f"{dynamics_config.step_count} шагов по {dynamics_config.step_seconds} с, "
@@ -707,29 +753,28 @@ def main() -> None:
         + f", сценарий атак={dynamics_config.attack_scenario}"
     )
     koopman_evaluation = dynamics.get("koopman_evaluation", {})
+    training = dynamics["training_summary"]
+    first_attack = training["first_attack_step"]
+    attack_timing = "воздействия не заданы" if first_attack is None else f"первое воздействие — шаг {first_attack}"
+    print(f"Обучение: {training['clean_training_steps']} чистых шагов; {attack_timing}; журнал — {output_dir / 'step_log.csv'}")
     if koopman_evaluation.get("attack_onset_count"):
         print(
             "Купман: заранее распознано "
             f"{koopman_evaluation.get('predicted_before_onset_count', 0)} из "
             f"{koopman_evaluation.get('attack_onset_count', 0)} воздействий; "
             f"минимальное упреждение={koopman_evaluation.get('minimum_observed_lead_seconds', 0)} с; "
-            f"precision текущего стенда={koopman_evaluation.get('prediction_precision', 0.0) * 100:.1f}%; "
-            f"recall={koopman_evaluation.get('prediction_recall', 0.0) * 100:.1f}%; "
+            f"доля верных предупреждений={koopman_evaluation.get('prediction_precision', 0.0) * 100:.1f}%; "
+            f"доля распознанных атак={koopman_evaluation.get('prediction_recall', 0.0) * 100:.1f}%; "
             f"максимальный горизонт={koopman_evaluation.get('forecast_horizon_seconds', 0)} с; "
             f"защита применена к {koopman_evaluation.get('preventive_defense_applied_count', 0)} воздействиям."
         )
         print(
-            "SLO прогноза: не менее "
+            "Требуемое упреждение: не менее "
             f"{koopman_evaluation.get('prediction_slo_seconds', 0)} с — "
             f"{koopman_evaluation.get('prediction_slo_predicted_count', 0)} из "
             f"{koopman_evaluation.get('attack_onset_count', 0)}; "
             f"статус={koopman_evaluation.get('prediction_slo_status_ru', '—')}."
         )
-        if not koopman_evaluation.get("independent_holdout_validation_performed", False):
-            print(
-                "  Важно: это постоценка синтетического single-seed сценария, "
-                "а не подтверждённая точность на независимых операторских данных."
-            )
     print("Графики динамики:")
     for path in chart_paths.values():
         print(f"  - {path}")
@@ -737,7 +782,7 @@ def main() -> None:
     if artifacts["remapped_flows_png"].exists():
         print(f"Карта наиболее активного переназначения: {artifacts['remapped_flows_png']}")
     print(f"Карта IP-адресации: {artifacts['ip_map_png']}")
-    print(f"Диалог алгоритмов: {artifacts['algorithm_dialogue_md']}")
+    print(f"Пояснения к решениям: {artifacts['algorithm_dialogue_md']}")
     print(f"Аудит RFC и характеристик: {artifacts['standards_audit']}")
     if debug_paths:
         print("Графическая диагностика:")

@@ -8,6 +8,7 @@ the fields later needed for remapping, Koopman/DMD and Lyapunov analysis.
 from __future__ import annotations
 
 from typing import Any
+import math
 
 from .models import NetworkModel, StateTensor
 
@@ -44,6 +45,73 @@ STATE_VECTOR_METRICS = (
 )
 
 
+TRIGGER_BANDS = {
+    "hausdorff": (0.25, 0.50, 0.75),
+    "koopman": (0.25, 0.35, 0.70),
+    "lyapunov": (0.20, 0.60, 0.85),
+    "decision": (0.20, 0.50, 0.75),
+}
+STATE_NAMES = ("normal", "watch", "alert", "critical")
+STATE_LABELS = ("норма", "наблюдение", "защита", "срочная защита")
+THREAT_CONTROLS = {
+    "dos": ["rate_limit_attack_traffic", "protect_gold_paths"],
+    "ddos": ["rate_limit_attack_traffic", "protect_gold_paths", "distribute_service_load"],
+    "syn_flood": ["enable_syn_protection", "protect_endpoint_queue"],
+    "brute_force": ["enforce_account_lockout_policy", "review_failed_authentication_events"],
+    "power_attack": ["check_power_domain", "prefer_nodes_with_energy_reserve"],
+}
+
+
+def trigger_state(value: float, signal: str) -> dict[str, Any]:
+    """Назвать диапазон, сохранив исходное число и точные границы."""
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError("Оценка состояния должна быть конечным неотрицательным числом")
+    bounds = TRIGGER_BANDS[signal]
+    index = sum(value >= bound for bound in bounds)
+    return {
+        "value": value, "state": STATE_NAMES[index], "label_ru": STATE_LABELS[index],
+        "lower_inclusive": 0.0 if index == 0 else bounds[index - 1],
+        "upper_exclusive": bounds[index] if index < 3 else None,
+    }
+
+
+def build_trigger_card(
+    *, hausdorff: float, risk: float, lyapunov_pressure: float,
+    decision_pressure: float, confirmed: bool, attack_kind: str,
+    source_confirmed: bool,
+) -> dict[str, Any]:
+    """Карта состояния связывает наблюдения с допустимой защитой."""
+    signals = {
+        "hausdorff": trigger_state(hausdorff, "hausdorff"),
+        "koopman": trigger_state(risk, "koopman"),
+        "lyapunov": trigger_state(lyapunov_pressure, "lyapunov"),
+        "decision": trigger_state(decision_pressure, "decision"),
+    }
+    controls = sorted({control for kind in attack_kind.split("+") for control in THREAT_CONTROLS.get(kind, [])})
+    # Порог исполнения сохраняет строгую границу > 0,20. Одиночное
+    # отклонение любого расчёта не подтверждает источник или класс угрозы.
+    observe_limit, protection_limit, emergency_limit = TRIGGER_BANDS["decision"]
+    if decision_pressure <= observe_limit:
+        action, stage = "NO_REMAP", "observe"
+    elif not confirmed:
+        action, stage = "OBSERVE_PRECURSOR", "confirm_observation"
+    else:
+        action = "PLAN_REMAP"
+        stage = "prepare" if decision_pressure < protection_limit else "protect" if decision_pressure < emergency_limit else "emergency"
+    if source_confirmed and confirmed and stage == "emergency" and set(attack_kind.split("+")) & {"dos", "ddos", "syn_flood"}:
+        controls.append("isolate_confirmed_attack_sources")
+    return {
+        "signals": signals, "attack_kind": attack_kind, "confirmed": confirmed,
+        "action": action, "response_stage": stage, "controls": controls if confirmed else [],
+        "source_quarantine_allowed": source_confirmed and confirmed and bool(set(attack_kind.split("+")) & {"dos", "ddos", "syn_flood"}),
+        "reason_ru": (
+            "Оснований для изменения маршрутов нет." if action == "NO_REMAP" else
+            "Сигнал требует повторного наблюдения; источник не изолируется." if not confirmed else
+            f"Угроза подтверждена; диапазон реакции: {signals['decision']['label_ru']}."
+        ),
+    }
+
+
 def build_arbitrator_view(
     model: NetworkModel,
     tensor_state: dict[str, Any],
@@ -78,6 +146,7 @@ def build_arbitrator_view(
         state_hausdorff=state_hausdorff,
     )
     attack_active = bool(observation.get("attacks", {}).get("active", False))
+    needs_remap = remap_pressure > TRIGGER_BANDS["decision"][0]
 
     return {
         "node_id": "ARB",
@@ -100,13 +169,13 @@ def build_arbitrator_view(
         "critical_node_hierarchy": critical_node_hierarchy(model),
         "observations": observation,
         "remap": {
-            "needed": remap_pressure > 0.20,
-            "action": "NO_REMAP" if remap_pressure <= 0.20 else "PLAN_REMAP",
+            "needed": needs_remap,
+            "action": "PLAN_REMAP" if needs_remap else "NO_REMAP",
             "reason": (
-                "healthy_stationary_baseline" if remap_pressure <= 0.20
+                "healthy_stationary_baseline" if not needs_remap
                 else "mitre_attack_observed" if attack_active else "tensor_threshold_pressure"
             ),
-            "candidate_actions": [] if remap_pressure <= 0.20 else [
+            "candidate_actions": [] if not needs_remap else [
                 "rate_limit_attack_traffic", "protect_gold_paths", "reroute_high_pressure_flows"
             ],
         },
