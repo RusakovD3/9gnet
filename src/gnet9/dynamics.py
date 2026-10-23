@@ -39,6 +39,8 @@ from .metrics import (
     state_tensor_hausdorff_view,
 )
 from .models import NetworkModel, StateTensor
+from .kalman import DEFAULT_PROCESS_VARIANCE, DEFAULT_MEASUREMENT_VARIANCE, validate_noise_variances
+from .hypernetwork import hypernetwork_embedding
 from .packet_simulator import TRAFFIC_APPS, simulate_packet_snapshot
 from .tensor_matrix import (
     build_tensor_matrix_view,
@@ -75,6 +77,8 @@ class DynamicsConfig:
     prediction_slo_seconds: int | None = None
     warning_risk_threshold: float | None = None
     warning_threshold_origin: str = "model_default_not_externally_validated"
+    kalman_process_variance: float = DEFAULT_PROCESS_VARIANCE
+    kalman_measurement_variance: float = DEFAULT_MEASUREMENT_VARIANCE
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -141,6 +145,9 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
         required_prediction_lead_seconds=_resolved_prediction_slo_seconds(config),
         warning_risk_threshold=_resolved_warning_risk_threshold(config),
         warning_threshold_origin=config.warning_threshold_origin,
+        runtime_state=reference_snapshot.get("traffic", {}).get("network_state"),
+        kalman_process_variance=config.kalman_process_variance,
+        kalman_measurement_variance=config.kalman_measurement_variance,
     )
     pending_defense_plan: dict[str, Any] | None = None
     for step_index in range(start_step, config.step_count + 1):
@@ -175,6 +182,7 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
             attack_state=snapshot.get("attacks", {}),
             step_index=step_index,
             time_seconds=step_index * config.step_seconds,
+            runtime_state=snapshot.get("traffic", {}).get("network_state"),
         )
         proposed_plan = apply_koopman_to_arbitrator(
             snapshot,
@@ -237,6 +245,8 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
             step_seconds=config.step_seconds,
         ),
         "attack_response_evaluation": _attack_response_evaluation(snapshots),
+        "hypernetwork": hypernetwork_embedding(model),
+        "sla_resilience": _sla_resilience(snapshots, config.step_seconds),
         "tensor_matrix_contract": {
             "representation": "one_dense_entity_by_named_metric_matrix_per_level",
             "levels": list(TENSOR_LEVELS),
@@ -1573,6 +1583,7 @@ def _plan_for_next_step(
 
 
 def _validate_config(config: DynamicsConfig) -> None:
+    validate_noise_variances(config.kalman_process_variance, config.kalman_measurement_variance)
     if config.attack_interval_steps is not None and config.attack_interval_steps <= 0:
         raise ValueError("Интервал атак должен быть положительным")
     if config.attack_start_step is not None:
@@ -1643,3 +1654,22 @@ def _json_value(value: Any) -> Any:
     if isinstance(value, tuple):
         return list(value)
     return value
+
+
+def _sla_resilience(snapshots, step_seconds):
+    """Среднее соблюдение SLA за фактически пройденный промежуток."""
+    weights = {"gold": 3, "silver": 2, "bronze": 1}
+    points = []
+    for snapshot in snapshots:
+        if snapshot["step_index"] == 0:
+            continue
+        tiers = snapshot.get("attacks", {}).get("sla_restoration", {}).get("tiers", [])
+        numerator = sum(weights[t["sla_grade"]] * int(t["sla_compliant_flow_count"]) for t in tiers)
+        denominator = sum(weights[t["sla_grade"]] * int(t["flow_count"]) for t in tiers)
+        if denominator:
+            points.append({"step_index": snapshot["step_index"], "score": numerator / denominator})
+    return {"grade_weights": weights, "time_mean": sum(p["score"] for p in points) / len(points) if points else None,
+            "minimum": min((p["score"] for p in points), default=None),
+            "observed_duration_seconds": len(points) * step_seconds, "points": points,
+            "definition": "weighted_compliant_flows_divided_by_weighted_accounted_flows",
+            "scope": "observed_steps_not_infinite_horizon_optimum"}

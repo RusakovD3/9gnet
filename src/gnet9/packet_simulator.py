@@ -13,8 +13,10 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from .addressing import NetworkIdentity, build_network_identities
-from .attacks import apply_attack_effects
+from .attacks import apply_attack_effects, build_current_attack_flows
 from .models import NetworkModel, StateTensor
+from .normal_traffic import poisson_arrivals
+from .runtime_metrics import network_runtime_metrics
 from .metrics import gold_route_hausdorff_view
 from .remapping import apply_gold_first_remap
 from .routing import shortest_data_path
@@ -156,6 +158,9 @@ def simulate_packet_snapshot(
         flow = _build_flow(model, identities, subscriber_id, attrs, flow_index, step_index, time_seconds, step_seconds)
         flows.append(flow)
 
+    # Один набор текущих flood-потоков используется и при допуске маршрутов,
+    # и при расчёте очередей: остаточная нагрузка не исчезает из ограничения 80%.
+    current_attack_flows = build_current_attack_flows(attack_events or [], defense_plan, identities)
     # Реальный data-plane overlay применяется до моделирования ущерба. Поэтому
     # успешно переназначенный поток больше не считается проходящим через цель.
     flows, routing_summary = apply_gold_first_remap(
@@ -165,6 +170,7 @@ def simulate_packet_snapshot(
         defense_plan,
         step_index=step_index,
         identities=identities,
+        background_flows=current_attack_flows,
     )
     routing_summary["by_sla"] = {
         str(item["sla_grade"]): item for item in routing_summary.get("tiers", [])
@@ -203,6 +209,7 @@ def simulate_packet_snapshot(
         identities=identities,
         scenario=attack_scenario,
         power_runtime_state=power_runtime_state,
+        prepared_attack_flows=current_attack_flows,
     )
     if attack_scenario is None and any(
         str(event.get("attack_id", "")).startswith("PRED-")
@@ -212,6 +219,7 @@ def simulate_packet_snapshot(
     attack_state["routing"] = routing_summary
     result: dict[str, Any] = {
         "summary": _traffic_summary(flows, model),
+        "network_state": network_runtime_metrics(model, flows, attack_events or [], detail=detail),
         "attack_state": attack_state,
     }
     if detail in {"flows", "sample"}:
@@ -283,6 +291,8 @@ def _build_voice_flow(context: FlowContext) -> dict[str, Any]:
     datagrams = packets_per_second * context.step_seconds
     codec_payload_bytes = max(1, int(round(context.payload_bps * context.step_seconds / 8.0)))
     codec_bytes_per_packet = max(1, int(round(codec_payload_bytes / datagrams)))
+    datagrams = poisson_arrivals(datagrams, node_id=context.subscriber_id, step=context.step_index)
+    codec_payload_bytes = datagrams * codec_bytes_per_packet
     wire_bytes = codec_payload_bytes + datagrams * (
         RTP_HEADER_BYTES + UDP_HEADER_BYTES + IPV4_HEADER_BYTES + ETHERNET_WIRE_OVERHEAD_BYTES
     )
@@ -326,7 +336,10 @@ def _build_tcp_flow(context: FlowContext) -> dict[str, Any]:
     data_route = _route(context.model, context.server_node, context.subscriber_id)
     ack_route = list(reversed(data_route))
     payload_bytes = _payload_bytes(context.payload_bps, context.step_seconds, TCP_MSS_BYTES)
-    data_segments = math.ceil(payload_bytes / TCP_MSS_BYTES)
+    expected_segments = payload_bytes / TCP_MSS_BYTES
+    data_segments = math.ceil(expected_segments) if context.step_index == 0 else poisson_arrivals(expected_segments, node_id=context.subscriber_id, step=context.step_index)
+    if context.step_index > 0:
+        payload_bytes = data_segments * TCP_MSS_BYTES
     ack_segments = math.ceil(data_segments / 2)
     handshake_packets = 3 if context.step_index == 0 else 0
     tcp_packets = handshake_packets + data_segments + ack_segments
@@ -376,7 +389,9 @@ def _build_udp_media_flow(context: FlowContext) -> dict[str, Any]:
     route = _route(context.model, context.server_node, context.subscriber_id)
     payload_unit = context.app["payload_unit_bytes"]
     payload_bytes = _payload_bytes(context.payload_bps, context.step_seconds, payload_unit)
-    datagrams = math.ceil(payload_bytes / payload_unit)
+    datagrams = math.ceil(payload_bytes / payload_unit) if context.step_index == 0 else poisson_arrivals(payload_bytes / payload_unit, node_id=context.subscriber_id, step=context.step_index)
+    if context.step_index > 0:
+        payload_bytes = datagrams * payload_unit
     has_rtp = context.app["application"].startswith("RTP_")
     media_header_bytes = RTP_HEADER_BYTES if has_rtp else 0
     wire_bytes = payload_bytes + datagrams * (
@@ -437,7 +452,7 @@ def _build_dns_flow(context: FlowContext) -> dict[str, Any]:
         policy.get("request_rate_qps")
         or _tensor_metric(context.attrs.get("tensor"), "request_rate_pps", default=1.0)
     )
-    query_count = max(1, int(round(request_rate * context.step_seconds)))
+    query_count = poisson_arrivals(request_rate * context.step_seconds, node_id=context.subscriber_id, step=context.step_index)
     query_bytes = int(context.app["query_payload_bytes"])
     response_bytes = int(context.app["response_payload_bytes"])
     payload_bytes = query_count * (query_bytes + response_bytes)
@@ -487,9 +502,23 @@ def _flow_record(
     extra: dict[str, Any],
 ) -> dict[str, Any]:
     service_attrs = context.model.graph.nodes[context.service_node]
+    kind = context.attrs.get("traffic_kind")
+    if kind == "voice":
+        expected_rate = 1000.0 / float(context.attrs.get("d0sl_policy", {}).get("packetization_ms") or 20)
+    elif kind == "dns":
+        expected_rate = 2.0 * float(extra["dns_request_rate_qps"])
+    elif transport == "TCP":
+        expected_rate = context.payload_bps / (8.0 * TCP_MSS_BYTES) * 1.5
+    else:
+        expected_rate = context.payload_bps / (8.0 * float(context.app["payload_unit_bytes"]))
     record = {
+        "normal_expected_payload_rate_bps": context.payload_bps,
+        "normal_expected_packet_rate_pps": expected_rate,
+        "normal_service_reference_packet_rate_pps": (expected_rate if kind in {"voice", "dns"} else expected_rate * float(context.attrs.get("target_bitrate_kbps", 0.0)) * 1000.0 / max(context.payload_bps, 1.0)),
         "flow_id": context.flow_id,
         "step_index": context.step_index,
+        "arrival_process": "expected_reference" if context.step_index == 0 else "poisson",
+        "normal_traffic_seed": 42,
         "time_seconds": context.time_seconds,
         "interval_seconds": context.step_seconds,
         "application": context.app["application"],
@@ -534,7 +563,7 @@ def _sample_packets_for_flow(
     model: NetworkModel,
     limit: int,
 ) -> list[dict[str, Any]]:
-    if limit <= 0 or flow.get("isolated") or not flow.get("route_available", True):
+    if limit <= 0 or int(flow.get("packet_count", 0)) <= 0 or flow.get("isolated") or not flow.get("route_available", True):
         return []
 
     if flow.get("is_attack_traffic"):
@@ -1186,6 +1215,10 @@ def _traffic_summary(flows: list[dict[str, Any]], model: NetworkModel) -> dict[s
             "flow_weighted_end_to_end_loss_exposure_not_physical_drop_location"
         ),
         "most_utilized_links": top_links,
+        "normal_arrival_process": "poisson",
+        "normal_traffic_seed": 42,
+        "normal_arrival_rate_pps": legitimate_packets / max(interval_seconds, 1),
+        "attack_arrival_rate_pps": sum(int(flow["packet_count"]) for flow in attack_flows) / max(interval_seconds, 1),
         "legitimate_packet_count": legitimate_packets,
         "legitimate_wire_bytes": legitimate_wire,
         "legitimate_offered_rate_mbps": round(

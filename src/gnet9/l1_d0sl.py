@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import re
 import math
-import math
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path

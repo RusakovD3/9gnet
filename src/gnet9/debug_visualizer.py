@@ -38,7 +38,7 @@ class ProcessBlock:
 PROCESS_BLOCKS = (
     ProcessBlock("cli", "Параметры запуска", "Управление", "Разбор режима, детализации и числа шагов.", ("parse_args",), (0.0, 3.0)),
     ProcessBlock("build", "Сборка модели", "Модель", "Создание воспроизводимой девятиуровневой структуры G-Net.", ("GNetBaselineBuilder.build",), (2.2, 3.0)),
-    ProcessBlock("policy", "Политики d0sl", "Модель", "Разбор SLA/SLO и назначение профилей абонентам.", ("load_l1_d0sl_catalog", "build_l1_queue_model"), (4.4, 4.1)),
+    ProcessBlock("policy", "Политики d0sl", "Модель", "Разбор требований к качеству услуг и назначение профилей абонентам.", ("load_l1_d0sl_catalog", "build_l1_queue_model"), (4.4, 4.1)),
     ProcessBlock("topology", "Топология и тензоры", "Модель", "Узлы, связи, оборудование, серверы и тензорные метрики.", ("_build_l2", "build_tensor"), (4.4, 2.7)),
     ProcessBlock("validate", "Проверка эталона t0", "Контроль", "Контроль связности, SLA, оборудования и отсутствия фактических потерь.", ("validate_healthy_baseline", "validate_ideal_t0"), (6.7, 4.1)),
     ProcessBlock("clock", "Шаг динамики", "Динамика", "Формирование снимка состояния для каждого момента времени.", ("simulate_stationary_dynamics", "_snapshot"), (6.7, 2.7)),

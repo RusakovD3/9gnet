@@ -220,8 +220,8 @@ def test_service_aware_slo_evaluation_exports_honest_metric_coverage() -> None:
     voice_metrics = by_application["RTP_OPUS"]["slo_evaluation"]["metrics"]
     assert voice_metrics["media_bitrate_kbps"]["evidence"] == "modeled"
     assert voice_metrics["one_way_media_latency_ms"]["compliant"] is True
-    assert voice_metrics["jitter_ms"]["evidence"] == "not_modeled"
-    assert voice_metrics["jitter_ms"]["observed_value"] is None
+    assert voice_metrics["jitter_ms"]["evidence"] == "assumed"
+    assert voice_metrics["jitter_ms"]["observed_value"] > 0
 
     vlc_metrics = by_application["RTP_VLC_AV"]["slo_evaluation"]["metrics"]
     assert vlc_metrics["media_bitrate_kbps"]["compliant"] is True

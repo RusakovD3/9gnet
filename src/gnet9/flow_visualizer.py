@@ -13,7 +13,11 @@ from matplotlib.patches import FancyBboxPatch
 from matplotlib.widgets import Button, Slider
 import numpy as np
 
-from .constants import ACTION_DISPLAY_NAMES, SERVICE_DISPLAY_NAMES
+from .constants import SERVICE_DISPLAY_NAMES
+from .flow_details import (FLOW_SHORT_LABELS, _flow_summary,
+                           _interactive_snapshot_summary, _node_hover_text)
+from .network_layout import network_positions as _positions
+from .plot_style import BACKGROUND, PANEL, TEXT, BORDER, save_figure
 
 
 FLOW_COLORS = {
@@ -27,70 +31,6 @@ FLOW_COLORS = {
     "ATTACK_DDOS": "#b91c1c",
     "ATTACK_SYN": "#f43f5e",
 }
-FLOW_LABELS = {
-    "RTP_OPUS": "Голос · Opus по RTP/UDP",
-    "RTP_VLC_AV": "VLC · голос и видео по RTP/UDP",
-    "FTP_DATA": "Файлы · FTP по TCP",
-    "DNS": "DNS · запросы имён по UDP",
-    "RTP_TELEMOST": "Видеоконференция · RTP/UDP",
-    "LIVE_HLS": "Прямая трансляция · LL-HLS/TCP",
-    "ATTACK_DOS": "АТАКА · DoS / прямой поток",
-    "ATTACK_DDOS": "АТАКА · DDoS / отражённое усиление",
-    "ATTACK_SYN": "АТАКА · SYN-флуд",
-}
-FLOW_SHORT_LABELS = {
-    "RTP_OPUS": "Голос · Opus/RTP",
-    "RTP_VLC_AV": "VLC · аудио/видео",
-    "FTP_DATA": "Файлы · FTP/TCP",
-    "DNS": "DNS · запросы/UDP",
-    "RTP_TELEMOST": "Видеоконференция",
-    "LIVE_HLS": "Прямая трансляция",
-    "ATTACK_DOS": "АТАКА · DoS",
-    "ATTACK_DDOS": "АТАКА · DDoS",
-    "ATTACK_SYN": "АТАКА · SYN-флуд",
-}
-TRAFFIC_LABELS = {
-    "voice": "голос", "vlc_av": "VLC: голос и видео",
-    "ftp": "передача файлов FTP", "dns": "запросы DNS",
-    "video_conference": "видеоконференция", "live_streaming": "прямая трансляция",
-}
-SLA_LABELS = {"gold": "золотой", "silver": "серебряный", "bronze": "бронзовый"}
-SLO_METRIC_LABELS = {
-    "one_way_mouth_to_ear_latency": "односторонняя задержка речи",
-    "network_packet_loss": "сетевая потеря пакетов",
-    "jitter": "разброс задержки",
-    "one_way_media_latency": "односторонняя задержка медиапотока",
-    "media_bitrate": "полезная скорость медиапотока",
-    "goodput": "полезная скорость передачи",
-    "file_completion_time": "время передачи файла",
-    "transfer_success": "успешность передачи",
-    "tcp_retransmission_ratio": "доля повторных передач TCP",
-    "response_time_p95_p99": "время ответа для 95% / 99% запросов",
-    "timeout_ratio": "доля запросов без ответа вовремя",
-    "servfail_ratio": "доля ответов с ошибкой сервера",
-    "tcp_fallback_success": "успешность перехода DNS на TCP",
-    "audio_one_way_latency": "односторонняя задержка звука",
-    "video_one_way_latency": "односторонняя задержка видео",
-    "media_loss": "потеря медиапакетов",
-    "live_edge_latency": "отставание от прямого эфира",
-    "startup_time": "время запуска воспроизведения",
-    "rebuffer_ratio": "доля времени ожидания загрузки",
-    "part_deadline_miss_ratio": "доля опоздавших частей трансляции",
-}
-MODEL_LIMITATION_LABELS = {
-    "latency_and_jitter_fields_are_compatibility_guardrails_not_primary_ftp_slo": (
-        "основные требования к передаче файла — скорость и время завершения"
-    ),
-    "bitrate_is_equivalent_load_for_generator_not_a_dns_service_slo": (
-        "поиск сетевого адреса оценивается по времени ответа и его успешности"
-    ),
-    "srtp_srtcp_and_dtls_byte_overhead_not_yet_counted": (
-        "защита медиапотока задана профилем услуги"
-    ),
-    "jitter_field_is_a_transport_guardrail_not_primary_ll_hls_user_slo": (
-        "трансляция оценивается по отставанию от эфира и непрерывности просмотра"
-    ),
-}
 LEVEL_COLORS = {"L0": "#10b981", "L2": "#60a5fa", "L7": "#fb923c", "L8": "#94a3b8"}
 NODE_SIZES = {"L0": 175, "L2": 64, "L7": 105, "L8": 28}
 SUBSCRIBER_STYLES = {
@@ -103,40 +43,6 @@ ATTACK_TARGET_COLORS = {
     "syn_flood": "#f43f5e",
     "power_attack": "#facc15",
 }
-
-
-def _positions(model) -> dict[str, tuple[float, float]]:
-    positions: dict[str, tuple[float, float]] = {}
-    missing: list[str] = []
-    for node_id, attrs in model.graph.nodes(data=True):
-        if "pos" in attrs:
-            x, y = attrs["pos"]
-            positions[node_id] = (float(x) * 1.55, float(y) * 1.04)
-        else:
-            missing.append(node_id)
-    for index, node_id in enumerate(missing):
-        positions[node_id] = (-10.5 + index * 0.4, 8.0)
-
-    # Render each 40-user access group as a compact 10 x 4 endpoint rack.
-    # The access devices are deliberately close in the engineering layout.  The
-    # previous 8-column rack was wider than the gap between neighbouring RAN/OLT
-    # nodes, so two subscriber groups visually crossed each other.  A four-column
-    # rack preserves a generous pixel gap between every device group while the
-    # ten rows remain easy to inspect in the enlarged figure.
-    # This changes only the display layout; graph coordinates and metrics stay intact.
-    access_groups: dict[str, list[str]] = {}
-    for node_id, attrs in model.graph.nodes(data=True):
-        if attrs.get("level") == "L1":
-            access_groups.setdefault(attrs["home_access"], []).append(node_id)
-    for access_node, node_ids in access_groups.items():
-        center_x, access_y = positions[access_node]
-        for index, node_id in enumerate(sorted(node_ids)):
-            row, column = divmod(index, 4)
-            positions[node_id] = (
-                center_x + (column - 1.5) * 0.28,
-                access_y - 1.28 - row * 0.42,
-            )
-    return positions
 
 
 def aggregate_flow_edges(flows: list[dict[str, Any]]) -> dict[frozenset[str], dict[str, Any]]:
@@ -171,13 +77,20 @@ def draw_service_flow_map(
     *,
     title_suffix: str = "",
 ) -> None:
-    """Сохранить полную топологию с фактической нагрузкой поверх связей."""
+    """Сохранить сеть с наблюдаемыми потоками текущего шага."""
+    draw_network_map(model, path, flows=flows, title_suffix=title_suffix)
+
+
+def draw_network_map(model, path: Path, *, flows=None, title_suffix="") -> None:
+    """Общий способ рисования сети; None означает схему без нагрузки."""
+    topology_only = flows is None
+    flows = flows or []
     pos = _positions(model)
-    loads = aggregate_flow_edges(flows)
-    max_bytes = max((item["wire_bytes"] for item in loads.values()), default=1)
-    fig, ax = plt.subplots(figsize=(36, 17))
-    fig.subplots_adjust(bottom=0.055, left=0.014, right=0.770, top=0.94)
-    title = "G-Net: сервисные потоки и загрузка связей"
+    loads = None if topology_only else aggregate_flow_edges(flows)
+    max_bytes = max((item["wire_bytes"] for item in (loads or {}).values()), default=1)
+    fig, ax = plt.subplots(figsize=(24, 15))
+    fig.subplots_adjust(bottom=0.055, left=0.014, right=0.755, top=0.93)
+    title = "GNet9 · схема сети" if topology_only else "GNet9 · потоки и нагрузка текущего шага"
     if title_suffix:
         title = f"{title}\n{title_suffix}"
     _style_axes(ax, title)
@@ -206,13 +119,19 @@ def draw_service_flow_map(
             linewidths=2.5, zorder=16,
         )
     _set_topology_view(ax, pos)
-    _draw_legend(ax, static=True)
+    _draw_legend(ax, static=True, topology_only=topology_only, applications=set(f.get("application") for f in flows),
+                 show_isolation=bool(isolated_nodes), show_failover=bool(failover_servers))
+    summary = (f"СОСТАВ СЕТИ\n\n{sum(a.get('level') == 'L1' for _, a in model.graph.nodes(data=True))} абонентов\n"
+               f"{sum(a.get('level') == 'L2' for _, a in model.graph.nodes(data=True))} сетевых устройств\n"
+               f"{len(model.servers)} сервера · {len(model.services)} услуг\n\n"
+               "Каждая точка снизу — абонент.\n"
+               "Цвет различает мобильный\nи проводной доступ.\n\n"
+               "Координаты схематичны.\nЛинии взяты из графа сети.") if topology_only else _flow_summary(flows)
     ax.text(
-        1.018, 0.98, _flow_summary(flows), transform=ax.transAxes, va="top", fontsize=9.8, color="#e9ecef",
-        bbox={"boxstyle": "round,pad=0.5", "fc": "#212529", "ec": "#6c757d", "alpha": 0.92},
+        1.018, 0.98, summary, transform=ax.transAxes, va="top", fontsize=9.2, color=TEXT,
+        bbox={"boxstyle": "round,pad=0.5", "fc": PANEL, "ec": BORDER, "alpha": 0.92},
     )
-    fig.savefig(path, dpi=220, bbox_inches="tight", facecolor=fig.get_facecolor())
-    plt.close(fig)
+    save_figure(fig, path)
 
 
 class ServiceFlowWindow:
@@ -250,7 +169,7 @@ class ServiceFlowWindow:
         for panel_ax in (self.status_ax, self.legend_ax, self.help_ax):
             panel_ax.set_axis_off()
             panel_ax.set_facecolor("none")
-        _style_axes(self.ax, "G-Net: сервисные потоки по шагам динамики")
+        _style_axes(self.ax, "GNet9 · потоки по шагам")
         _draw_access_zones(self.ax, model, self.pos)
         _draw_topology(self.ax, model, self.pos)
         _draw_labels(self.ax, model, self.pos)
@@ -617,6 +536,8 @@ def _draw_topology(ax, model, pos, *, loads=None, max_bytes: int = 1) -> None:
             color = FLOW_COLORS.get(dominant, "#ffbe0b")
             width = 0.8 + 5.2 * np.sqrt(load["wire_bytes"] / max_bytes)
             alpha, zorder = 0.88, 3
+        elif loads is None:
+            color, width, alpha, zorder = "#94a3b8", 1.05, .65, 1
         else:
             color = "#22d3ee" if standby else "#64748b"
             width, alpha, zorder = (0.65, 0.32, 2) if standby else (0.48, 0.36, 1)
@@ -724,16 +645,16 @@ def _draw_labels(ax, model, pos) -> None:
         elif level == "L0":
             label = SERVICE_DISPLAY_NAMES.get(attrs.get("label"), attrs.get("label", node_id)).upper()
         elif level == "L7":
-            label = "АРБ"
+            label = "Арбитр"
         ax.text(
             x, y + (0.34 if level == "L0" else 0.20), label, ha="center",
-            fontsize=7.2, color="#f8fafc", zorder=7,
+            fontsize=8.5, color=TEXT, zorder=7,
         )
 
 
 def _style_axes(ax, title: str) -> None:
-    ax.figure.patch.set_facecolor("#0f172a")
-    ax.set_facecolor("#0f172a")
+    ax.figure.patch.set_facecolor(BACKGROUND)
+    ax.set_facecolor(BACKGROUND)
     ax.set_title(title, color="#f8fafc", fontsize=16, pad=12)
     ax.set_aspect("equal", adjustable="box")
     ax.axis("off")
@@ -751,9 +672,10 @@ def _set_topology_view(ax, pos: dict[str, tuple[float, float]]) -> None:
     ax.set_ylim(min(ys) - max(height * 0.10, 0.80), max(ys) + max(height * 0.08, 0.65))
 
 
-def _draw_legend(ax, *, static: bool = False, compact: bool = False) -> None:
-    flow_labels = FLOW_LABELS if static else FLOW_SHORT_LABELS
-    flow_handles = [Line2D([0], [0], color=color, lw=3, label=flow_labels[name]) for name, color in FLOW_COLORS.items()]
+def _draw_legend(ax, *, static=False, compact=False, applications=None,
+                 show_isolation=True, show_failover=True, topology_only=False) -> None:
+    flow_labels = FLOW_SHORT_LABELS
+    flow_handles = [Line2D([0], [0], color=color, lw=3, label=flow_labels[name]) for name, color in FLOW_COLORS.items() if applications is None or name in applications]
     subscriber_handles = []
     for style in SUBSCRIBER_STYLES.values():
         subscriber_handles.append(Line2D(
@@ -778,7 +700,18 @@ def _draw_legend(ax, *, static: bool = False, compact: bool = False) -> None:
         Line2D([0], [0], color="#cbd5e1", lw=0.7, label="Линия абонента: цвет M/Ф"),
         Line2D([0], [0], color="#94a3b8", lw=0.7, alpha=0.7, label="Связь без трафика"),
     ]
-    if compact:
+    semantic_handles.extend([
+        Line2D([0], [0], marker="^", color="none", markerfacecolor=LEVEL_COLORS["L2"], markersize=7, label="RAN — узел радиодоступа"),
+        Line2D([0], [0], marker="v", color="none", markerfacecolor=LEVEL_COLORS["L2"], markersize=7, label="OLT — узел оптического доступа"),
+    ])
+    if static:
+        # Только обозначения, которые действительно видны на этом рисунке.
+        handles = [*flow_handles, *subscriber_handles, *semantic_handles[:7],
+                   *([semantic_handles[10]] if show_isolation else []),
+                   *([semantic_handles[11]] if show_failover else []),
+                   *(semantic_handles[12:] if not topology_only else semantic_handles[-2:]) ]
+        legend_options = {"loc": "lower left", "bbox_to_anchor": (1.018, .015), "ncol": 1}
+    elif compact:
         handles = [
             *flow_handles[:6],
             *subscriber_handles,
@@ -795,570 +728,12 @@ def _draw_legend(ax, *, static: bool = False, compact: bool = False) -> None:
         )
     legend = ax.legend(
         handles=handles, framealpha=0.96, facecolor="#111827", edgecolor="#475569",
-        labelcolor="#e2e8f0", fontsize=7.15 if static else 6.7 if compact else 7.05,
-        title="Условные обозначения" if compact else "Узлы и сервисные потоки",
+        labelcolor="#e2e8f0", fontsize=8.2 if static else 6.7 if compact else 7.05,
+        title="Узлы и связи" if topology_only else "Условные обозначения" if compact else "Узлы и потоки",
         title_fontsize=7.6 if compact else 8.3, **legend_options,
     )
     legend.get_title().set_color("#f8fafc")
     legend.set_zorder(20)
-
-
-def _flow_summary(flows: list[dict[str, Any]]) -> str:
-    apps = Counter(flow.get("application", "unknown") for flow in flows)
-    legitimate_count = sum(1 for flow in flows if not flow.get("is_attack_traffic"))
-    attack_count = len(flows) - legitimate_count
-    packets = sum(int(flow.get("packet_count", 0)) for flow in flows)
-    wire_bytes = sum(int(flow.get("wire_bytes", 0)) for flow in flows)
-    routed_flows = [
-        flow for flow in flows
-        if flow.get("route") and not flow.get("isolated") and int(flow.get("packet_count", 0)) > 0
-    ]
-    routed_wire_bytes = sum(int(flow.get("wire_bytes", 0)) for flow in routed_flows)
-    delivered_packets = sum(
-        max(0, int(flow.get("packet_count", 0)) - int(flow.get("observed_dropped_packets", 0)))
-        for flow in routed_flows
-    )
-    interval = int(flows[0].get("interval_seconds", 0)) if flows else 0
-    megabytes = wire_bytes / 1_000_000
-    offered_rate_mbps = wire_bytes * 8.0 / max(interval, 1) / 1_000_000
-    carried_rate_mbps = routed_wire_bytes * 8.0 / max(interval, 1) / 1_000_000
-    rerouted = sum(bool(flow.get("rerouted")) for flow in flows if not flow.get("is_attack_traffic"))
-    failover = sum(bool(flow.get("failover_active")) for flow in flows if not flow.get("is_attack_traffic"))
-    isolated = sum(bool(flow.get("isolated")) for flow in flows if not flow.get("is_attack_traffic"))
-    lines = [
-        f"Легитимные потоки: {legitimate_count} = {legitimate_count} абонентов",
-        "По 1 активному потоку на пользователя",
-        f"Атакующие агрегированные потоки: {attack_count}",
-        f"Сформировано пакетов за {interval} с: {packets:,}",
-        f"Доставлено пакетов: {delivered_packets:,}",
-        f"Предложено: {megabytes:,.1f} МБ · {offered_rate_mbps:,.1f} Мбит/с",
-        f"Передано по маршрутам: {routed_wire_bytes / 1_000_000:,.1f} МБ · {carried_rate_mbps:,.1f} Мбит/с",
-        f"Переназначено / резерв / изолировано: {rerouted} / {failover} / {isolated}",
-        "Приложения:",
-    ]
-    lines.extend(f"  {FLOW_SHORT_LABELS.get(name, name)}: {count}" for name, count in sorted(apps.items()))
-    return "\n".join(lines)
-
-
-def _interactive_snapshot_summary(snapshot, flows, loads, paused: bool, model) -> str:
-    """Краткая карточка для окна: она всегда помещается в выделенную панель."""
-    legitimate = [flow for flow in flows if not flow.get("is_attack_traffic")]
-    active_attacks = snapshot.get("attacks", {})
-    koopman = snapshot.get("koopman", {})
-    routing = active_attacks.get("routing", {})
-    by_sla = routing.get("by_sla", {})
-    latencies = [
-        float(flow.get("one_way_latency_ms", 0.0))
-        for flow in legitimate
-        if not flow.get("isolated")
-    ]
-    mode = "ПАУЗА" if paused else "ВОСПРОИЗВЕДЕНИЕ"
-    step = int(snapshot.get("step_index", 0))
-    time_seconds = float(snapshot.get("time_seconds", 0.0))
-    remap = snapshot.get("arbitrator", {}).get("remap", {}).get("action", "—")
-    attack_names = ", ".join(
-        str(event.get("name_ru") or event.get("attack_id") or "атака")
-        for event in active_attacks.get("events", [])[:2]
-    )
-    if len(active_attacks.get("events", [])) > 2:
-        attack_names += f" и ещё {len(active_attacks['events']) - 2}"
-    warning = bool(koopman.get("forecast_is_early_warning"))
-    targets = ", ".join(map(str, koopman.get("forecast_target_ids", [])[:3])) or "—"
-    status = "ПРОГНОЗ ПОДТВЕРЖДЁН" if warning else "признаков атаки нет"
-    gold = by_sla.get("gold", {})
-    max_link = max(
-        (item.get("wire_bytes", 0) for item in loads.values()),
-        default=0,
-    ) / 1_000_000
-    lines = [
-        f"ШАГ {step} · t = {time_seconds:.0f} с · {mode}",
-        "─" * 30,
-        f"Легитимных потоков: {len(legitimate)}",
-        f"Связей с трафиком: {len(loads)} из {model.graph.number_of_edges()}",
-        f"Средняя / макс. задержка: {np.mean(latencies) if latencies else 0.0:.2f} / {max(latencies, default=0.0):.2f} мс",
-        f"Макс. объём на связи: {max_link:.1f} МБ за шаг",
-        "",
-        f"КУПМАН: {status}",
-        f"Риск: {float(koopman.get('forecast_risk_score', 0.0)) * 100:.1f}% (не вероятность)",
-        f"Цель: {targets}",
-        f"Окно: {koopman.get('forecast_window_start_seconds', '—')}…{koopman.get('forecast_window_end_seconds', '—')} с",
-        f"Запас: ≥ {koopman.get('prediction_slo_seconds', '—')} с",
-        "",
-        f"Защита: {ACTION_DISPLAY_NAMES.get(remap, remap)}",
-        f"Переназначено / резерв сервера / изолировано: {routing.get('rerouted_flow_count', 0)} / {routing.get('failover_flow_count', 0)} / {routing.get('isolated_flow_count', 0)}",
-        f"Доступность золотого класса: {float(gold.get('availability_ratio', 1.0)) * 100:.1f}%",
-    ]
-    if active_attacks.get("active"):
-        lines.extend([
-            "",
-            f"АТАКА: {attack_names}",
-            f"После защиты: {float(active_attacks.get('attack_rate_mbps', 0.0)):,.1f} Мбит/с",
-            f"Этап: {routing.get('protection_stage', 'подтверждение/защита')}",
-        ])
-    elif step == 0:
-        lines.append("t0: эталон без потерь, очередей и ремаппинга")
-    return "\n".join(lines)
-
-
-def _snapshot_summary(snapshot, flows, loads, paused: bool, model) -> str:
-    latencies = [
-        float(flow.get("one_way_latency_ms", 0.0)) for flow in flows
-        if not flow.get("is_attack_traffic") and not flow.get("isolated")
-    ]
-    busiest = max(loads.items(), key=lambda item: item[1]["wire_bytes"], default=(frozenset(), {"wire_bytes": 0}))
-    edge_name = " ↔ ".join(sorted(busiest[0])) if busiest[0] else "—"
-    remap_code = snapshot.get("arbitrator", {}).get("remap", {}).get("action", "—")
-    remap = {
-        "NO_REMAP": "текущие маршруты сохраняются",
-        "OBSERVE_PRECURSOR": "наблюдение: требуется второй отсчёт",
-        "PLAN_REMAP": "выполняется план переназначения",
-    }.get(remap_code, remap_code)
-    mode = "ПАУЗА — выбранный снимок" if paused else f"ВОСПРОИЗВЕДЕНИЕ → следующий шаг"
-    t0_note = "\nt0: пакеты находятся в точках-источниках" if paused and snapshot.get("step_index", 0) == 0 else ""
-    breakdown = _active_link_breakdown(model, loads)
-    attacks = snapshot.get("attacks", {})
-    attack_names = ", ".join(event.get("name_ru", event.get("attack_id", "")) for event in attacks.get("events", []))
-    koopman = snapshot.get("koopman", {})
-    observed_targets = [
-        str(item.get("sensor_node_id") or item.get("suspected_target_id") or "цель")
-        for item in attacks.get("precursors", [])
-    ]
-    forecast_targets = [str(node) for node in koopman.get("forecast_target_ids", [])]
-    precursor_targets = ", ".join(dict.fromkeys(observed_targets or forecast_targets)) or "не локализована"
-    kind_labels = {
-        "dos": "DoS",
-        "ddos": "DDoS",
-        "syn_flood": "SYN-флуд",
-        "power_attack": "деградация питания",
-    }
-    raw_kinds = str(koopman.get("forecast_next_attack_kind", "")).split("+")
-    predicted_kind = " + ".join(kind_labels.get(kind, "аномальное воздействие") for kind in raw_kinds)
-    precursor_names = f"{predicted_kind} → область {precursor_targets}"
-    forecast_window = (
-        f"{koopman.get('forecast_window_start_seconds', '—')}…"
-        f"{koopman.get('forecast_window_end_seconds', '—')} с"
-    )
-    warning_note = (
-        "\n\nПОДТВЕРЖДЁННЫЙ РАННИЙ ПРОГНОЗ КУПМАНА\n"
-        f"Окно прогноза: {forecast_window} · максимум "
-        f"{koopman.get('maximum_forecast_horizon_seconds', 0)} с\n"
-        f"Целевой запас на решение: не менее {koopman.get('prediction_slo_seconds', 0)} с\n"
-        f"Оценка риска (не вероятность): {koopman.get('forecast_risk_score', 0.0) * 100:.1f}%\n"
-        f"Ожидается: {precursor_names}\n"
-        "Защита подготовлена; приоритет: золотой → серебряный → бронзовый"
-        if koopman.get("forecast_is_early_warning")
-        else ""
-    )
-    routing = attacks.get("routing", {})
-    by_sla = routing.get("by_sla", {})
-    slo_tiers = {
-        str(tier.get("sla_grade", "")): tier
-        for tier in attacks.get("sla_restoration", {}).get("tiers", [])
-    }
-    route_hausdorff = routing.get("gold_route_hausdorff") or koopman.get("route_hausdorff", {})
-    state_hausdorff = snapshot.get("arbitrator", {}).get("analysis", {}).get("state_hausdorff", {})
-    restoration_values = [
-        by_sla.get(grade, {}).get("restoration_ratio", 1.0) * 100.0
-        for grade in ("gold", "silver", "bronze")
-    ]
-    slo_compliance_values: list[float] = []
-    slo_coverage_values: list[float] = []
-    for grade in ("gold", "silver", "bronze"):
-        tier = slo_tiers.get(grade, {})
-        flow_count = int(tier.get("flow_count", 0))
-        slo_compliance_values.append(
-            100.0
-            if flow_count <= 0
-            else float(tier.get("sla_compliant_flow_count", 0)) / flow_count * 100.0
-        )
-        slo_coverage_values.append(
-            float(tier.get("mean_slo_assessment_coverage_ratio", 1.0)) * 100.0
-        )
-    slo_note = (
-        "\n\nТРЕБОВАНИЯ К КАЧЕСТВУ УСЛУГ"
-        f"\nСоблюдены, золотой/серебряный/бронзовый: "
-        f"{slo_compliance_values[0]:.1f}% / {slo_compliance_values[1]:.1f}% / "
-        f"{slo_compliance_values[2]:.1f}%"
-        f"\nОхват измеряемых метрик: {slo_coverage_values[0]:.1f}% / "
-        f"{slo_coverage_values[1]:.1f}% / {slo_coverage_values[2]:.1f}%"
-    )
-    routing_note = (
-        "\n\nУПРАВЛЯЕМАЯ КОНФИГУРАЦИЯ\n"
-        f"Переназначено: {routing.get('rerouted_flow_count', 0)} · "
-        f"резерв: {routing.get('failover_flow_count', 0)} · "
-        f"изолировано: {routing.get('isolated_flow_count', 0)}\n"
-        f"Доступность золотой/серебряный/бронзовый: "
-        f"{by_sla.get('gold', {}).get('availability_ratio', 1.0) * 100:.1f}% / "
-        f"{by_sla.get('silver', {}).get('availability_ratio', 1.0) * 100:.1f}% / "
-        f"{by_sla.get('bronze', {}).get('availability_ratio', 1.0) * 100:.1f}%\n"
-        f"Восстановлено среди затронутых: "
-        f"{restoration_values[0]:.1f}% / {restoration_values[1]:.1f}% / {restoration_values[2]:.1f}%\n"
-        f"Макс. ресурс после переназначения: "
-        f"{routing.get('maximum_projected_utilization_percent', 0.0):.2f}% (предел 80%)\n"
-        f"  сеть — канал {routing.get('maximum_projected_edge_utilization_percent', 0.0):.2f}%, "
-        f"узел {routing.get('maximum_projected_node_utilization_percent', 0.0):.2f}%\n"
-        f"  сервер — ЦП {routing.get('maximum_projected_server_cpu_utilization_percent', 0.0):.2f}%, "
-        f"ОЗУ {routing.get('maximum_projected_server_ram_utilization_percent', 0.0):.2f}%, "
-        f"сеансы {routing.get('maximum_projected_server_session_utilization_percent', 0.0):.2f}%\n"
-        f"Отклонено кандидатов: сеть {routing.get('network_capacity_rejected_candidate_count', 0)}, "
-        f"сервер {routing.get('server_resource_rejected_candidate_count', 0)}\n"
-        f"Хаусдорф маршрутов золотого класса: {route_hausdorff.get('normalized_distance', 0.0):.3f}\n"
-        f"Хаусдорф состояния относительно t0 (больше = хуже): {state_hausdorff.get('normalized_distance', 0.0):.3f}\n"
-        f"Ляпунов: V={koopman.get('lyapunov_value', 0.0):.4f} · "
-        f"dV/dt={koopman.get('lyapunov_derivative_per_second', 0.0):+.4f} 1/с"
-        if routing.get("plan_active") or routing.get("rerouted_flow_count") or routing.get("isolated_flow_count")
-        else ""
-    )
-    defense = attacks.get("preventive_defense", {})
-    defense_note = (
-        f"\nПредотвращено: {attacks.get('blocked_attack_rate_mbps', 0.0):,.1f} Мбит/с вредоносного трафика"
-        f"; {attacks.get('prevented_legitimate_dropped_packets', 0):,} потерь пакетов"
-        if defense.get("effective")
-        else ""
-    )
-    packet_attack_active = any(
-        str(event.get("kind")) != "power_attack"
-        for event in attacks.get("events", [])
-    )
-    attack_rate_note = (
-        f"Вредоносная скорость: {attacks.get('attack_rate_mbps', 0.0):,.1f} Мбит/с "
-        f"из {attacks.get('raw_attack_rate_mbps', 0.0):,.1f} Мбит/с до защиты\n"
-        if packet_attack_active
-        else "Вредоносный канальный поток отсутствует: воздействие идёт через управление питанием\n"
-    )
-    attack_note = (
-        f"\n\nАТАКА АКТИВНА: {attack_names}\n"
-        f"{_active_attack_details(attacks.get('events', []))}"
-        f"{attack_rate_note}"
-        f"Потери легитимных пакетов: {attacks.get('legitimate_loss_ratio', 0.0) * 100:.2f}%\n"
-        f"Затронуто потоков золотого класса: {attacks.get('impacted_gold_flow_count', 0)}{defense_note}"
-        if attacks.get("active") else "\n\nАтаки: нет"
-    )
-    power_runtime_note = _power_runtime_summary(attacks.get("power_runtime_state", []))
-    return (
-        f"ШАГ {snapshot.get('step_index', 0)} · t = {snapshot.get('time_seconds', 0)} с\n"
-        f"{mode}{t0_note}\n\n{_flow_summary(flows)}\n"
-        f"Используемых связей: {len(loads)} из {model.graph.number_of_edges()}\n"
-        f"  абонент → коммутатор A: {breakdown['access']}\n"
-        f"  коммутатор A → маршрутизатор C: {breakdown['uplink']}\n"
-        f"  маршрутизатор C → маршрутизатор C: {breakdown['core']}\n"
-        f"  маршрутизатор C → сервер: {breakdown['service']}\n"
-        f"Средняя задержка: {np.mean(latencies) if latencies else 0.0:.2f} мс\n"
-        f"Макс. задержка: {max(latencies, default=0.0):.2f} мс\n\n"
-        f"Самая нагруженная связь:\n{edge_name}\n"
-        f"{busiest[1]['wire_bytes'] / 1_000_000:.1f} МБ за шаг\n\n"
-        f"Решение защиты: {ACTION_DISPLAY_NAMES.get(remap, remap)}{slo_note}{warning_note}{routing_note}{attack_note}{power_runtime_note}"
-    )
-
-
-def _active_attack_details(events: list[dict[str, Any]]) -> str:
-    """Кратко показать физический смысл активного воздействия."""
-    lines: list[str] = []
-    kind_labels = {
-        "dos": "DoS",
-        "ddos": "DDoS",
-        "syn_flood": "SYN-флуд",
-        "power_attack": "деградация питания",
-    }
-    for event in events[:3]:
-        technical = event.get("technical", {})
-        ingress = event.get("ingress_nodes", [])
-        sources = ", ".join(str(node) for node in ingress[:3])
-        if len(ingress) > 3:
-            sources += f" и ещё {len(ingress) - 3}"
-        protocol = str(technical.get("protocol", "—"))
-        source_text = sources or "канал управления"
-        lines.append(
-            f"• {kind_labels.get(str(event.get('kind')), 'атака')}: "
-            f"{source_text} → {event.get('target_id', '—')} · {protocol}"
-        )
-        offered_rate = float(event.get("effective_offered_rate_mbps", 0.0) or 0.0)
-        packet_rate = int(event.get("effective_packet_rate_pps", 0) or 0)
-        packet_size = int(
-            technical.get("on_wire_size_bytes")
-            or technical.get("packet_size_bytes", 0)
-            or 0
-        )
-        if offered_rate > 0.0 or packet_rate > 0:
-            lines.append(
-                f"  {offered_rate:,.1f} Мбит/с · {packet_rate / 1000:,.1f} тыс. пакетов/с"
-                + (f" · на линии {packet_size} байт/пакет" if packet_size else "")
-            )
-            lines.append(
-                f"  входная ёмкость {float(event.get('convergence_capacity_mbps', 0.0)):,.1f} Мбит/с · "
-                f"полоса {float(event.get('peak_bandwidth_load_ratio', 0.0)) * float(event.get('intensity_ratio', 1.0)) * 100:.1f}% · "
-                f"ресурс цели {float(event.get('peak_target_processing_load_ratio', 0.0)) * float(event.get('intensity_ratio', 1.0)) * 100:.1f}%"
-            )
-        runtime = event.get("power_runtime", {})
-        if str(event.get("kind")) == "power_attack" and runtime:
-            mode_label = {
-                "brownout_feed_loss": "просадка входа, нагрузку удерживает ИБП",
-                "cyber_shutdown": "команда выключения через контур управления",
-            }.get(str(event.get("power_failure_mode")), "событие электропитания")
-            phase_label = {
-                "ups_ride_through": "работа от батареи без перерыва сервиса",
-                "cyber_shutdown": "сервис выключен",
-                "battery_recharge": "заряд батареи восстанавливается",
-                "rebooting": "загрузка устройства",
-                "health_check": "проверка готовности",
-                "recovered": "восстановлено",
-            }.get(str(runtime.get("phase")), str(runtime.get("phase", "—")))
-            lines.append(f"  режим: {mode_label}; состояние: {phase_label}")
-            lines.append(
-                f"  вход ИБП {float(runtime.get('input_voltage_ratio', 1.0)) * 100:.1f}% · "
-                f"выход {float(runtime.get('power_output_availability_ratio', 1.0)) * 100:.1f}% · "
-                f"сервис {float(runtime.get('service_availability_ratio', 1.0)) * 100:.1f}% · "
-                f"энергорезерв {float(runtime.get('energy_reserve_ratio', 1.0)) * 100:.1f}%"
-            )
-        reflector_count = int(technical.get("external_reflector_count", 0) or 0)
-        if reflector_count:
-            lines.append(
-                f"  инициаторов L1: {int(technical.get('initiator_count', len(ingress)) or len(ingress))} · "
-                f"внешних отражателей в профиле: {reflector_count:,} · "
-                f"усиление ×{float(technical.get('amplification_factor', 1.0)):.1f}"
-            )
-        process = event.get("arrival_process", {})
-        realization = event.get("arrival_realization", {})
-        if str(process.get("distribution", "")).lower() == "weibull":
-            lines.append(
-                f"  Вейбулл: k={float(process.get('shape') or 0.0):.2f}, "
-                f"λ={float(process.get('scale_seconds') or 0.0):.1f} с, "
-                f"независимая выборка {float(realization.get('sampled_interarrival_seconds') or 0.0):.1f} с, "
-                f"кадрированный интервал {float(realization.get('elapsed_interarrival_seconds') or 0.0):.1f} с"
-            )
-    return "\n".join(lines) + ("\n" if lines else "")
-
-
-def _power_runtime_summary(records: list[dict[str, Any]]) -> str:
-    """Показать продолжающееся восстановление даже после окончания импульса."""
-    if not records:
-        return ""
-    phase_labels = {
-        "ups_ride_through": "ИБП удерживает нагрузку",
-        "cyber_shutdown": "сервис выключен",
-        "battery_recharge": "заряд ИБП восстанавливается",
-        "rebooting": "устройство загружается",
-        "health_check": "проверяется готовность",
-        "recovered": "работа восстановлена",
-    }
-    lines = ["\n\nЭЛЕКТРОПИТАНИЕ И ВОССТАНОВЛЕНИЕ"]
-    for runtime in records[:4]:
-        phase = phase_labels.get(str(runtime.get("phase")), str(runtime.get("phase", "—")))
-        lines.append(
-            f"{runtime.get('target_id', '—')}: {phase} · сервис "
-            f"{float(runtime.get('service_availability_ratio', 1.0)) * 100:.1f}% · "
-            f"энергорезерв {float(runtime.get('energy_reserve_ratio', 1.0)) * 100:.1f}%"
-        )
-    if len(records) > 4:
-        lines.append(f"… и ещё {len(records) - 4}")
-    return "\n".join(lines)
-
-
-def _active_link_breakdown(model, loads) -> dict[str, int]:
-    counts = {"access": 0, "uplink": 0, "core": 0, "service": 0, "other": 0}
-    for edge in loads:
-        nodes = tuple(edge)
-        attrs = [model.graph.nodes[node] for node in nodes]
-        levels = {item.get("level") for item in attrs}
-        roles = {item.get("role") for item in attrs}
-        if "L1" in levels:
-            counts["access"] += 1
-        elif roles & {"radio-access-node", "optical-line-terminal"}:
-            counts["access"] += 1
-        elif roles == {"aggregation-switch", "core-router"}:
-            counts["uplink"] += 1
-        elif roles == {"core-router"}:
-            counts["core"] += 1
-        elif "L0" in levels:
-            counts["service"] += 1
-        else:
-            counts["other"] += 1
-    return counts
-
-
-def _node_hover_text(model, node_id: str) -> str:
-    attrs = model.graph.nodes[node_id]
-    role = attrs.get("role")
-    if role in {"core-router", "aggregation-switch", "radio-access-node", "optical-line-terminal"}:
-        return _equipment_hover_text(model, node_id, attrs)
-    if role == "service-server":
-        profile = attrs.get("server_profile", {})
-        runtime = attrs.get("runtime", {})
-        power = attrs.get("power_architecture", {})
-        return (
-            f"{node_id} · Физический сервер L0\n"
-            f"IP: {attrs.get('ip_address')} · MAC: {attrs.get('mac_address')}\n"
-            f"Модель: {profile.get('model')}\n"
-            f"ЦП: {profile.get('cpu')} · {profile.get('total_cores')} физических ядер · "
-            f"{profile.get('threads_total', 0)} потоков\n"
-            f"ОЗУ: {profile.get('ram_gb')} ГБ · хранилище: {profile.get('storage_tb')} ТБ\n"
-            f"Выбранные сетевые порты: {profile.get('network_ports_gbps')} Гбит/с\n"
-            f"Питание: {power.get('feed_count', 0)} ввода · "
-            f"{_power_redundancy_label(power.get('psu_redundancy'))}\n"
-            f"БП: {power.get('psu_count', 0)} × {power.get('psu_rating_w_each', 0)} Вт · "
-            f"{power.get('psu_efficiency_class', '—')} [Dell; номинал БП, не потребление]\n"
-            f"T0: {float(power.get('modeled_t0_power_w') or 0.0):.0f} Вт [сценарий] · "
-            f"ИБП {float(power.get('ups_backup_autonomy_hours') or 0.0):.2f} ч [сценарий]\n"
-            f"Локальный домен отказа: {power.get('local_fault_domain_id', '—')}\n"
-            f"Сервисы: {', '.join(attrs.get('hosted_services', []))}\n"
-            f"Резервные реплики: {', '.join(attrs.get('standby_services', [])) or 'нет'}\n"
-            f"Базовая нагрузка T0: ЦП {runtime.get('cpu_util_percent', 0):.1f}%, "
-            f"ОЗУ {runtime.get('ram_util_percent', 0):.1f}%, сеть {runtime.get('network_util_percent', 0):.1f}%\n"
-            f"Диски {runtime.get('storage_util_percent', 0):.1f}%, "
-            f"температура {runtime.get('temperature_c', 0):.1f} °C, сеансов {runtime.get('active_sessions', 0)}"
-            f"{_protection_hover(attrs)}"
-        )
-    if attrs.get("level") == "L1":
-        kind = "Мобильный абонент" if role == "mobile-subscriber" else "Фиксированный абонент"
-        return (
-            f"{node_id} · {kind}\n"
-            f"IP: {attrs.get('ip_address')} · MAC: {attrs.get('mac_address')}\n"
-            f"Логическая точка агрегации: {attrs.get('home_access')}\n"
-            "Линия доступа: одна; резервной линии абонента нет\n"
-            f"Профиль доступа: {attrs.get('access_profile', '—')}\n"
-            f"Доступ: {attrs.get('access_capacity_mbps', 0):.0f} Мбит/с · "
-            f"базовая задержка {attrs.get('access_latency_ms', 0):.1f} мс\n"
-            f"Класс SLA: {SLA_LABELS.get(attrs.get('sla_grade'), attrs.get('sla_grade'))}\n"
-            f"Приложение: {TRAFFIC_LABELS.get(attrs.get('traffic_kind'), attrs.get('traffic_kind'))}\n"
-            f"Кодек/профиль: {attrs.get('codec_profile_name') or attrs.get('codec')}\n"
-            f"Целевая скорость: {attrs.get('target_bitrate_kbps', 0):.0f} кбит/с"
-            f"{_protection_hover(attrs)}"
-        )
-    if attrs.get("level") == "L0":
-        service_name = SERVICE_DISPLAY_NAMES.get(attrs.get("label"), attrs.get("label"))
-        service_profile = attrs.get("service_profile", {})
-        primary_metrics = ", ".join(
-            SLO_METRIC_LABELS.get(metric, metric)
-            for metric in service_profile.get("primary_slo_metrics", ())
-        ) or "—"
-        limitations = ", ".join(
-            MODEL_LIMITATION_LABELS.get(limitation, limitation)
-            for limitation in service_profile.get("modeling_limitations", ())
-        ) or "нет"
-        return (
-            f"{node_id} · Логический сервис L0\nНазначение: {service_name}\n"
-            f"Виртуальный IP (VIP): {attrs.get('ip_address')} · MAC: {attrs.get('mac_address')}\n"
-            f"Платформа: {attrs.get('platform')}\nОсновной сервер: {attrs.get('hosted_on')}\n"
-            f"Резервный сервер: {', '.join(attrs.get('standby_hosts', [])) or 'нет'}\n"
-            f"Профиль: {attrs.get('codec_profile_name')}\n"
-            f"Аудиокодек: {attrs.get('audio_codec') or '—'} · Видеокодек: {attrs.get('video_codec') or '—'}\n"
-            f"Основные показатели качества: {primary_metrics}\n"
-            f"Ограничения модели: {limitations}"
-        )
-    if role == "arbitrator":
-        return "АРБ · Арбитратор L7\nНаблюдает метрики всех уровней\nПринимает решение о переназначении"
-    if attrs.get("level") == "L8":
-        x, y = attrs.get("pos", ("—", "—"))
-        return (
-            f"{node_id} · Опорная точка местности L8\n"
-            f"Координаты модели: x={x}, y={y}\n"
-            "Используется как географическая основа размещения;\n"
-            "не является транзитным сетевым устройством"
-        )
-    return f"{node_id}\nРоль: {role}\nУровень: {attrs.get('level')}"
-
-
-def _equipment_hover_text(model, node_id: str, attrs: dict[str, Any]) -> str:
-    role = attrs.get("role")
-    device_name = {
-        "core-router": "Маршрутизатор ядра",
-        "aggregation-switch": "Агрегирующий коммутатор",
-        "radio-access-node": "узел радиодоступа",
-        "optical-line-terminal": "узел оптического доступа",
-    }.get(role, "сетевое оборудование")
-    raw = attrs.get("l2_raw_baseline", {})
-    profile = attrs.get("l2_profile", {})
-    neighbors = list(model.graph.neighbors(node_id))
-    clients = [
-        node for node in neighbors
-        if model.graph.nodes[node].get("level") == "L1"
-        and model.graph.nodes[node].get("home_access") == node_id
-    ]
-    if role == "aggregation-switch":
-        access_neighbors = [
-            node for node in neighbors
-            if model.graph.nodes[node].get("role") in {"radio-access-node", "optical-line-terminal"}
-        ]
-        clients = [
-            node for node, client_attrs in model.graph.nodes(data=True)
-            if client_attrs.get("level") == "L1"
-            and client_attrs.get("home_access") in access_neighbors
-        ]
-    uplinks = [node for node in neighbors if model.graph.nodes[node].get("level") in {"L0", "L2"}]
-    verified = set(profile.get("verified_fields", ()))
-    dram_origin = "Cisco" if "dram_gb" in verified else "модель"
-    forwarding_origin = "Cisco" if "forwarding_mpps" in verified else "модель"
-    throughput_origin = "Cisco" if "throughput_gbps" in verified else "модель"
-    port_origin = "Cisco" if str(profile.get("vendor")) == "Cisco" else "модель"
-    power = attrs.get("power_architecture", {})
-    if power.get("vendor_typical_output_power_w") is not None:
-        vendor_power_text = (
-            f"{float(power['vendor_typical_output_power_w']):.0f} Вт типично / "
-            f"{float(power.get('vendor_max_output_power_w') or 0.0):.0f} Вт максимум "
-            "выходной мощности [Cisco]"
-        )
-    else:
-        vendor_power_text = (
-            "типичное потребление не опубликовано; "
-            f"{float(power.get('vendor_thermal_output_btu_per_hour') or 0.0):.0f} BTU/ч "
-            f"≈ {float(power.get('vendor_thermal_output_equivalent_w') or 0.0):.0f} Вт "
-            "теплового верхнего предела [Cisco]"
-        )
-    if (
-        power.get("vendor_typical_output_power_w") is None
-        and power.get("vendor_thermal_output_equivalent_w") is None
-    ):
-        vendor_power_text = "GNet9 scenario power envelope [not vendor spec]"
-    return (
-        f"{node_id} · {device_name}\n"
-        f"IP: {attrs.get('ip_address')} · MAC: {attrs.get('mac_address')}\n"
-        f"Платформа: {attrs.get('platform_family')}\n"
-        f"Профиль: {attrs.get('platform_profile')}\n"
-        f"Базовая загрузка ЦП: {raw.get('cpu_util', 0):.1f}% [модель]\n"
-        f"Базовая загрузка ОЗУ: {raw.get('ram_util', 0):.1f} / {profile.get('dram_gb', 0):.1f} ГБ [{dram_origin}]\n"
-        f"Системная пропускная способность: {profile.get('throughput_gbps', 0):,.0f} Гбит/с [{throughput_origin}]\n"
-        f"Скорость пересылки: {profile.get('forwarding_mpps', 0):,.0f} млн пакетов/с [{forwarding_origin}]\n"
-        f"Порты: {profile.get('port_configuration', '—')} [{port_origin}]\n"
-        f"Логических соседей графа: {len(neighbors)}"
-        + (f" · клиентов: {len(clients)}" if clients else "")
-        + f"\nТранзитная степень: {attrs.get('infrastructure_degree', '—')} (предел ≤ 6)"
-        + f"\nФизических портов ≥40G занято: {attrs.get('physical_high_speed_ports_used', '—')}"
-        + f"\nL1-привязки абстрагируют RAN/PON и не расходуют по одному порту C9500"
-        + f"\nПитание: {power.get('feed_count', 0)} ввода · "
-        + _power_redundancy_label(power.get("psu_redundancy"))
-        + f"\nМощность: {vendor_power_text}"
-        + f"\nT0: {float(power.get('modeled_t0_power_w') or 0.0):.0f} Вт · "
-        + f"ИБП {float(power.get('ups_backup_autonomy_hours') or 0.0):.1f} ч [сценарий]"
-        + f"\nСвязи: {', '.join(uplinks)}"
-        + _protection_hover(attrs)
-    )
-
-
-def _protection_hover(attrs: dict[str, Any]) -> str:
-    protection = attrs.get("critical_protection", {})
-    if not protection.get("is_critical"):
-        return ""
-    return (
-        "\nКРИТИЧЕСКИЙ УЗЕЛ ЗОЛОТОГО КЛАССА · приоритет защиты 1"
-        f"\nПотоков золотого класса через узел: {protection.get('gold_transit_flow_count', 0)}"
-        f" · резервных: {protection.get('gold_recovery_reserve_flow_count', 0)}"
-        f" · КВУ: {protection.get('critical_involvement_coefficient', 0.0):.3f}"
-        + (
-            f"\nИерархия КВУ: {protection.get('kvu_tier')} · место {protection.get('kvu_rank')}"
-            f" · абонентов золотого класса в пути: {protection.get('gold_subscriber_count', 0)}"
-            f" (на доступе: {protection.get('direct_gold_subscriber_count', 0)})"
-            if protection.get("kvu_rank") is not None
-            else ""
-        )
-        + f"\nПредел загрузки при переназначении: {protection.get('maximum_safe_utilization_percent', 80.0):.0f}%"
-    )
-
-
-def _power_redundancy_label(value: Any) -> str:
-    return {
-        "1+1 hot-swappable": "1+1, горячая замена",
-        "1+1 hot-plug": "1+1, горячее подключение",
-    }.get(str(value), str(value or "—"))
 
 
 def _spread_sample(flows: list[dict[str, Any]], limit: int, frame: int) -> list[dict[str, Any]]:

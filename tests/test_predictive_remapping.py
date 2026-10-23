@@ -13,6 +13,7 @@ from src.gnet9.attacks import (
     observe_attack_precursors,
     predictive_demo_minimum_steps,
     predictive_demo_weibull_schedule,
+    predictive_demo_mixed_schedule,
 )
 from src.gnet9.constants import SUBSCRIBER_COUNT
 from src.gnet9.dynamics import DynamicsConfig, simulate_stationary_dynamics
@@ -74,21 +75,19 @@ def test_predictive_catalog_is_weighted_reproducible_and_uses_l1_sources() -> No
     assert first == second
     # Вейбулловский renewal-процесс имеет переменное число приходов в конечном
     # окне. Для seed=42 первые четыре позиции специально покрывают все виды.
-    assert 1 <= len(first) <= 8
+    assert 1 <= len(first) <= 9
     assert Counter(item["kind"] for item in first) == {
-        "dos": 1,
-        "ddos": 1,
-        "syn_flood": 1,
-        "power_attack": 1,
+        "dos": 1, "ddos": 2, "syn_flood": 2, "power_attack": 1, "brute_force": 1,
     }
     assert {item["scenario_weight_origin"] for item in first} == {"scenario_assumption"}
-    assert sum(item["scenario_weight"] for item in first) == 1.0
+    assert sum(item["scenario_weight"] for item in first) == pytest.approx(1.0)
     assert {item["scenario_weight_semantics"] for item in first} == {"realized_event_mass"}
     assert {item["kind"]: item["kind_weight"] for item in first} == {
-        "dos": 3 / 8,
-        "ddos": 2 / 8,
-        "syn_flood": 2 / 8,
-        "power_attack": 1 / 8,
+        "dos": 3 / 9,
+        "ddos": 2 / 9,
+        "syn_flood": 2 / 9,
+        "power_attack": 1 / 9,
+        "brute_force": 1 / 9,
     }
     assert all(
         MODEL.graph.nodes[source]["level"] == "L1"
@@ -112,6 +111,7 @@ def test_predictive_catalog_is_weighted_reproducible_and_uses_l1_sources() -> No
         "ddos": "T1498.002",
         "syn_flood": "T1499.001",
         "power_attack": "T0831",
+        "brute_force": "T1110.001",
     }
     assert all(item["mitre_technique_id"] == expected_mitre[item["kind"]] for item in first)
     power = next(item for item in first if item["kind"] == "power_attack")
@@ -173,9 +173,10 @@ def test_weibull_renewal_schedule_is_reproducible_bounded_and_exported() -> None
     assert all(0.0 < value < 1.0 for value in first.realized_survival_probability)
 
     catalog = attack_catalog(MODEL, "predictive-demo", seed=42, step_seconds=2, step_count=60)
-    assert tuple(item["temporal"]["start_step"] for item in catalog) == first.realized_start_steps
-    assert all(item["arrival_schedule"]["shape"] == first.shape for item in catalog)
-    assert tuple(item["arrival_interval_seconds"] for item in catalog) == first.realized_interarrival_seconds
+    mixed = predictive_demo_mixed_schedule(seed=42, step_seconds=2, step_count=60)
+    assert tuple(item["temporal"]["start_step"] for item in catalog) == mixed.realized_start_steps
+    assert tuple(item["arrival_shape"] for item in catalog) == mixed.event_shapes
+    assert tuple(item["arrival_interval_seconds"] for item in catalog) == mixed.realized_interarrival_seconds
 
 
 def test_weibull_schedule_respects_arbitrary_positive_step_duration() -> None:

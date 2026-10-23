@@ -434,8 +434,8 @@ def build_state_vector(
         _tier_compliance_ratio(sla_tiers, "bronze"),
     ]
     return {
-        "metric_names": metric_names + observed_names,
-        "vector": vector + observed_vector,
+        "metric_names": metric_names + observed_names + ["OBS.normal_arrival_rate_pps"],
+        "vector": vector + observed_vector + [float(traffic.get("normal_arrival_rate_pps", 0.0))],
     }
 
 

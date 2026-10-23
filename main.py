@@ -3,6 +3,7 @@
 import argparse
 import csv
 import json
+import math
 import shutil
 from dataclasses import asdict
 from pathlib import Path
@@ -12,6 +13,7 @@ from src.gnet9.address_visualizer import draw_ip_address_map, export_ip_address_
 from src.gnet9.attacks import (
     PREDICTIVE_DEMO_DEFAULT_SEED,
     PREDICTIVE_DEMO_STEP_COUNT,
+    PREDICTIVE_DEMO_FIRST_ATTACK_STEP,
     PREDICTIVE_DEMO_STEP_SECONDS,
     attack_catalog,
     mitre_tensor_mapping_catalog,
@@ -29,6 +31,8 @@ from src.gnet9.flow_visualizer import (
     show_visualization_windows,
 )
 from src.gnet9.service_catalog import CODEC_CATALOG
+from src.gnet9.runtime_metrics import compact_runtime_state
+from src.gnet9.kalman import DEFAULT_PROCESS_VARIANCE, DEFAULT_MEASUREMENT_VARIANCE
 from src.gnet9.standards_audit import build_standards_and_equipment_audit
 from src.gnet9.telemetry_validation import (
     TelemetryValidationConfig,
@@ -264,6 +268,8 @@ def _dynamics_export_view(dynamics: dict[str, Any], packet_detail: str) -> dict[
             if packet_detail == "summary":
                 traffic.pop("flows", None)
                 traffic.pop("packet_sample", None)
+                if isinstance(traffic.get("network_state"), dict):
+                    traffic["network_state"] = compact_runtime_state(traffic["network_state"])
             elif packet_detail == "flows":
                 traffic.pop("packet_sample", None)
             snapshot["traffic"] = traffic
@@ -290,8 +296,10 @@ def export_stationary_dynamics(
 
 def export_step_log(dynamics: dict[str, Any], path: Path) -> None:
     """Записать короткий журнал с одной строкой на шаг."""
-    columns = ["шаг", "время_с", "фаза", "обучающих_переходов", "модель_обновлена", "Хаусдорф", "риск_Купмана", "рост_Ляпунова_в_секунду", "тип_угрозы", "решение", "причина", "изменённых_маршрутов"]
+    columns = ["шаг", "время_с", "фаза", "обучающих_переходов", "модель_обновлена", "Хаусдорф", "риск_Купмана", "рост_Ляпунова_в_секунду", "тип_угрозы", "решение", "причина", "изменённых_маршрутов", "обычный_трафик_пакетов_с", "атаки_пакетов_с", "отклонение_до_фильтра", "отклонение_после_фильтра", "соблюдение_SLA"]
     phases = {"reference": "эталон", "nominal_training": "обучение на исправной сети", "observation_and_protection": "наблюдение и защита"}
+    sla_by_step = {point["step_index"]: point["score"]
+                   for point in dynamics.get("sla_resilience", {}).get("points", [])}
     with path.open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow(columns)
@@ -299,6 +307,11 @@ def export_step_log(dynamics: dict[str, Any], path: Path) -> None:
             training = snapshot["training"]
             card = snapshot["arbitrator"]["trigger_card"]
             koopman = snapshot["koopman"]
+            traffic_summary = snapshot.get("traffic", {}).get("summary", {})
+            kalman = koopman.get("kalman_filter", {})
+            raw = kalman.get("raw_normalized_vector", [])
+            filtered = kalman.get("filtered_normalized_vector", [])
+            sla = sla_by_step.get(snapshot["step_index"], "")
             writer.writerow([
                 snapshot["step_index"], snapshot["time_seconds"], phases[training["phase"]],
                 training["nominal_transitions"], "да" if training["operator_updated"] else "нет",
@@ -306,6 +319,9 @@ def export_step_log(dynamics: dict[str, Any], path: Path) -> None:
                 koopman["lyapunov_derivative_per_second"], "; ".join(ATTACK_KIND_DISPLAY_NAMES.get(kind, "неопределённая угроза") for kind in card["attack_kind"].split("+")),
                 RESPONSE_STAGE_DISPLAY_NAMES[card["response_stage"]], card["reason_ru"],
                 snapshot.get("attacks", {}).get("routing", {}).get("rerouted_flow_count", 0),
+                traffic_summary.get("normal_arrival_rate_pps", 0), traffic_summary.get("attack_arrival_rate_pps", 0),
+                (sum(v*v for v in raw) / max(len(raw), 1)) ** 0.5,
+                (sum(v*v for v in filtered) / max(len(filtered), 1)) ** 0.5, sla,
             ])
 
 
@@ -359,8 +375,28 @@ def _simulation_timing(args: argparse.Namespace) -> tuple[int, int]:
     return step_count, step_seconds
 
 
+def _non_negative_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("нужно конечное число ≥ 0")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = _non_negative_float(value)
+    if parsed == 0:
+        raise argparse.ArgumentTypeError("нужно конечное число > 0")
+    return parsed
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Построить модель сети GNet9 и сохранить результаты.")
+    parser.add_argument("--kalman-process-variance", type=_non_negative_float,
+        default=DEFAULT_PROCESS_VARIANCE,
+        help="Q: дисперсия изменения нормированного состояния за шаг (по умолчанию 0.0001).")
+    parser.add_argument("--kalman-measurement-variance", type=_positive_float,
+        default=DEFAULT_MEASUREMENT_VARIANCE,
+        help="R: дисперсия шума нормированного измерения (по умолчанию 0.0025).")
     parser.add_argument(
         "--dynamics-steps",
         type=_non_negative_int,
@@ -514,10 +550,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
     if args.attack_scenario == "predictive-demo" and args.attack_start_step is None:
-        # Для обычной демонстрации оставляем 29 чистых переходов при такте 2 с.
+        # Для обычной демонстрации оставляем 59 чистых переходов при такте 2 с.
         # Короткие явно заданные серии сохраняют исходное расписание.
         if args.dynamics_steps is None:
-            args.attack_start_step = 40
+            args.attack_start_step = PREDICTIVE_DEMO_FIRST_ATTACK_STEP
     if args.attack_start_step is not None or args.attack_interval_steps is not None:
         count, period = _simulation_timing(args)
         precursor = predictive_demo_minimum_steps(period) - 5 if args.attack_scenario == "predictive-demo" else 1
@@ -628,6 +664,8 @@ def main() -> None:
         attack_start_step=args.attack_start_step,
         attack_interval_steps=args.attack_interval_steps,
         prediction_slo_seconds=args.prediction_slo_seconds,
+        kalman_process_variance=args.kalman_process_variance,
+        kalman_measurement_variance=args.kalman_measurement_variance,
         warning_risk_threshold=(
             calibration_profile["warning_risk_threshold"]
             if calibration_profile else None
