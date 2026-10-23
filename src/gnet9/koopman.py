@@ -16,11 +16,13 @@ from typing import Any
 
 import numpy as np
 
+from .kalman import DiagonalKalmanFilter, DEFAULT_PROCESS_VARIANCE, DEFAULT_MEASUREMENT_VARIANCE
+from .local_observation import LocalObservationFilter, is_smoothable_metric
 from .attacks import MITRE_T1110_001_ATTEMPTS_PER_SECOND
 from .arbitrator import build_trigger_card, evaluate_defense_game
 from .metrics import gold_threat_proximity_view
 from .sdn_controller import compile_sdn_intent
-from .tensor_matrix import TensorKroneckerKoopman, TensorMatrixView
+from .tensor_matrix import TensorKroneckerKoopman, TensorMatrixView, TensorLevelMatrix
 
 
 THREAT_METRICS = {
@@ -78,6 +80,31 @@ KOOPMAN_TREND_WINDOW_SECONDS = 12
 # создаёт тревогу: дополнительно нужны распознанный класс, локализованный
 # сенсор и два последовательных причинных отсчёта.
 KOOPMAN_WARNING_RISK_THRESHOLD = 0.30
+NOMINAL_THREAT_SCORE_LIMIT = 0.10
+
+
+def _healthy_quality_observation(metric_names, vector, attack_state) -> bool:
+    """Даже слабое нарушение SLA/потери исключают наблюдение из нормы.
+
+    Проверяются исходные значения, до фильтра и прогноза. Отсутствующий
+    показатель не заменяется выдуманным измерением. Допуск 1e-9 относится
+    только к погрешности представления долей, а не к допустимому ущербу.
+    """
+    full_ratios = {"OBS.gold_sla_compliance_ratio", "OBS.legitimate_delivery_ratio",
+                   "OBS.gold_delivery_ratio", "OBS.silver_delivery_ratio", "OBS.bronze_delivery_ratio"}
+    zero_counts = {"OBS.legitimate_loss_ratio", "OBS.impacted_gold_flow_count",
+                   "OBS.isolated_flow_count", "OBS.rerouted_gold_flow_count",
+                   "OBS.rerouted_silver_flow_count", "OBS.rerouted_bronze_flow_count",
+                   "OBS.service_failover_count", "OBS.route_change_ratio"}
+    for name, value in zip(metric_names, vector):
+        if name in full_ratios and value < 1.0 - 1e-9:
+            return False
+        if name in zero_counts and abs(value) > 1e-9:
+            return False
+    for tier in attack_state.get("sla_restoration", {}).get("tiers", []):
+        if int(tier.get("sla_compliant_flow_count", 0)) < int(tier.get("flow_count", 0)):
+            return False
+    return True
 
 
 def forecast_horizon_steps_for_sample_period(step_seconds: int) -> int:
@@ -126,6 +153,9 @@ class KoopmanOnlineAnalyzer:
     last_observed_threat_step: int | None = None
     previous_transition_was_nominal: bool = True
     tensor_koopman: TensorKroneckerKoopman | None = None
+    kalman_filter: DiagonalKalmanFilter | None = None
+    local_filter: LocalObservationFilter | None = None
+    tensor_filters: dict[str, DiagonalKalmanFilter] = field(default_factory=dict)
 
     @classmethod
     def from_t0(
@@ -138,6 +168,9 @@ class KoopmanOnlineAnalyzer:
         required_prediction_lead_seconds: int = 10,
         warning_risk_threshold: float | None = None,
         warning_threshold_origin: str = "model_default_not_externally_validated",
+        runtime_state: dict[str, Any] | None = None,
+        kalman_process_variance: float = DEFAULT_PROCESS_VARIANCE,
+        kalman_measurement_variance: float = DEFAULT_MEASUREMENT_VARIANCE,
     ) -> "KoopmanOnlineAnalyzer":
         metric_names = list(state_vector["metric_names"])
         reference = np.asarray(state_vector["vector"], dtype=float)
@@ -155,6 +188,13 @@ class KoopmanOnlineAnalyzer:
         lyapunov_matrix, lyapunov_iterations, lyapunov_residual = _discrete_lyapunov_matrix(operator)
         return cls(
             metric_names=metric_names,
+            kalman_filter=DiagonalKalmanFilter(len(metric_names),
+                process_variance=kalman_process_variance,
+                measurement_variance=kalman_measurement_variance),
+            local_filter=(LocalObservationFilter(runtime_state,
+                process_variance=kalman_process_variance,
+                measurement_variance=kalman_measurement_variance)
+                if runtime_state is not None else None),
             reference_vector=reference,
             scale_vector=scale,
             ideal_operator=operator,
@@ -208,6 +248,7 @@ class KoopmanOnlineAnalyzer:
         attack_state: dict[str, Any],
         step_index: int,
         time_seconds: int,
+        runtime_state: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.analysis_revision += 1
         # Текущий снимок является атомарным: residual, rollout, спектр и
@@ -222,16 +263,39 @@ class KoopmanOnlineAnalyzer:
         operator_fingerprint_used = _matrix_fingerprint(operator_used)
         lyapunov_fingerprint_used = _matrix_fingerprint(lyapunov_matrix_used)
         current = np.asarray(state_vector["vector"], dtype=float)
+        raw_normalized = self._normalize(current)
+        active_attack_score = _attack_score(self.metric_names, current)
+        precursor_score = _precursor_score(self.metric_names, current)
+        observable_precursor_now = _observable_precursor_present(attack_state, precursor_score)
+        observable_attack_now = bool(attack_state.get("events", []))
+        healthy_quality = _healthy_quality_observation(self.metric_names, current, attack_state)
+        if self.kalman_filter is None:
+            self.kalman_filter = DiagonalKalmanFilter(len(self.metric_names))
+        filter_mask = np.asarray([name not in THREAT_METRICS and is_smoothable_metric(name)
+                                  for name in self.metric_names])
+        # Наблюдаемая угроза не меняет сохранённую оценку исправной сети.
+        # Её текущий ущерб проходит в прогноз без задержки от сглаживания.
+        filter_applied = (healthy_quality and not observable_attack_now and not observable_precursor_now
+                          and max(active_attack_score, precursor_score) < NOMINAL_THREAT_SCORE_LIMIT)
+        local_observation = (
+            self.local_filter.analyze(runtime_state, nominal=filter_applied)
+            if self.local_filter is not None and runtime_state is not None else None
+        )
+        tensor_input = self._filter_tensor_observation(tensor_matrices) if filter_applied else tensor_matrices
         tensor_matrix_koopman = (
-            self.tensor_koopman.analyze(tensor_matrices)
-            if self.tensor_koopman is not None and tensor_matrices is not None
+            self.tensor_koopman.analyze(tensor_input)
+            if self.tensor_koopman is not None and tensor_input is not None
             else {
-                "model": "factorised_kronecker_tensor_koopman",
-                "available": False,
+                "model": "factorised_kronecker_tensor_koopman", "available": False,
                 "semantics_ru": "Матрицы тензоров не переданы в этот вызов анализатора.",
             }
         )
-        z_current = self._normalize(current)
+        tensor_matrix_koopman["input_kalman_filtered"] = (
+            filter_applied and self.tensor_koopman is not None and tensor_input is not None
+        )
+        z_current = (self.kalman_filter.update(raw_normalized, filter_mask)
+                     if filter_applied else raw_normalized.copy())
+        current = np.where(filter_mask & filter_applied, self._denormalize(z_current), current)
         residual = 0.0
         transition_residual_vector = np.zeros_like(z_current)
         if self.previous_vector is not None:
@@ -242,14 +306,7 @@ class KoopmanOnlineAnalyzer:
 
         deviation = _rms(z_current)
         operator_drift = _operator_drift(operator_used, self.ideal_operator)
-        active_attack_score = _attack_score(self.metric_names, current)
-        precursor_score = _precursor_score(self.metric_names, current)
         threat_score = max(active_attack_score, precursor_score)
-        observable_precursor_now = _observable_precursor_present(
-            attack_state,
-            precursor_score,
-        )
-        observable_attack_now = bool(attack_state.get("events", []))
         if observable_precursor_now or observable_attack_now:
             self.last_observed_threat_step = step_index
         threat_proximity = gold_threat_proximity_view(
@@ -447,8 +504,11 @@ class KoopmanOnlineAnalyzer:
         # Обучение номинальной динамике коммитится после завершения всех
         # вычислений снимка. Новые K/P не меняют ни одно значение текущего шага.
         update_applied_for_next_step = False
-        nominal_now = not observable_attack_now and not observable_precursor_now and threat_score < 0.10 and forecast_risk < 0.25
-        if self.previous_vector is not None and self.previous_transition_was_nominal and nominal_now:
+        nominal_now = (healthy_quality and not observable_attack_now and not observable_precursor_now
+                       and threat_score < NOMINAL_THREAT_SCORE_LIMIT and forecast_risk < 0.25)
+        transition_accepted = (self.previous_vector is not None
+                               and self.previous_transition_was_nominal and nominal_now)
+        if transition_accepted:
             z_previous_for_update = self._normalize(self.previous_vector)
             self.nominal_observation_count += 1
             update_applied_for_next_step = self._update_observed_operator(
@@ -478,8 +538,38 @@ class KoopmanOnlineAnalyzer:
             del self.state_history[:-history_limit]
         return {
             "model": "causal_koopman_dmd_plus_lag_trend_and_precursor_classifier",
+            "kalman_filter": {
+                "model": "diagonal_random_walk_on_normalized_observations",
+                "process_variance": self.kalman_filter.process_variance,
+                "measurement_variance": self.kalman_filter.measurement_variance,
+                "applied_to_nominal_observation": filter_applied,
+                "healthy_quality_observation": healthy_quality,
+                "filtered_metric_names": [name for name, enabled in zip(self.metric_names, filter_mask) if enabled and filter_applied],
+                "raw_normalized_vector": raw_normalized.tolist(),
+                "filtered_normalized_vector": z_current.tolist(),
+                "gain_vector": (self.kalman_filter.gain if filter_applied else np.ones_like(raw_normalized)).tolist(),
+                "posterior_variance_vector": self.kalman_filter.variance.tolist(),
+                "covariance_factorization": "diagonal_cholesky",
+                "local_observation": local_observation,
+                "koopman_input_uncertainty": {
+                    "semantics": "one_step_propagated_input_noise_not_total_forecast_error",
+                    "operator_revision_used": operator_revision_used,
+                    "normalized_std_vector": np.sqrt(
+                        (operator_used ** 2) @ np.where(
+                            filter_mask & filter_applied, self.kalman_filter.variance,
+                            self.kalman_filter.measurement_variance)
+                    ).tolist(),
+                },
+                "filtered_normal_arrival_rate_pps": float(current[self.metric_names.index("OBS.normal_arrival_rate_pps")]) if "OBS.normal_arrival_rate_pps" in self.metric_names else None,
+            },
             "training_reference": self.reference_context,
             "training_residual": round(self.training_residual, 8),
+            "nominal_training": {
+                "observation_eligible": nominal_now,
+                "transition_accepted": transition_accepted,
+                "input": "filtered_normalized_observations",
+                "requires_two_healthy_observations": True,
+            },
             "t0_signature": self.reference_context["t0_signature"],
             "step_index": step_index,
             "analysis_revision": self.analysis_revision,
@@ -662,6 +752,34 @@ class KoopmanOnlineAnalyzer:
             "top_residual_metrics": _top_residuals(self.metric_names, transition_residual_vector),
             "arbitrator_recommendation": recommendation,
         }
+
+    def _filter_tensor_observation(self, observation: TensorMatrixView | None) -> TensorMatrixView | None:
+        """Очистить обычные показатели по локальным осям, сохранив исходный снимок."""
+        if observation is None or self.tensor_koopman is None:
+            return observation
+        matrices = {}
+        for level in observation.levels:
+            observed = observation.matrices[level]
+            reference = self.tensor_koopman.reference.matrices[level]
+            if (observed.entity_ids != reference.entity_ids
+                    or observed.metric_names != reference.metric_names):
+                raise ValueError("Оси фильтра тензора должны совпадать с t0")
+            if not observed.values.size:
+                matrices[level] = observed
+                continue
+            scale = np.maximum(np.abs(reference.values), 1.0)
+            normalized = (observed.values - reference.values) / scale
+            mask = np.broadcast_to([is_smoothable_metric(name) for name in observed.metric_names],
+                                   observed.values.shape)
+            if level not in self.tensor_filters:
+                self.tensor_filters[level] = DiagonalKalmanFilter(normalized.size,
+                    process_variance=self.kalman_filter.process_variance,
+                    measurement_variance=self.kalman_filter.measurement_variance)
+            filtered = self.tensor_filters[level].update(normalized.ravel(), mask.ravel())
+            values = np.where(mask, reference.values + filtered.reshape(normalized.shape) * scale,
+                              observed.values)
+            matrices[level] = TensorLevelMatrix(level, observed.entity_ids, observed.metric_names, values)
+        return TensorMatrixView(observation.levels, matrices)
 
     def _normalize(self, vector: np.ndarray) -> np.ndarray:
         return (vector - self.reference_vector) / self.scale_vector
@@ -1177,7 +1295,7 @@ def _ideal_training_vectors(metric_names: list[str], reference: np.ndarray, scal
             rows.append(reference.copy())
             continue
         for index, name in enumerate(metric_names):
-            if name.startswith("OBS."):
+            if name in THREAT_METRICS:
                 continue
             # Разные частоты дают полноранговую номинальную выборку вместо
             # нескольких одинаковых гармоник со сдвигом фазы.
@@ -1397,7 +1515,7 @@ def _classify_precursor_signals(signals: dict[str, Any]) -> str:
     выброс не авторизует превентивную защиту.
     """
     if (
-        float(signals.get("authentication_failure_rate_per_second", 0.0)) >= 0.05
+        float(signals.get("authentication_failure_rate_per_second", 0.0)) >= 0.025
         and float(signals.get("authentication_failure_ratio", 0.0)) >= 0.8
     ):
         return "brute_force"

@@ -43,6 +43,7 @@ def apply_gold_first_remap(
     *,
     step_index: int,
     identities: Mapping[str, Any] | None = None,
+    background_flows: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Применить подготовленный Купманом маршрутный overlay.
 
@@ -50,8 +51,11 @@ def apply_gold_first_remap(
     словаре ``routing_control``.  Поддерживаются как одношаговое поле
     ``valid_for_step``, так и полуинтервал ``valid_from_step`` / ``valid_until_step``.
 
-    Возвращаются новые записи потоков и сериализуемая сводка.  Атакующий трафик
-    намеренно пропускается: генератор атак вызывается после этого этапа.
+    Возвращаются новые записи потоков и сериализуемая сводка.
+    ``background_flows`` содержит уже наблюдаемый остаточный трафик атаки
+    после действующей фильтрации. Он занимает ресурсы до распределения SLA;
+    будущее расписание сюда не входит. Если фон отдельно не передан,
+    используются атакующие записи из ``flows``.
     """
     copied_flows = [_copy_flow(flow) for flow in flows]
     control = _routing_control(defense_plan)
@@ -66,7 +70,16 @@ def apply_gold_first_remap(
     for flow in copied_flows:
         _initialize_overlay_fields(flow)
 
+    background = (
+        background_flows if background_flows is not None
+        else [flow for flow in flows if flow.get("is_attack_traffic")]
+    )
+    edge_loads, node_loads = _background_loads(background)
     if not plan_is_active:
+        for edge, rate in _initial_edge_loads(copied_flows).items():
+            edge_loads[edge] = edge_loads.get(edge, 0.0) + rate
+        for node, rate in _initial_node_loads(copied_flows).items():
+            node_loads[node] = node_loads.get(node, 0.0) + rate
         return copied_flows, _build_summary(
             model,
             copied_flows,
@@ -79,8 +92,8 @@ def apply_gold_first_remap(
             network_capacity_rejections=0,
             server_resource_rejections=0,
             server_resource_rejection_reasons={},
-            projected_edge_loads=_initial_edge_loads(copied_flows),
-            projected_node_loads=_initial_node_loads(copied_flows),
+            projected_edge_loads=edge_loads,
+            projected_node_loads=node_loads,
             projected_server_resources=server_resource_state,
             context=context,
         )
@@ -88,8 +101,6 @@ def apply_gold_first_remap(
     # Резервирование строится заново в строгом SLA-порядке. Если заранее
     # занести сюда Silver/Bronze baseline, они смогут занять альтернативу до
     # Gold и формальный приоритет будет нарушен.
-    edge_loads: dict[tuple[str, str], float] = {}
-    node_loads: dict[str, float] = {}
     actions: list[dict[str, Any]] = []
     network_capacity_rejections = 0
     server_resource_rejections = 0
@@ -347,6 +358,7 @@ def _control_context(
         _string_set(control.get("quarantine_sources"))
         | _string_set(defense_plan.get("quarantine_sources"))
     )
+    confirmed_sources: set[str] = set()
     target_kinds: dict[str, set[str]] = defaultdict(set)
     transparent_power_targets: set[str] = set()
     nontransparent_event_targets: set[str] = set()
@@ -364,6 +376,17 @@ def _control_context(
             if kind:
                 target_kinds[target].add(kind)
         observed_sources.update(_string_set(record.get("source_ids")))
+        # Список кандидатов или название этапа сами по себе не доказывают
+        # источник. Сохранённый план должен содержать запись уже наблюдённой
+        # сетевой атаки с тем же идентификатором, что и подтверждённый план.
+        if (
+            control.get("protection_stage") == "confirmed_active_mitigation"
+            and record.get("observation_type") == "active_event"
+            and str(record.get("attack_id", "")) in plan_attack_ids
+            and record.get("attack_id")
+            and kind in NETWORK_ATTACK_KINDS
+        ):
+            confirmed_sources.update(_string_set(record.get("source_ids")))
 
     for event in events:
         event_id = str(event.get("attack_id", ""))
@@ -388,6 +411,7 @@ def _control_context(
         if kind in NETWORK_ATTACK_KINDS:
             observed_sources.update(_string_set(event.get("ingress_nodes")))
             quarantine_candidates.update(_string_set(event.get("ingress_nodes")))
+            confirmed_sources.update(_string_set(event.get("ingress_nodes")))
 
     # Фактическая телеметрия сильнее предварительного плана: если UPS держит
     # нагрузку и доступность сервиса равна 1, узел остаётся наблюдаемой целью,
@@ -439,7 +463,7 @@ def _control_context(
     # Карантин применим только к абонентским источникам.  Маршрутизатор в поле
     # ingress означает точку наблюдения, а не заражённого абонента.
     quarantine_sources = {
-        node for node in quarantine_candidates
+        node for node in quarantine_candidates & confirmed_sources
         if node in model.graph
         and (model.graph.nodes[node].get("level") == "L1" or _node_role(model, node) in SUBSCRIBER_ROLES)
     }
@@ -913,6 +937,27 @@ def _action_record(flow: Mapping[str, Any], context: Mapping[str, Any], grade: s
     }
 
 
+def _background_loads(
+    flows: Sequence[Mapping[str, Any]],
+) -> tuple[dict[tuple[str, str], float], dict[str, float]]:
+    """Занятость Мбит/с от текущего фона; обратный маршрут не дублирует рёбра.
+
+    Например, фон 79 Мбит/с на линии 100 Мбит/с оставляет 1 Мбит/с
+    до безопасного предела 80%, поэтому новая заявка 1,1 Мбит/с не проходит.
+    """
+    edges: dict[tuple[str, str], float] = defaultdict(float)
+    nodes: dict[str, float] = defaultdict(float)
+    for flow in flows:
+        if flow.get("quarantined") or flow.get("isolated") or not flow.get("route"):
+            continue
+        rate = _flow_rate_mbps(flow)
+        for edge in _flow_edges(flow):
+            edges[edge] += rate
+        for node in _flow_nodes(flow):
+            nodes[node] += rate
+    return dict(edges), dict(nodes)
+
+
 def _initial_edge_loads(flows: list[Mapping[str, Any]]) -> dict[tuple[str, str], float]:
     loads: dict[tuple[str, str], float] = defaultdict(float)
     for flow in flows:
@@ -1167,6 +1212,20 @@ def _build_summary(
     baseline_nodes, baseline_edges = _route_sets(baseline_gold_routes)
     active_nodes, active_edges = _route_sets(active_gold_routes)
     edge_utilization, node_utilization = _utilization_views(model, projected_edge_loads, projected_node_loads)
+    admitted_routes = [
+        flow for flow in legitimate
+        if (flow.get("rerouted") or flow.get("failover_active"))
+        and not flow.get("isolated") and flow.get("route")
+    ]
+    admitted_edges = {edge for flow in admitted_routes for edge in _flow_edges(flow)}
+    admitted_nodes = {node for flow in admitted_routes for node in _flow_nodes(flow)}
+    maximum_admitted_route_utilization = max(
+        [item["utilization_percent"] for item in edge_utilization
+         if _edge_key(item["source"], item["target"]) in admitted_edges]
+        + [item["utilization_percent"] for item in node_utilization
+           if item["node_id"] in admitted_nodes],
+        default=0.0,
+    )
     maximum_edge_utilization = max(
         (item["utilization_percent"] for item in edge_utilization),
         default=0.0,
@@ -1213,7 +1272,7 @@ def _build_summary(
             context.get("service_transparent_power_targets", set())
         ),
         "observed_source_ids": sorted(context.get("observed_source_ids", set())),
-        "quarantine_sources": sorted(context.get("quarantine_sources", set())),
+        "quarantine_sources": sorted(context.get("quarantine_sources", set())) if plan_active else [],
         "rerouted_flow_count": sum(bool(flow.get("rerouted")) for flow in legitimate),
         "failover_flow_count": sum(bool(flow.get("failover_active")) for flow in legitimate),
         "isolated_flow_count": sum(bool(flow.get("isolated")) for flow in legitimate),
@@ -1234,8 +1293,14 @@ def _build_summary(
         ),
         "maximum_projected_edge_utilization_percent": round(maximum_edge_utilization, 6),
         "maximum_projected_node_utilization_percent": round(maximum_node_utilization, 6),
+        "maximum_admitted_route_utilization_percent": round(maximum_admitted_route_utilization, 6),
+        "maximum_admitted_route_utilization_semantics": (
+            "final_total_current_background_plus_legitimate_reservations_on_changed_admitted_routes;"
+            "zero_when_no_reroute_or_failover_was_admitted"
+        ),
         "maximum_projected_utilization_semantics": (
-            "maximum_of_reserved_network_and_projected_server_cpu_ram_session_load"
+            "maximum_of_reserved_legitimate_plus_current_known_residual_attack_network_load"
+            "_and_projected_server_cpu_ram_session_load;unknown_future_traffic_is_not_included"
         ),
         "maximum_projected_server_resource_utilization_percent": round(
             maximum_server_resource_utilization, 6

@@ -22,6 +22,8 @@ from typing import Any
 
 import numpy as np
 
+from .hypernetwork import CONTROLLED_LEVELS, EMBEDDING_LEVEL_PAIRS, hypernetwork_embedding
+
 
 TENSOR_MATRIX_LEVELS = ("L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8", "EDGE")
 KRONECKER_FEATURE_NAMES = (
@@ -208,26 +210,29 @@ class TensorKroneckerKoopman:
     def from_reference(cls, reference: TensorMatrixView, model=None) -> "TensorKroneckerKoopman":
         level_names, observables = kronecker_observables(reference, reference)
         level_count, feature_count = observables.shape
-        # Связи уровней берутся из показателей одного объекта и концов
-        # одной связи сети. Сила переноса 0,04 — настройка модели.
+        # A[target, source] переносит только явно разрешённые зависимости
+        # гиперсети. Совместное хранение тензоров не образует полную клику.
+        # Сила переноса 0,04 — безразмерная настройка, а не обученная оценка.
         level_operator = 0.93 * np.eye(level_count, dtype=float)
+        coupling = np.zeros((level_count, level_count), dtype=float)
+        index = {level: offset for offset, level in enumerate(level_names)}
         if model is not None:
-            coupling = np.zeros((level_count, level_count), dtype=float)
-            index = {level: offset for offset, level in enumerate(level_names)}
-            entities = [attrs for _, attrs in model.graph.nodes(data=True)]
-            entities.extend(attrs for _, _, attrs in model.graph.edges(data=True))
-            for attrs in entities:
-                levels = {getattr(value, "level", None) for value in attrs.values()}
-                present = [index[level] for level in levels if level in index]
-                for source in present:
-                    for target in present:
-                        if source != target:
-                            coupling[source, target] += 1.0
-            row_sum = coupling.sum(axis=1, keepdims=True)
-            coupling /= np.maximum(row_sum, 1.0)
-            level_operator += 0.04 * coupling
-        elif level_count:
-            level_operator += 0.04 * np.ones((level_count, level_count), dtype=float) / level_count
+            for relation in hypernetwork_embedding(model)["relations"]:
+                for dependency in relation["dependencies"]:
+                    source = index.get(dependency["source_level"])
+                    target = index.get(dependency["target_level"])
+                    if source is not None and target is not None and source != target:
+                        coupling[target, source] += 1.0
+        else:
+            # Без графа известна только схема уровней; нельзя выдумывать
+            # полную связность, в частности управление L4/L8 арбитром.
+            pairs = (EMBEDDING_LEVEL_PAIRS + (("L0", "L7"),)
+                     + tuple(("L7", level) for level in CONTROLLED_LEVELS))
+            for source_level, target_level in pairs:
+                if source_level in index and target_level in index:
+                    coupling[index[target_level], index[source_level]] = 1.0
+        coupling /= np.maximum(coupling.sum(axis=1, keepdims=True), 1.0)
+        level_operator += 0.04 * coupling
         feature_operator = np.diag((0.96, 0.92, 0.90, 0.88)[:feature_count]).astype(float)
         if feature_count > 1:
             feature_operator += 0.01 * np.ones((feature_count, feature_count), dtype=float) / feature_count

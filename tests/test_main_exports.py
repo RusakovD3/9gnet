@@ -58,6 +58,12 @@ def test_compact_dynamics_export_keeps_runtime_flows_without_serializing_them(
     assert runtime["snapshots"][0]["traffic"]["flows"]
     assert "flows" not in exported["snapshots"][0]["traffic"]
     assert "packet_sample" not in exported["snapshots"][0]["traffic"]
+    original_state = runtime["snapshots"][0]["traffic"]["network_state"]
+    compact_state = exported["snapshots"][0]["traffic"]["network_state"]
+    assert "nodes" not in compact_state and "edges" not in compact_state
+    assert compact_state["node_ids"] == [n["id"] for n in original_state["nodes"]]
+    assert compact_state["vertex_vectors"] == [list(n["metrics"].values()) for n in original_state["nodes"]]
+    assert compact_state["edge_vectors"] == [list(e["metrics"].values()) for e in original_state["edges"]]
     assert exported["config"]["packet_detail"] == "summary"
     assert exported["config"]["runtime_packet_detail"] == "flows"
 

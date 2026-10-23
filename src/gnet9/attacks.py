@@ -115,8 +115,11 @@ class WeibullArrivalSchedule:
     value_origin: str = "seeded_weibull_renewal_scenario_assumption"
     raw_intervals_are_iid_weibull: bool = True
     realized_intervals_are_iid_weibull: bool = False
+    event_shapes: tuple[float, ...] = ()
+    event_scales_seconds: tuple[float, ...] = ()
     hazard_semantics: str = "unconditioned_weibull_hazard_evaluated_at_raw_sampled_interval"
     parameter_estimation_status: str = "not_fitted_to_operator_incident_data"
+    shape_semantics: str = "common_shape_when_iid_base_shape_when_type_conditioned"
     mean_formula: str = "scale * Gamma(1 + 1/shape)"
     survival_formula: str = "exp(-(t/scale)**shape)"
     hazard_formula: str = "shape/scale * (t/scale)**(shape-1)"
@@ -352,13 +355,14 @@ MITRE_DEMO_ATTACKS = (
 )
 
 
-# Новый демонстрационный профиль рассчитан на 60 переходов по 2 секунды.
-# Восемь — это верхняя граница числа атак в одном прогоне, а не гарантия:
+# Новый демонстрационный профиль рассчитан на 160 переходов по 2 секунды.
+# Девять — это верхняя граница числа атак в одном прогоне, а не гарантия:
 # renewal-процесс Вейбулла прекращается на правой границе окна. Квоты ниже
 # задают состав полной демонстрационной серии и вероятностные веса типов.
 PREDICTIVE_DEMO_DEFAULT_SEED = 42
 PREDICTIVE_DEMO_STEP_SECONDS = 2
-PREDICTIVE_DEMO_STEP_COUNT = 100
+PREDICTIVE_DEMO_STEP_COUNT = 160
+PREDICTIVE_DEMO_FIRST_ATTACK_STEP = 70
 PREDICTIVE_DEMO_PRECURSOR_SECONDS = 20
 
 
@@ -379,15 +383,16 @@ def predictive_demo_minimum_steps(step_seconds: int) -> int:
     return precursor_steps + 5
 
 
-# k < 1 задаёт убывающую интенсивность отказов (hazard) и тяжёлый хвост.
-# Это не самовозбуждающийся процесс и не доказательство координации ботнета;
-# число является только воспроизводимым допущением лабораторного сценария.
-PREDICTIVE_DEMO_WEIBULL_SHAPE = 0.85
+# Формы сценария: возрастающая вероятность начала перегрузки и
+# убывающая вероятность начала медленных попыток входа.
+PREDICTIVE_DEMO_WEIBULL_SHAPE = 1.5
+PREDICTIVE_BRUTE_FORCE_WEIBULL_SHAPE = 0.7
 PREDICTIVE_DEMO_KIND_COUNTS = {
     AttackKind.DOS: 3,
     AttackKind.DDOS: 2,
     AttackKind.SYN_FLOOD: 2,
     AttackKind.POWER_ATTACK: 1,
+    AttackKind.BRUTE_FORCE: 1,
 }
 PREDICTIVE_DEMO_KIND_WEIGHTS = {
     kind.value: count / sum(PREDICTIVE_DEMO_KIND_COUNTS.values())
@@ -524,7 +529,7 @@ def attack_catalog(
                 str(item.get("target_id", "")),
             )
     if scenario == "predictive-demo" and not _custom_schedule(config):
-        arrival_schedule = predictive_demo_weibull_schedule(
+        arrival_schedule = predictive_demo_mixed_schedule(
             seed=resolved_seed,
             step_seconds=resolved_step_seconds,
             step_count=resolved_step_count,
@@ -541,6 +546,8 @@ def attack_catalog(
             # каталоге испытания. В телеметрию Купмана оно не попадает.
             item["arrival_schedule"] = dict(schedule_data)
             item["arrival_realization_index"] = realization_index
+            item["arrival_shape"] = arrival_schedule.event_shapes[realization_index]
+            item["arrival_scale_seconds"] = arrival_schedule.event_scales_seconds[realization_index]
             item["arrival_interval_seconds"] = (
                 arrival_schedule.realized_interarrival_seconds[realization_index]
             )
@@ -560,8 +567,10 @@ def attack_catalog(
             default=None,
         )
         for item in catalog:
+            item["arrival_shape"] = (PREDICTIVE_BRUTE_FORCE_WEIBULL_SHAPE if item["kind"] == "brute_force" else PREDICTIVE_DEMO_WEIBULL_SHAPE) if distribution == "shifted_weibull" else None
             item["arrival_schedule"] = {
                 "distribution": distribution,
+                "event_shapes": [PREDICTIVE_BRUTE_FORCE_WEIBULL_SHAPE if profile.kind == AttackKind.BRUTE_FORCE else PREDICTIVE_DEMO_WEIBULL_SHAPE for profile in profiles] if distribution == "shifted_weibull" else [],
                 "realized_start_steps": list(start_steps),
                 "first_attack_step": start_steps[0] if start_steps else None,
                 "interval_steps": config.attack_interval_steps,
@@ -621,12 +630,14 @@ def predictive_demo_weibull_schedule(
     event_count: int = 8,
     shape: float = PREDICTIVE_DEMO_WEIBULL_SHAPE,
     precursor_steps: int | None = None,
+    shape_by_event: tuple[float, ...] | None = None,
+    recovery_steps: int = 3,
 ) -> WeibullArrivalSchedule:
     """Сформировать воспроизводимый конечный renewal-процесс Вейбулла.
 
-    ``event_count`` — предохранительный верхний предел для короткой учебной
-    демонстрации, не фиксированное число событий. Каждый следующий интервал
-    берётся из одной и той же iid Weibull-выборки. Интервал, выводящий начало
+    ``event_count`` — верхний предел, не фиксированное число событий.
+    Без ``shape_by_event`` интервалы независимы с одинаковым распределением;
+    с ним форма выбирается для каждого типа отдельно. Интервал, выводящий начало
     следующей атаки за границу окна, сохраняется как правосторонне
     цензурированный и не превращается в событие; иначе процесс может закончиться
     на защитном пределе. Дискретизация нужна только для кадров визуализации:
@@ -638,13 +649,20 @@ def predictive_demo_weibull_schedule(
         raise ValueError("Число событий Вейбулла должно быть положительным")
     if shape <= 0.0 or not math.isfinite(shape):
         raise ValueError("Параметр формы Вейбулла должен быть конечным и положительным")
+    if shape_by_event is not None and (
+        len(shape_by_event) < event_count
+        or any(not math.isfinite(k) or k <= 0 for k in shape_by_event)
+    ):
+        raise ValueError("Для каждого события нужна конечная положительная форма Вейбулла")
     resolved_precursor_steps = (
         predictive_demo_minimum_steps(step_seconds) - 5
         if precursor_steps is None
         else int(precursor_steps)
     )
     first_start_step = resolved_precursor_steps + 2
-    last_start_step = step_count - 3
+    if recovery_steps < 3:
+        raise ValueError("После серии нужно оставить не менее трёх шагов")
+    last_start_step = step_count - recovery_steps
     available_slots = last_start_step - first_start_step + 1
     if resolved_precursor_steps < 2 or available_slots < 1:
         minimum_steps = (
@@ -670,10 +688,13 @@ def predictive_demo_weibull_schedule(
     realized_steps: list[int] = []
     previous_step = window_origin_step
     right_censored_interval: float | None = None
-    for _ in range(event_count):
+    event_shapes, event_scales = [], []
+    for event_index in range(event_count):
+        event_shape = shape if shape_by_event is None else shape_by_event[event_index]
+        event_scale = expected_interval / math.gamma(1.0 + 1.0 / event_shape)
         raw_interval = (
-            scale_seconds
-            * (-math.log1p(-max(rng.random(), 1e-12))) ** (1.0 / shape)
+            event_scale
+            * (-math.log1p(-max(rng.random(), 1e-12))) ** (1.0 / event_shape)
         )
         # ceil сохраняет причинность: событие из непрерывного интервала
         # отображается в первый полностью наступивший дискретный кадр.
@@ -683,6 +704,8 @@ def predictive_demo_weibull_schedule(
             right_censored_interval = raw_interval
             break
         raw_intervals.append(raw_interval)
+        event_shapes.append(event_shape)
+        event_scales.append(event_scale)
         realized_steps.append(realized_step)
         previous_step = realized_step
     termination_reason = (
@@ -697,12 +720,12 @@ def predictive_demo_weibull_schedule(
         for previous, current in zip(prior_steps, realized_steps, strict=True)
     )
     hazards = tuple(
-        shape / scale_seconds * (interval / scale_seconds) ** (shape - 1.0)
-        for interval in raw_intervals
+        k / scale * (interval / scale) ** (k - 1.0)
+        for interval, k, scale in zip(raw_intervals, event_shapes, event_scales)
     )
     survival = tuple(
-        math.exp(-((interval / scale_seconds) ** shape))
-        for interval in raw_intervals
+        math.exp(-((interval / scale) ** k))
+        for interval, k, scale in zip(raw_intervals, event_shapes, event_scales)
     )
     return WeibullArrivalSchedule(
         shape=round(shape, 6),
@@ -727,8 +750,46 @@ def predictive_demo_weibull_schedule(
             else None
         ),
         termination_reason=termination_reason,
+        event_shapes=tuple(event_shapes),
+        event_scales_seconds=tuple(round(value, 6) for value in event_scales),
+        raw_intervals_are_iid_weibull=shape_by_event is None,
+        generation_method=(
+            "inverse_cdf_iid_renewal_until_window_end_or_safety_cap"
+            if shape_by_event is None
+            else "inverse_cdf_type_conditioned_intervals_until_window_end_or_safety_cap"
+        ),
     )
 
+
+
+def _predictive_kind_sequence(seed: int) -> tuple[AttackKind, ...]:
+    rng = random.Random(int(seed))
+    kinds = [AttackKind.DOS, AttackKind.DDOS, AttackKind.SYN_FLOOD, AttackKind.POWER_ATTACK]
+    rng.shuffle(kinds)
+    kinds.append(AttackKind.BRUTE_FORCE)
+    remaining = [kind for kind, count in PREDICTIVE_DEMO_KIND_COUNTS.items() for _ in range(count)]
+    for kind in kinds:
+        remaining.remove(kind)
+    rng.shuffle(remaining)
+    return tuple(kinds + remaining)
+
+
+def predictive_demo_mixed_schedule(*, seed=PREDICTIVE_DEMO_DEFAULT_SEED,
+                                   step_seconds=PREDICTIVE_DEMO_STEP_SECONDS,
+                                   step_count=PREDICTIVE_DEMO_STEP_COUNT,
+                                   precursor_steps=None) -> WeibullArrivalSchedule:
+    """Форма 1,5 для перегрузки, 0,7 для медленных попыток входа.
+
+    Интервалы независимы, но имеют разные распределения для разных типов.
+    Форма задаёт изменение вероятности начала события, не скорость пакетов.
+    """
+    kinds = _predictive_kind_sequence(seed)
+    shapes = tuple(PREDICTIVE_BRUTE_FORCE_WEIBULL_SHAPE if kind == AttackKind.BRUTE_FORCE
+                   else PREDICTIVE_DEMO_WEIBULL_SHAPE for kind in kinds)
+    return predictive_demo_weibull_schedule(seed=seed, step_seconds=step_seconds,
+                                          step_count=step_count, event_count=len(kinds),
+                                          precursor_steps=precursor_steps, shape_by_event=shapes,
+                                          recovery_steps=11 if step_count >= predictive_demo_minimum_steps(step_seconds) + 11 else 3)
 
 def predictive_demo_attack_profiles(
     model: NetworkModel | None,
@@ -737,7 +798,7 @@ def predictive_demo_attack_profiles(
     step_seconds: int = PREDICTIVE_DEMO_STEP_SECONDS,
     step_count: int = PREDICTIVE_DEMO_STEP_COUNT,
 ) -> tuple[AttackProfile, ...]:
-    """Построить воспроизводимое расписание не более чем из восьми атак.
+    """Построить воспроизводимое расписание не более чем из девяти атак.
 
     Генератор знает расписание, но наблюдателю оно не передаётся: Купман получает
     только плавно нарастающие показания датчиков. Это отделяет сценарий испытаний
@@ -757,31 +818,15 @@ def predictive_demo_attack_profiles(
         2,
         math.ceil(PREDICTIVE_DEMO_PRECURSOR_SECONDS / step_seconds),
     )
-    arrival_schedule = predictive_demo_weibull_schedule(
+    arrival_schedule = predictive_demo_mixed_schedule(
         seed=seed,
         step_seconds=step_seconds,
         step_count=step_count,
-        event_count=sum(PREDICTIVE_DEMO_KIND_COUNTS.values()),
         precursor_steps=precursor_steps,
     )
 
     rng = random.Random(int(seed))
-    all_kinds = [
-        kind
-        for kind, count in PREDICTIVE_DEMO_KIND_COUNTS.items()
-        for _ in range(count)
-    ]
-    # В коротком окне renewal-процесс может успеть показать лишь часть серии.
-    # Первые четыре позиции поэтому образуют одну перемешанную «витрину» всех
-    # поддерживаемых воздействий; оставшиеся сохраняют заданные веса 3:2:2:1.
-    # Это относится только к составу учебного сценария, не к Weibull-времени.
-    kinds = list(PREDICTIVE_DEMO_KIND_COUNTS)
-    rng.shuffle(kinds)
-    remaining_kinds = list(all_kinds)
-    for kind in kinds:
-        remaining_kinds.remove(kind)
-    rng.shuffle(remaining_kinds)
-    kinds.extend(remaining_kinds)
+    kinds = _predictive_kind_sequence(seed)
     start_steps = arrival_schedule.realized_start_steps
     pools = _predictive_node_pools(model)
     used_targets: set[str] = set()
@@ -815,6 +860,7 @@ def predictive_demo_attack_profiles(
             AttackKind.DDOS: 8,
             AttackKind.SYN_FLOOD: 4,
             AttackKind.POWER_ATTACK: 1,
+            AttackKind.BRUTE_FORCE: 1,
         }[kind]
         ingress_nodes = (
             ()
@@ -837,12 +883,14 @@ def predictive_demo_attack_profiles(
             AttackKind.DDOS: 3,
             AttackKind.SYN_FLOOD: 2,
             AttackKind.POWER_ATTACK: 2,
+            AttackKind.BRUTE_FORCE: 6,
         }[kind]
         rise_steps = 1 if duration_steps <= 2 else 2
         latency_penalty, loss_ratio, pressure = {
             AttackKind.DOS: (46.0, 0.075, 0.70),
             AttackKind.DDOS: (210.0, 0.25, 0.95),
             AttackKind.SYN_FLOOD: (360.0, 0.34, 0.90),
+            AttackKind.BRUTE_FORCE: (0.0, 0.0, 0.06),
             AttackKind.POWER_ATTACK: (
                 (125.0, 0.20, 1.0)
                 if power_failure_mode == "cyber_shutdown"
@@ -863,6 +911,7 @@ def predictive_demo_attack_profiles(
                     AttackKind.DOS: "T1498.001",
                     AttackKind.DDOS: "T1498.002",
                     AttackKind.SYN_FLOOD: "T1499.001",
+                    AttackKind.BRUTE_FORCE: "T1110.001",
                     AttackKind.POWER_ATTACK: (
                         "T1529" if power_failure_mode == "cyber_shutdown" else "T0831"
                     ),
@@ -871,6 +920,7 @@ def predictive_demo_attack_profiles(
                     AttackKind.DOS: "Direct Network Flood",
                     AttackKind.DDOS: "Reflection Amplification",
                     AttackKind.SYN_FLOOD: "OS Exhaustion Flood",
+                    AttackKind.BRUTE_FORCE: "Password Guessing",
                     AttackKind.POWER_ATTACK: (
                         "System Shutdown/Reboot"
                         if power_failure_mode == "cyber_shutdown"
@@ -1034,6 +1084,8 @@ def _target_pool_for_kind(
         category = ("servers", "core")[occurrence_index % 2]
     elif kind == AttackKind.SYN_FLOOD:
         category = ("subscribers", "servers")[occurrence_index % 2]
+    elif kind == AttackKind.BRUTE_FORCE:
+        category = "subscribers"
     else:
         # При чётном seed демонстрируется питание сетевого узла, при нечётном
         # — сервера. Так обе допустимые области достижимы без изменения весов.
@@ -1114,6 +1166,8 @@ def _predictive_technical_profile(
     *,
     power_failure_mode: str | None = None,
 ) -> AttackTechnicalCharacteristics:
+    if kind == AttackKind.BRUTE_FORCE:
+        return next(profile.technical for profile in MITRE_DEMO_ATTACKS if profile.kind == AttackKind.BRUTE_FORCE)
     aggregate_access = sum(_subscriber_access_capacity_mbps(model, node) for node in ingress_nodes)
     if kind == AttackKind.POWER_ATTACK:
         cyber_shutdown = power_failure_mode == "cyber_shutdown"
@@ -1215,6 +1269,9 @@ def _predictive_attack_text(
             f"SYN-флуд на {target_id}",
             "Реальные L1-источники создают незавершённые TCP-соединения и давление на очередь SYN.",
         )
+    if kind == AttackKind.BRUTE_FORCE:
+        return (f"Медленные попытки входа в учётную запись {target_id}",
+                "Отдельные журнальные события входа без дополнительного потока перегрузки.")
     if power_failure_mode == "cyber_shutdown":
         return (
             f"Удалённое выключение {target_id}",
@@ -1535,7 +1592,7 @@ def active_attack_events(
         config=config,
     )
     arrival_schedule = (
-        predictive_demo_weibull_schedule(
+        predictive_demo_mixed_schedule(
             seed=resolved_seed,
             step_seconds=resolved_step_seconds,
             step_count=resolved_step_count,
@@ -1614,8 +1671,8 @@ def active_attack_events(
                 # испытания и не может стать признаком прогнозатора.
                 event["arrival_process"] = {
                     "distribution": arrival_schedule.distribution,
-                    "shape": arrival_schedule.shape,
-                    "scale_seconds": arrival_schedule.scale_seconds,
+                    "shape": arrival_schedule.event_shapes[realization_index],
+                    "scale_seconds": arrival_schedule.event_scales_seconds[realization_index],
                     "expected_interarrival_seconds": (
                         arrival_schedule.expected_interarrival_seconds
                     ),
@@ -2007,6 +2064,25 @@ def observe_attack_precursors(
     return observations
 
 
+def build_current_attack_flows(
+    events: list[dict[str, Any]],
+    defense_plan: dict[str, Any] | None = None,
+    identities: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Текущая остаточная нагрузка после защиты, общая для допуска и очередей.
+
+    Здесь только уже наблюдаемые события текущего шага. Ни расписание будущих
+    событий, ни новое решение защиты следующего шага не используются.
+    """
+    result = []
+    for event in events:
+        mitigation = _event_defense_mitigation(defense_plan, event)
+        result.extend(_build_attack_flows(event, mitigation_ratio=mitigation,
+            quarantined_sources=_active_quarantined_sources(
+                defense_plan, event, mitigation_ratio=mitigation), identities=identities))
+    return result
+
+
 def apply_attack_effects(
     model: NetworkModel,
     legitimate_flows: list[dict[str, Any]],
@@ -2017,6 +2093,7 @@ def apply_attack_effects(
     identities: Mapping[str, Any] | None = None,
     scenario: str | None = None,
     power_runtime_state: Mapping[str, Mapping[str, Any]] | None = None,
+    prepared_attack_flows: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Ухудшить затронутые легитимные потоки и добавить агрегированные flood-потоки."""
     precursor_events = precursor_events or []
@@ -2035,6 +2112,14 @@ def apply_attack_effects(
         event["attack_id"]: _event_defense_mitigation(defense_plan, event)
         for event in events
     }
+    source_delivery_fraction = {}
+    for event in events:
+        sources = set(event.get("ingress_nodes", []))
+        quarantined = _active_quarantined_sources(
+            defense_plan, event, mitigation_ratio=event_mitigation[event["attack_id"]],
+        )
+        direct = event["kind"] in {AttackKind.DOS.value, AttackKind.SYN_FLOOD.value}
+        source_delivery_fraction[event["attack_id"]] = len(sources - quarantined) / len(sources) if direct and sources else 1.0
     flow_mitigation, allocation_reports = _allocate_sla_defense_budget(
         flows,
         events,
@@ -2059,6 +2144,9 @@ def apply_attack_effects(
                 float(event["legitimate_loss_ratio"]) * intensity * resource_pressure,
             )
             mitigation = flow_mitigation.get((event["attack_id"], str(flow["flow_id"])), 0.0)
+            admitted_fraction = source_delivery_fraction[event["attack_id"]]
+            filtering_mitigation = mitigation
+            mitigation = 1.0 - (1.0 - mitigation) * admitted_fraction
             loss_ratio = raw_loss_ratio * (1.0 - mitigation)
             raw_dropped = min(int(flow["packet_count"]), math.ceil(int(flow["packet_count"]) * raw_loss_ratio))
             raw_already_dropped = int(flow.get("raw_attack_dropped_packets", 0))
@@ -2081,7 +2169,8 @@ def apply_attack_effects(
                 float(event["latency_penalty_ms"])
                 * intensity
                 * resource_pressure
-                * (1.0 - mitigation * 0.85)
+                * (1.0 - filtering_mitigation * 0.85)
+                * admitted_fraction
             )
             flow["attack_latency_penalty_ms"] = round(
                 float(flow.get("attack_latency_penalty_ms", 0.0))
@@ -2101,21 +2190,9 @@ def apply_attack_effects(
             flow.setdefault("attack_ids", []).append(event["attack_id"])
             flow["attack_impacted"] = True
 
-    attack_flows = [
-        flow
-        for event in events
-        for flow in _build_attack_flows(
-            event,
-            mitigation_ratio=event_mitigation[event["attack_id"]],
-            quarantined_sources=_active_quarantined_sources(
-                defense_plan,
-                event,
-                mitigation_ratio=event_mitigation[event["attack_id"]],
-            ),
-            identities=identities,
-        )
-    ]
-    apply_transport_queues(model, flows)
+    attack_flows = (prepared_attack_flows if prepared_attack_flows is not None
+                    else build_current_attack_flows(events, defense_plan, identities))
+    apply_transport_queues(model, flows, attack_flows)
     all_flows = flows + attack_flows
     for flow in flows:
         flow["slo_evaluation"] = _evaluate_flow_slo(model, flow)
@@ -2433,7 +2510,7 @@ def _evaluate_flow_slo(model: NetworkModel, flow: dict[str, Any]) -> dict[str, A
     delivery_ratio = (
         max(0.0, 1.0 - dropped_packets / packet_count)
         if packet_count > 0
-        else 0.0
+        else 1.0
     )
     interval_seconds = max(float(flow.get("interval_seconds", 1.0) or 1.0), 1e-9)
     offered_payload_kbps = (
@@ -2445,7 +2522,7 @@ def _evaluate_flow_slo(model: NetworkModel, flow: dict[str, Any]) -> dict[str, A
     delivered_payload_kbps = offered_payload_kbps * delivery_ratio
     if flow.get("transport") == "TCP" and "transport_queue" in flow:
         delivered_payload_kbps = float(flow["transport_queue"]["goodput_mbps"]) * 1000.0
-    loss_percent = (dropped_packets / packet_count * 100.0) if packet_count else 100.0
+    loss_percent = (dropped_packets / packet_count * 100.0) if packet_count else 0.0
     available = bool(flow.get("route")) and not bool(flow.get("isolated"))
     available = available and flow.get("route_available", True) is not False
     available = available and flow.get("service_available", True) is not False
@@ -2466,13 +2543,21 @@ def _evaluate_flow_slo(model: NetworkModel, flow: dict[str, Any]) -> dict[str, A
     ) -> None:
         if evidence not in {"modeled", "assumed", "not_modeled"}:
             raise ValueError(f"Unknown SLO evidence level: {evidence}")
+        effective_budget = budget
+        if comparison == "gte" and unit == "kbit/s" and flow.get("arrival_process") == "poisson" and budget is not None:
+            # Нет обязанности передавать данные, которые не поступили.
+            # Исходное требование сохраняем рядом с проверяемым спросом.
+            effective_budget = min(float(budget), offered_payload_kbps)
+        if packet_count == 0 and metric_id != "service_availability":
+            required = False
+            note_ru = "На этом шаге нет заявок; проверяется доступность услуги."
         compliant: bool | None
         if evidence == "not_modeled" or observed is None or budget is None:
             compliant = None
         elif comparison == "lte":
             compliant = float(observed) <= float(budget) + 1e-12
         elif comparison == "gte":
-            compliant = float(observed) + 1e-12 >= float(budget)
+            compliant = float(observed) + 1e-12 >= float(effective_budget)
         elif comparison == "eq":
             compliant = bool(observed) is bool(budget)
         else:
@@ -2485,6 +2570,7 @@ def _evaluate_flow_slo(model: NetworkModel, flow: dict[str, Any]) -> dict[str, A
                 else observed
             ),
             "budget_value": budget,
+            "effective_budget_value": effective_budget,
             "unit": unit,
             "comparison": comparison,
             "evidence": evidence,
@@ -2512,6 +2598,7 @@ def _evaluate_flow_slo(model: NetworkModel, flow: dict[str, Any]) -> dict[str, A
     loss_budget_percent = float(policy.get("packet_loss_budget_percent", math.inf))
     min_bitrate_kbps = float(policy.get("min_bitrate_kbps", 0.0))
     jitter_budget_ms = policy.get("jitter_budget_ms")
+    queue_jitter = flow.get("transport_queue", {}).get("jitter_ms")
 
     if traffic_kind in {"voice", "vlc_av"}:
         add_metric(
@@ -2547,13 +2634,13 @@ def _evaluate_flow_slo(model: NetworkModel, flow: dict[str, Any]) -> dict[str, A
         add_metric(
             "jitter_ms",
             label_ru="джиттер медиапотока",
-            observed=None,
+            observed=queue_jitter,
             budget=jitter_budget_ms,
             unit="ms",
             comparison="lte",
-            evidence="not_modeled",
-            value_origin="no_per_packet_arrival_time_series",
-            note_ru="без временного ряда прибытия пакетов джиттер не подменяется нулём",
+            evidence="assumed" if queue_jitter is not None else "not_modeled",
+            value_origin="finite_gelenbe_delay_variance",
+            note_ru="Разброс задержки оценён по очереди, в миллисекундах.",
         )
 
     elif traffic_kind == "ftp":
@@ -2567,11 +2654,18 @@ def _evaluate_flow_slo(model: NetworkModel, flow: dict[str, Any]) -> dict[str, A
         completion_budget = float(
             policy.get("completion_time_budget_seconds", math.inf)
         )
-        # Здесь нет полноценного TCP congestion-control. Поэтому goodput и
-        # completion являются консервативной производной по доставленным пакетам.
+        # Число сегментов за короткий шаг — пуассоновская реализация,
+        # а не оценка устойчивой скорости целого файла. Берём заданное
+        # ожидание полезной нагрузки и сохраняем текущую потерю эффективности
+        # (включая TCP-восстановление). Без ожидания остаётся прежняя оценка.
+        expected_payload_kbps = float(flow.get("normal_expected_payload_rate_bps",
+                                                offered_payload_kbps * 1000.0)) / 1000.0
+        efficiency = (min(1.0, delivered_payload_kbps / offered_payload_kbps)
+                      if offered_payload_kbps > 0 else delivery_ratio)
+        sustained_goodput_kbps = expected_payload_kbps * efficiency
         completion_seconds = (
             file_size_mib * 1024.0 * 1024.0 * 8.0
-            / max(delivered_payload_kbps * 1000.0, 1e-9)
+            / max(sustained_goodput_kbps * 1000.0, 1e-9)
         )
         add_metric(
             "ftp_goodput_kbps",
@@ -2592,7 +2686,8 @@ def _evaluate_flow_slo(model: NetworkModel, flow: dict[str, Any]) -> dict[str, A
             unit="s",
             comparison="lte",
             evidence="assumed",
-            value_origin="configured_file_size_divided_by_derived_goodput",
+            value_origin="configured_file_size_over_expected_payload_rate_times_observed_efficiency",
+            note_ru="Оценка при сохранении текущей эффективности; завершение целого файла не моделируется.",
         )
         add_metric(
             "tcp_retransmission_ratio_percent",
@@ -2708,12 +2803,12 @@ def _evaluate_flow_slo(model: NetworkModel, flow: dict[str, Any]) -> dict[str, A
         add_metric(
             "conference_jitter_ms",
             label_ru="джиттер конференции",
-            observed=None,
+            observed=queue_jitter,
             budget=jitter_budget_ms,
             unit="ms",
             comparison="lte",
-            evidence="not_modeled",
-            value_origin="no_per_packet_arrival_time_series",
+            evidence="assumed" if queue_jitter is not None else "not_modeled",
+            value_origin="finite_gelenbe_delay_variance",
         )
 
     elif traffic_kind == "live_streaming":

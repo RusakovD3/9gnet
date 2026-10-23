@@ -178,6 +178,8 @@ def main(argv: list[str] | None = None) -> int:
             report["checks"].append({"name": "syntax", "exit_code": 0})
             selection = list(QUICK_TESTS) if args.profile == "quick" else ["tests"]
             command("pytest", [sys.executable, "-m", "pytest", "-q", *selection,
+                               f"--basetemp={report_dir / 'pytest_tmp'}",
+                               "-o", f"cache_dir={report_dir / 'pytest_cache'}",
                                f"--junitxml={report_dir / 'pytest.xml'}"])
         elif args.profile == "smoke":
             workspace = report_dir / "workspace"

@@ -15,6 +15,9 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 from .arbitrator import TRIGGER_BANDS
+from .remapping import MAX_REMAP_UTILIZATION_PERCENT
+from .plot_style import (BACKGROUND, PANEL, TEXT, MUTED, BLUE, GREEN,
+                         AMBER, RED, PURPLE, save_figure, style_axis)
 
 
 AggregateSeriesSpec = tuple[str, str, str, str, float]
@@ -35,6 +38,11 @@ AGGREGATE_SERIES: tuple[AggregateSeriesSpec, ...] = (
 )
 
 TRAFFIC_SERIES: tuple[NestedSeriesSpec, ...] = (
+    ("normal_arrival_rate_pps", ("traffic", "summary", "normal_arrival_rate_pps"), 1.0),
+    ("attack_arrival_rate_pps", ("traffic", "summary", "attack_arrival_rate_pps"), 1.0),
+    ("filtered_normal_arrival_rate_pps", ("koopman", "kalman_filter", "filtered_normal_arrival_rate_pps"), 1.0),
+    ("raw_attack_rate_mbps", ("attacks", "raw_attack_rate_mbps"), 1.0),
+    ("admitted_attack_rate_mbps", ("attacks", "attack_rate_mbps"), 1.0),
     ("packet_count", ("traffic", "summary", "packet_count"), 1.0),
     ("traffic_rate_mbps", ("traffic", "summary", "offered_rate_mbps"), 1.0),
     ("traffic_delivered_rate_mbps", ("traffic", "summary", "delivered_rate_mbps"), 1.0),
@@ -105,7 +113,7 @@ def export_dynamics_charts(
 
 
 def extract_dynamics_chart_series(dynamics: dict[str, Any]) -> dict[str, list[float]]:
-    """Извлечь ровно те ряды, которые показаны на итоговых диаграммах."""
+    """Извлечь сохранённые ряды; отсутствующий результат не заменять успехом."""
     snapshots = dynamics.get("snapshots", [])
     names = (
         "time_seconds",
@@ -122,6 +130,15 @@ def extract_dynamics_chart_series(dynamics: dict[str, Any]) -> dict[str, list[fl
         for name, path, multiplier in (*TRAFFIC_SERIES, *ARBITRATOR_SERIES, *ATTACK_SERIES):
             default = 1.0 if name in {"gold_availability_percent", "legitimate_delivery_percent"} else 0.0
             series[name].append(_nested_float(snapshot, path, default=default) * multiplier)
+    for grade in ("gold", "silver", "bronze"):
+        values = []
+        for snapshot in snapshots:
+            tiers = snapshot.get("attacks", {}).get("sla_restoration", {}).get("tiers", [])
+            tier = next((t for t in tiers if t["sla_grade"] == grade), {})
+            count = tier.get("flow_count", 0)
+            values.append(100 * tier["sla_compliant_flow_count"] / count if count else float("nan"))
+        series[f"{grade}_sla_percent"] = values
+    series["kalman_applied"] = [bool(s.get("koopman", {}).get("kalman_filter", {}).get("applied_to_nominal_observation")) for s in snapshots]
     return series
 
 
@@ -148,140 +165,100 @@ def extract_application_series(dynamics: dict[str, Any]) -> dict[str, dict[str, 
     return result
 
 
-def _plot_dynamics_overview(
-    series: dict[str, list[float]],
-    dynamics: dict[str, Any],
-    path: Path,
-) -> None:
-    """Показать одну цепочку: сигнал, решение, действие и результат."""
-    fig, axes = _dashboard("GNet9 · ход сценария и результат защиты", 2, 2, (16, 11.5))
+def _plot_dynamics_overview(series, dynamics, path: Path) -> None:
+    """Сигнал → оценка → качество услуг → меры → обычный трафик → атаки."""
+    fig, axes = _dashboard("GNet9 · состояние сети и работа защиты", 3, 2, (16, 13.8))
     time = series["time_seconds"]
-
     ax = axes[0, 0]
-    _plot_line(ax, time, series["precursor_confidence_percent"], "предвестник", "#38bdf8")
-    _plot_line(ax, time, [value * 100.0 for value in series["koopman_forecast_risk"]], "риск Купмана", "#fbbf24")
-    _plot_line(ax, time, series["attack_intensity_percent"], "факт атаки", "#fb7185")
-    _plot_step(ax, time, series["koopman_warning_percent"], "подтверждённое предупреждение", "#a78bfa")
-    _style_axes(
-        ax,
-        "1. Наблюдаемый сигнал → предупреждение → факт",
-        "% условной шкалы",
-        (0, 105),
-        legend_columns=2,
-    )
+    _plot_line(ax, time, [v / 100 for v in series["precursor_confidence_percent"]], "наблюдаемый предвестник", BLUE)
+    _plot_line(ax, time, series["koopman_forecast_risk"], "оценка риска Купмана", AMBER)
+    _plot_step(ax, time, [v / 100 for v in series["koopman_warning_percent"]], "подтверждённое предупреждение", PURPLE)
+    _style_axes(ax, "01  Признаки угрозы и предупреждение", "условная шкала 0…1", (0, 1.06))
 
     ax = axes[0, 1]
-    _plot_line(ax, time, series["state_hausdorff_normalized"], "отличие от эталона", "#f97316")
-    _plot_line(ax, time, series["koopman_forecast_risk"], "риск Купмана", "#fbbf24")
-    _plot_line(ax, time, series["lyapunov_remap_pressure"], "вклад Ляпунова", "#a78bfa")
-    _plot_line(ax, time, series["remap_pressure"], "необходимость защиты", "#f87171")
-    for bound in TRIGGER_BANDS["decision"]:
-        ax.axhline(bound, color="#cbd5e1", linewidth=0.7, linestyle="--", alpha=0.45)
-    _style_axes(
-        ax,
-        "2. Основания для защиты",
-        "нормированная оценка 0…1",
-        (0, 1.02),
-        legend_columns=2,
-    )
+    for key, label, color in (("state_hausdorff_normalized", "изменение состояния", BLUE),
+                              ("lyapunov_remap_pressure", "вклад Ляпунова", PURPLE),
+                              ("remap_pressure", "необходимость защиты", RED)):
+        _plot_line(ax, time, series[key], label, color)
+    ax.axhline(TRIGGER_BANDS["decision"][0], color=MUTED, linewidth=.8, linestyle=":", label="граница наблюдения")
+    _style_axes(ax, "02  Основания решения арбитра", "нормированная оценка", (0, 1.06))
 
     ax = axes[1, 0]
-    _plot_step(ax, time, series["rerouted_flows"], "обойдены по другому маршруту", "#22d3ee")
-    _plot_step(ax, time, series["failover_flows"], "переведены на резервный сервер", "#a78bfa")
-    _plot_step(ax, time, series["isolated_flows"], "временно изолированы", "#fb7185")
-    upper = max(1.0, max(
-        series["rerouted_flows"] + series["failover_flows"] + series["isolated_flows"],
-        default=0.0,
-    ) * 1.18)
-    _style_axes(ax, "3. Какие меры защита реально применила", "число потоков", (0, upper), legend_columns=1)
+    for grade, label, color, pattern in (("gold", "золотой", AMBER, "-"),
+                                        ("silver", "серебряный", BLUE, "--"),
+                                        ("bronze", "бронзовый", PURPLE, ":")):
+        _plot_line(ax, time, series[f"{grade}_sla_percent"], label, color, linestyle=pattern)
+    finite = [v for grade in ("gold", "silver", "bronze") for v in series[f"{grade}_sla_percent"] if np.isfinite(v)]
+    minimum = min(finite, default=0)
+    lower = max(0, minimum - max(1, .2 * (100 - minimum)))
+    _style_axes(ax, "03  Выполнение требований к качеству услуг", "% учтённых потоков", (lower, 100.3))
+    if not finite:
+        ax.text(.5, .5, "Нет данных о качестве услуг", transform=ax.transAxes, color=MUTED, ha="center")
 
     ax = axes[1, 1]
-    _plot_line(ax, time, series["gold_availability_percent"], "доступность золотого класса", "#fbbf24")
-    _plot_line(ax, time, series["legitimate_delivery_percent"], "доставка полезных данных", "#34d399")
-    _plot_line(ax, time, series["post_remap_utilization_percent"], "максимальная загрузка после защиты", "#38bdf8")
-    ax.axhline(80.0, color="#f87171", linewidth=1.0, linestyle="--", label="предел ресурса 80 %")
-    _style_axes(
-        ax,
-        "4. Качество обслуживания после защиты",
-        "%",
-        (0, 105),
-        legend_columns=1,
-    )
+    _plot_step(ax, time, series["rerouted_flows"], "сменили маршрут", BLUE)
+    _plot_step(ax, time, series["failover_flows"], "перешли на резервный сервер", PURPLE)
+    _plot_step(ax, time, series["isolated_flows"], "изолированы", RED)
+    _style_axes(ax, "04  Применённые меры защиты", "число потоков", (0, max(1, max(series["rerouted_flows"] + series["failover_flows"] + series["isolated_flows"], default=0)) * 1.15))
 
-    for axis in axes.ravel():
-        axis.set_xlabel("время от t0, с", color="#cbd5e1")
+    ax = axes[2, 0]
+    _plot_line(ax, time, series["normal_arrival_rate_pps"], "обычные поступления", BLUE)
+    filtered = [v if enabled else float("nan") for v, enabled in zip(series["filtered_normal_arrival_rate_pps"], series["kalman_applied"])]
+    _plot_line(ax, time, filtered, "Калман на исправных наблюдениях", GREEN)
+    _style_axes(ax, "05  Обычный трафик и сглаживание шума", "пакетов/с")
+
+    ax = axes[2, 1]
+    _plot_line(ax, time, series["raw_attack_rate_mbps"], "предложенный поток атак", RED)
+    _plot_line(ax, time, series["admitted_attack_rate_mbps"], "допущен после защиты", AMBER)
+    _style_axes(ax, "06  Пакетный поток атак", "Мбит/с")
+    ax.set_ylim(bottom=0)
+
+    for axis in axes.flat:
+        axis.set_xlabel("время от t0, с", color=MUTED, fontsize=9)
+        if time:
+            axis.set_xlim(time[0], max(time[-1], time[0] + 1))
     _shade_attack_windows(axes, dynamics)
-    clean_steps = dynamics.get("training_summary", {}).get("clean_training_steps", 0)
+    training = dynamics.get("training_summary", {})
+    clean_steps = training.get("clean_training_steps", 0)
     training_end = clean_steps * dynamics.get("config", {}).get("step_seconds", 1)
-    if training_end > 0:
-        for axis in axes.ravel():
-            axis.axvspan(0, training_end, color="#22c55e", alpha=0.055, zorder=0)
-        axes[0, 0].text(0.02, 0.95, f"Исправная сеть: {clean_steps} шагов обучения", transform=axes[0, 0].transAxes, color="#86efac", fontsize=8, va="top")
-    fig.text(
-        0.5,
-        0.925,
-        "Источник всех рядов: снимки snapshots в network_dynamics.json. Риск Купмана — оценка, а не вероятность.",
-        ha="center",
-        va="center",
-        color="#94a3b8",
-        fontsize=8.1,
-    )
-    _save(fig, path, bottom=0.09, top=0.85)
+    for axis in axes.flat:
+        if training_end > 0:
+            axis.axvspan(0, training_end, color=GREEN, alpha=.045, zorder=0)
+    first = training.get("first_attack_step")
+    fig.text(.07, .936, f"Шагов: {dynamics.get('config', {}).get('step_count', 0)}     ·     Чистых переходов обучения: {clean_steps}     ·     Первая атака: {'нет' if first is None else 'шаг ' + str(first)}", color=TEXT, fontsize=11)
+    fig.text(.07, .908, "Зелёный фон — начальное обучение; красный и жёлтый — наблюдаемые атаки. Риск не является вероятностью.", color=MUTED, fontsize=9)
+    fig.text(.07, .015, "Источник: network_dynamics.json. Попытки входа и сбои питания учитываются по событиям, а не как пакетная перегрузка.", color=MUTED, fontsize=8)
+    _save(fig, path, bottom=.085, top=.85)
 
 
-def _plot_capacity_bottlenecks(model, snapshots: list[dict[str, Any]], path: Path) -> None:
-    """Показать только наиболее важный риск ёмкости, без второго дубля графика."""
-    fig, ax = _single_chart("GNet9 · наиболее загруженные связи", (13.5, 7.4))
-    if model is None:
-        ax.text(0.5, 0.5, "Для расчёта ёмкости нужна модель топологии", transform=ax.transAxes,
-                ha="center", va="center", color="#cbd5e1", fontsize=12)
-        _style_axes(ax, "Нет данных о каналах", "% доступной ёмкости", (0, 100), legend=False)
-        _save(fig, path)
-        return
-
-    top = sorted(_link_load_rows(model, snapshots), key=lambda row: row["utilization_percent"], reverse=True)[:8]
+def _plot_capacity_bottlenecks(model, snapshots, path: Path) -> None:
+    fig, axes = _dashboard("GNet9 · нагрузка и запас ресурсов", 2, 1, (13, 10))
+    ax, trend = axes[:, 0]
+    rows = _link_load_rows(model, snapshots)
+    top = sorted(rows, key=lambda row: row["utilization_percent"], reverse=True)[:8]
+    limit = MAX_REMAP_UTILIZATION_PERCENT
+    bars = ax.barh([r["label"] for r in reversed(top)], [r["utilization_percent"] for r in reversed(top)],
+                   color=[RED if r["utilization_percent"] > limit else BLUE for r in reversed(top)], height=.6)
+    for bar, row in zip(bars, reversed(top)):
+        ax.text(bar.get_width() + .8, bar.get_y() + bar.get_height() / 2,
+                f"{row['utilization_percent']:.2f}% · шаг {row['step_index']}", va="center", color=TEXT, fontsize=9)
     if not top:
-        ax.text(0.5, 0.5, "В снимках нет модельных потоков", transform=ax.transAxes,
-                ha="center", va="center", color="#cbd5e1", fontsize=12)
-        _style_axes(ax, "Нет данных о каналах", "% доступной ёмкости", (0, 100), legend=False)
-        _save(fig, path)
-        return
-
-    labels = [row["label"] for row in reversed(top)]
-    values = [row["utilization_percent"] for row in reversed(top)]
-    colors = ["#f87171" if value >= 80.0 else "#60a5fa" for value in values]
-    bars = ax.barh(labels, values, color=colors, height=0.62)
-    ax.axvline(80.0, color="#f87171", linewidth=1.2, linestyle="--")
-    for bar, value in zip(bars, values):
-        ax.text(value + 0.65, bar.get_y() + bar.get_height() / 2, f"{value:.2f} %",
-                va="center", color="#e2e8f0", fontsize=9)
-    limit = max(80.0, max(values, default=0.0) * 1.20) + 4.0
-    _style_axes(
-        ax,
-        "Пиковая расчётная загрузка за весь прогон",
-        "% доступной ёмкости",
-        legend=False,
-    )
-    ax.set_xlim(0, limit)
-    ax.text(
-        80.0,
-        0.98,
-        "предел допуска 80 %",
-        transform=ax.get_xaxis_transform(),
-        ha="right",
-        va="top",
-        color="#fca5a5",
-        fontsize=8.6,
-        bbox={"boxstyle": "round,pad=0.18", "fc": "#111827", "ec": "#f87171", "alpha": 0.95},
-    )
-    ax.set_xlabel("максимум по всем шагам сценария", color="#cbd5e1")
-    fig.text(
-        0.5,
-        0.925,
-        "Источник: сохранённые модельные потоки из снимков network_dynamics.json.",
-        ha="center", va="center", color="#94a3b8", fontsize=8.1,
-    )
-    _save(fig, path, bottom=0.12, top=0.84, left=0.15)
+        ax.text(.5, .5, "Нет данных о нагрузке линий", transform=ax.transAxes, color=MUTED, ha="center")
+    _style_axes(ax, "01  Пиковая нагрузка линий за весь расчёт", "% пропускной способности", legend=False)
+    ax.axvline(limit, color=RED, linestyle="--", linewidth=1)
+    ax.set_xlim(0, max(limit, max((r["utilization_percent"] for r in top), default=0) * 1.25) + 8)
+    ax.text(limit, 1.01, f"допуск новых маршрутов: {limit:g}%", transform=ax.get_xaxis_transform(), color=RED, ha="right", fontsize=8)
+    time = [s.get("time_seconds", 0) for s in snapshots]
+    # Ряд по каждому шагу, а не максимум из ограниченного списка top-8.
+    peak_series = [_snapshot_peak_load(model, s) for s in snapshots]
+    _plot_line(trend, time, peak_series, "максимальная нагрузка линии", BLUE)
+    projected = [_nested_float(s, ("attacks", "routing", "maximum_projected_utilization_percent"), default=float("nan")) for s in snapshots]
+    _plot_line(trend, time, projected, "оценка ресурсов после смены маршрутов", PURPLE)
+    trend.axhline(limit, color=RED, linestyle="--", linewidth=1, label=f"допуск новых маршрутов: {limit:g}%")
+    _style_axes(trend, "02  Нагрузка во времени", "%", (0, max(105, max(peak_series, default=0) * 1.1)))
+    trend.set_xlabel("время от t0, с", color=MUTED)
+    fig.text(.15, .93, "Пик считается по скорости на каждом шаге. Пропускная способность и правила допуска взяты из модели.", color=MUTED, fontsize=9)
+    _save(fig, path, bottom=.12, top=.86, left=.15)
 
 
 def _attack_windows(dynamics: dict[str, Any]) -> list[dict[str, Any]]:
@@ -307,58 +284,57 @@ def _shade_attack_windows(axes, dynamics: dict[str, Any]) -> None:
             axis.axvspan(window["start"], window["end"], color=color, alpha=0.075, zorder=0)
 
 
-def _link_load_rows(model, snapshots: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    peak_bytes: dict[frozenset[str], int] = {}
-    interval_by_edge: dict[frozenset[str], int] = {}
-    for snapshot in snapshots:
-        current: dict[frozenset[str], int] = {}
-        for flow in snapshot.get("traffic", {}).get("flows", []):
-            interval = int(flow.get("interval_seconds", 1))
-            route = flow.get("route", [])
-            for source, target in zip(route, route[1:]):
-                edge = frozenset((source, target))
-                current[edge] = current.get(edge, 0) + int(flow.get("wire_bytes", 0))
-                interval_by_edge[edge] = interval
-        for edge, wire_bytes in current.items():
-            peak_bytes[edge] = max(peak_bytes.get(edge, 0), wire_bytes)
-
-    rows = []
-    for edge, wire_bytes in peak_bytes.items():
-        source, target = sorted(edge)
-        if not model.graph.has_edge(source, target):
+def _snapshot_link_loads(model, snapshot):
+    """Скорости линий в Мбит/с из сохранённых показателей или полных потоков."""
+    state = snapshot.get("traffic", {}).get("network_state", {})
+    if "edge_vectors" in state:
+        names = state["edge_metric_names"]
+        speed, capacity = names.index("speed_mbps"), names.index("capacity_mbps")
+        return [(tuple(edge), values[speed], values[capacity]) for edge, values in zip(state["edge_ids"], state["edge_vectors"])]
+    if "edges" in state:
+        return [((e["source"], e["target"]), e["metrics"]["speed_mbps"], e["metrics"]["capacity_mbps"]) for e in state["edges"]]
+    rates = {}
+    for flow in snapshot.get("traffic", {}).get("flows", []):
+        if flow.get("isolated") or flow.get("quarantined"):
             continue
-        capacity = float(model.graph.edges[source, target].get("capacity_mbps", 0.0))
-        rate = wire_bytes * 8.0 / max(interval_by_edge.get(edge, 1), 1) / 1_000_000.0
-        rows.append({
-            "label": f"{source} ↔ {target}",
-            "utilization_percent": rate / max(capacity, 1e-9) * 100.0,
-        })
-    return rows
+        rate = int(flow.get("wire_bytes", 0)) * 8 / max(float(flow.get("interval_seconds", 1)), 1e-9) / 1e6
+        for source, target in zip(flow.get("route", []), flow.get("route", [])[1:]):
+            edge = tuple(sorted((source, target)))
+            rates[edge] = rates.get(edge, 0) + rate
+    return [(edge, rate, float(model.graph.edges[edge].get("capacity_mbps", 0)))
+            for edge, rate in rates.items() if model is not None and model.graph.has_edge(*edge)]
+
+
+def _snapshot_peak_load(model, snapshot):
+    return max((rate / capacity * 100 for _, rate, capacity in _snapshot_link_loads(model, snapshot) if capacity > 0), default=0)
+
+
+def _link_load_rows(model, snapshots):
+    """Для каждой линии сохранить её пик и шаг, на котором он достигнут."""
+    peaks = {}
+    for snapshot in snapshots:
+        for edge, rate, capacity in _snapshot_link_loads(model, snapshot):
+            if capacity <= 0:
+                continue
+            edge = tuple(sorted(edge))
+            utilization = rate / capacity * 100
+            if edge not in peaks or utilization > peaks[edge]["utilization_percent"]:
+                peaks[edge] = {"label": " ↔ ".join(edge), "utilization_percent": utilization,
+                               "step_index": snapshot.get("step_index", 0)}
+    return list(peaks.values())
 
 
 def _dashboard(title: str, rows: int, columns: int, size: tuple[float, float]):
     fig, axes = plt.subplots(rows, columns, figsize=size, squeeze=False)
     fig.suptitle(title, color="#f8fafc", fontsize=17, fontweight="bold", y=0.975)
-    _dark_figure(fig, axes)
+    fig.set_facecolor(BACKGROUND)
+    for axis in axes.flat:
+        axis.set_facecolor(PANEL)
     return fig, axes
 
 
-def _single_chart(title: str, size: tuple[float, float]):
-    fig, ax = plt.subplots(figsize=size)
-    fig.suptitle(title, color="#f8fafc", fontsize=17, fontweight="bold", y=0.975)
-    _dark_figure(fig, (ax,))
-    return fig, ax
-
-
-def _dark_figure(fig, axes) -> None:
-    fig.patch.set_facecolor("#0f172a")
-    for axis in np.asarray(axes).flat:
-        axis.set_facecolor("#111827")
-
-
 def _plot_line(ax, x, y, label: str, color: str, *, linestyle: str = "-") -> None:
-    mark_every = max(1, len(x) // 16) if x else 1
-    ax.plot(x, y, marker="o", markevery=mark_every, markersize=3.2, linewidth=1.9,
+    ax.plot(x, y, linewidth=1.8,
             linestyle=linestyle, color=color, label=label)
 
 
@@ -373,27 +349,21 @@ def _style_axes(
     ylim=None,
     *,
     legend: bool = True,
-    legend_columns: int = 1,
+    legend_columns: int = 2,
 ) -> None:
-    ax.set_title(title, color="#f8fafc", fontsize=11.8, fontweight="bold", pad=10)
-    ax.set_ylabel(ylabel, color="#cbd5e1")
-    ax.tick_params(colors="#cbd5e1")
-    for spine in ax.spines.values():
-        spine.set_color("#334155")
-    ax.grid(True, axis="y", color="#334155", linewidth=0.7, alpha=0.65)
-    ax.set_axisbelow(True)
+    style_axis(ax, title, ylabel)
     if ylim is not None:
         ax.set_ylim(*ylim)
     if legend:
         # Легенда находится под данными, а не поверх линий и столбцов.
         ax.legend(
             loc="upper center",
-            bbox_to_anchor=(0.5, -0.22),
+            bbox_to_anchor=(0.5, -0.23),
             ncol=legend_columns,
-            facecolor="#172033",
+            facecolor=PANEL,
             edgecolor="#475569",
             labelcolor="#e2e8f0",
-            fontsize=7.7,
+            fontsize=8,
         )
 
 
@@ -405,9 +375,8 @@ def _save(
     top: float = 0.89,
     left: float = 0.075,
 ) -> None:
-    fig.subplots_adjust(left=left, right=0.985, bottom=bottom, top=top, hspace=0.78, wspace=0.28)
-    fig.savefig(path, dpi=180, bbox_inches="tight", pad_inches=0.12, facecolor=fig.get_facecolor())
-    plt.close(fig)
+    fig.subplots_adjust(left=left, right=0.985, bottom=bottom, top=top, hspace=0.65, wspace=0.26)
+    save_figure(fig, path)
 
 
 def _aggregate(snapshot: dict[str, Any], level: str, metric: str, statistic: str) -> float:
