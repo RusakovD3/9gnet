@@ -29,11 +29,11 @@ def save_figure(fig, path: Path, *, dpi: int = 180) -> None:
 def style_axis(ax, title: str, ylabel: str = "") -> None:
     ax.figure.set_facecolor(BACKGROUND)
     ax.set_facecolor(PANEL)
-    ax.set_title(title, color=TEXT, fontsize=11, fontweight="bold", loc="left", pad=12)
+    ax.set_title(title, color=TEXT, fontsize=11, fontweight="bold", loc="left", pad=14)
     ax.set_ylabel(ylabel, color=MUTED, fontsize=9)
     ax.tick_params(colors=MUTED, labelsize=8)
     for spine in ax.spines.values():
         spine.set_color(BORDER)
     ax.spines[["top", "right"]].set_visible(False)
-    ax.grid(axis="y", color=BORDER, linewidth=0.6, alpha=0.65)
+    ax.grid(axis="y", color=BORDER, linewidth=0.6, alpha=0.45)
     ax.set_axisbelow(True)

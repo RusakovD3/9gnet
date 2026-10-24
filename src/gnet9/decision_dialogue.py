@@ -27,7 +27,23 @@ def build_algorithm_dialogue(dynamics: dict[str, Any]) -> dict[str, Any]:
         top_kvu = hierarchy[0] if hierarchy else {}
         card = snapshot.get("arbitrator", {}).get("trigger_card", {})
         training = snapshot.get("training", {})
+        kalman = koopman.get("kalman_filter", {})
+        routing = snapshot.get("attacks", {}).get("routing", {})
+        executed = routing.get("actions", [])
+        tiers = snapshot.get("attacks", {}).get("sla_restoration", {}).get("tiers", [])
         turns = [
+            {
+                "algorithm": "Нормировка и фильтр Калмана",
+                "evidence": {key: kalman.get(key) for key in (
+                    "applied_to_nominal_observation", "healthy_quality_observation", "process_variance", "measurement_variance")},
+                "message_ru": (
+                    "Обычные нормированные показатели сглажены; признаки угроз и потерь сохранены."
+                    if kalman.get("applied_to_nominal_observation") is True else
+                    "Сглаживание обойдено: текущие значения переданы напрямую, память исправной сети сохранена."
+                    if kalman.get("applied_to_nominal_observation") is False else
+                    "Данных о применении фильтра нет."
+                ),
+            },
             {
                 "algorithm": "Хаусдорф: отличие от эталона",
                 "evidence": {
@@ -47,6 +63,9 @@ def build_algorithm_dialogue(dynamics: dict[str, Any]) -> dict[str, Any]:
                     "early_warning": bool(koopman.get("forecast_is_early_warning")),
                     "targets": koopman.get("forecast_target_ids", []),
                     "tensor_matrix_residual": koopman.get("tensor_matrix_koopman", {}).get("one_step_residual"),
+                    "window_start_seconds": koopman.get("forecast_window_start_seconds"),
+                    "window_end_seconds": koopman.get("forecast_window_end_seconds"),
+                    "nominal_training": koopman.get("nominal_training"),
                 },
                 "message_ru": (
                     "Оценка риска по текущим и прошлым наблюдениям невысока."
@@ -86,8 +105,18 @@ def build_algorithm_dialogue(dynamics: dict[str, Any]) -> dict[str, Any]:
                     "attacker_payoff": selected.get("attacker_payoff"),
                 },
                 "message_ru": (
-                    f"Решение: {ACTION_DISPLAY_NAMES.get(remap.get('action', 'NO_REMAP'), 'неизвестное действие')}; "
+                    f"Предложение арбитра: {ACTION_DISPLAY_NAMES.get(remap.get('action', 'NO_REMAP'), 'неизвестное действие')}; "
                     f"сравнение вариантов рекомендует: {ACTION_DISPLAY_NAMES.get(game.get('recommended_action', 'NO_REMAP'), 'неизвестное действие')}."
+                ),
+            },
+            {
+                "algorithm": "Фактическое исполнение и качество услуг",
+                "evidence": {"actions": executed, "sla_tiers": tiers,
+                    "maximum_admitted_route_utilization_percent": routing.get("maximum_admitted_route_utilization_percent")},
+                "message_ru": (
+                    f"В текущем снимке записано действий над потоками: {len(executed)}. "
+                    "Качество услуг проверено по сохранённым результатам каждого класса."
+                    if tiers else "Данных о выполнении SLA в текущем снимке нет."
                 ),
             },
             {

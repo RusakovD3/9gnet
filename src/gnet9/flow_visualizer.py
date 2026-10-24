@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from pathlib import Path
+import textwrap
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -14,8 +15,9 @@ from matplotlib.widgets import Button, Slider
 import numpy as np
 
 from .constants import SERVICE_DISPLAY_NAMES
-from .flow_details import (FLOW_SHORT_LABELS, _flow_summary,
-                           _interactive_snapshot_summary, _node_hover_text)
+from .flow_details import (FLOW_SHORT_LABELS, _flow_summary, _flow_is_visible,
+                           _interactive_snapshot_summary, _interactive_status_sections,
+                           _node_hover_text)
 from .network_layout import network_positions as _positions
 from .plot_style import BACKGROUND, PANEL, TEXT, BORDER, save_figure
 
@@ -49,6 +51,8 @@ def aggregate_flow_edges(flows: list[dict[str, Any]]) -> dict[frozenset[str], di
     """Суммировать потоки, байты и приложения на каждой пройденной связи."""
     result: dict[frozenset[str], dict[str, Any]] = {}
     for flow in flows:
+        if not _flow_is_visible(flow):
+            continue
         route = flow.get("route", [])
         for source, target in zip(route, route[1:]):
             key = frozenset((source, target))
@@ -138,9 +142,9 @@ class ServiceFlowWindow:
     """Интерактивное окно трафика с выбором и просмотром точного шага."""
 
     def __init__(self, model, snapshots: list[dict[str, Any]], *, particles_per_frame: int = 52) -> None:
-        usable = [snapshot for snapshot in snapshots if snapshot.get("traffic", {}).get("flows")]
-        if not usable:
+        if not any(isinstance(snapshot.get("traffic", {}).get("flows"), list) for snapshot in snapshots):
             raise ValueError("Для интерактивного окна требуется packet_detail='flows' или 'sample'")
+        usable = list(snapshots)
         self.model = model
         self.snapshots = usable
         self.pos = _positions(model)
@@ -154,18 +158,18 @@ class ServiceFlowWindow:
         self.frames_per_step = 32
         self.step_index = 0
         self._syncing_slider = False
-        self.edge_loads = [aggregate_flow_edges(snapshot["traffic"]["flows"]) for snapshot in usable]
-        self.max_wire_bytes = max(
+        self.edge_loads = [aggregate_flow_edges(snapshot.get("traffic", {}).get("flows", [])) for snapshot in usable]
+        self.max_wire_bytes = max(1, max(
             (item["wire_bytes"] for loads in self.edge_loads for item in loads.values()), default=1
-        )
+        ))
 
         # The main network area is intentionally wider than the side panels:
         # 480 endpoints are readable without zooming into a single access group.
         self.fig, self.ax = plt.subplots(figsize=(28, 16))
         self.fig.subplots_adjust(bottom=0.125, right=0.770, left=0.018, top=0.94)
-        self.status_ax = self.fig.add_axes([0.790, 0.455, 0.200, 0.485])
-        self.legend_ax = self.fig.add_axes([0.790, 0.245, 0.200, 0.185])
-        self.help_ax = self.fig.add_axes([0.790, 0.065, 0.200, 0.150])
+        self.status_ax = self.fig.add_axes([0.790, 0.295, 0.200, 0.650])
+        self.legend_ax = self.fig.add_axes([0.790, 0.140, 0.200, 0.140])
+        self.help_ax = self.fig.add_axes([0.790, 0.025, 0.200, 0.100])
         for panel_ax in (self.status_ax, self.legend_ax, self.help_ax):
             panel_ax.set_axis_off()
             panel_ax.set_facecolor("none")
@@ -200,20 +204,29 @@ class ServiceFlowWindow:
             linewidths=2.6, alpha=0.96, zorder=16,
         )
         panel_style = {"boxstyle": "round,pad=0.55", "fc": "#172033", "ec": "#475569", "alpha": 0.96}
-        self.status = self.status_ax.text(
-            0.0, 1.0, "", transform=self.status_ax.transAxes, va="top", fontsize=7.15,
-            color="#f8fafc", linespacing=1.06, bbox=panel_style, wrap=True,
-        )
+        self.status_cards = []
+        top = 1.0
+        for height in (0.205, 0.205, 0.235, 0.205, 0.150):
+            bottom = top - height
+            panel = FancyBboxPatch((0, bottom + 0.01), 1.0, height - 0.018,
+                                  transform=self.status_ax.transAxes, boxstyle="round,pad=0.008",
+                                  facecolor=PANEL, edgecolor=BORDER, linewidth=1)
+            self.status_ax.add_patch(panel)
+            heading = self.status_ax.text(0.025, top - 0.018, "", va="top", fontsize=11.8,
+                                          fontweight="bold", transform=self.status_ax.transAxes)
+            body = self.status_ax.text(0.025, top - 0.052, "", va="top", fontsize=11.0,
+                                       color=TEXT, linespacing=1.22, transform=self.status_ax.transAxes)
+            self.status_cards.append((heading, body, panel))
+            top = bottom
+        self.status = self.status_cards[0][1]
         self.help_text = self.help_ax.text(
             0.0, 1.0,
-            "КАК ЧИТАТЬ\n\n"
-            "Цвет магистрали — ведущий сервис;\n"
-            "линия абонента окрашена как M или F.\n"
-            "Толщина — объём за шаг, точка — пакет.\n"
-            "Красное кольцо — атака; фиолетовое — прогноз.\n\n"
-            "Наведите на узел для карточки.\n"
-            "Шкала выбирает снимок и ставит паузу.",
-            transform=self.help_ax.transAxes, va="top", fontsize=7.15, color="#dbeafe",
+            "КАК ЧИТАТЬ И УПРАВЛЯТЬ\n"
+            "Точки — условная выборка потоков, не отдельные пакеты.\n"
+            "Толщина линии — объём за шаг; цвет — услуга.\n"
+            "← / → — шаг; пробел — воспроизведение / пауза.\n"
+            "Наведение — показатели выбранного шага.",
+            transform=self.help_ax.transAxes, va="top", fontsize=9.2, color="#dbeafe",
             linespacing=1.12, bbox=panel_style,
         )
         self.hover_note = self.ax.annotate(
@@ -228,10 +241,11 @@ class ServiceFlowWindow:
         # если объект виден, его смысл можно узнать наведением.
         self.hover_nodes = list(model.graph.nodes)
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_hover)
+        self.fig.canvas.mpl_connect("key_press_event", self._on_key)
 
-        slider_ax = self.fig.add_axes([0.12, 0.045, 0.52, 0.027])
+        slider_ax = self.fig.add_axes([0.18, 0.045, 0.41, 0.027])
         self.slider = Slider(
-            slider_ax, "Шаг", 0, len(usable) - 1, valinit=0, valstep=1,
+            slider_ax, "Шаг", 0, max(1, len(usable) - 1), valinit=0, valstep=1,
             valfmt="%d", color="#38bdf8", initcolor="none"
         )
         self.slider.label.set_color("#f8fafc")
@@ -248,9 +262,14 @@ class ServiceFlowWindow:
         self.slider.on_changed(self._select_step)
         self.slider.track.set_facecolor("#334155")
         self.playback_status = self.fig.text(
-            0.12, 0.090, "", ha="left", va="center",
-            color="#e2e8f0", fontsize=8.5, fontweight="bold",
+            0.16, 0.090, "", ha="left", va="center",
+            color="#e2e8f0", fontsize=10.5, fontweight="bold",
         )
+        self.previous_button = Button(self.fig.add_axes([0.022, 0.027, 0.06, 0.055]), "← Назад", color=PANEL, hovercolor=BORDER)
+        self.next_button = Button(self.fig.add_axes([0.086, 0.027, 0.06, 0.055]), "Вперёд →", color=PANEL, hovercolor=BORDER)
+        for step_button, direction in ((self.previous_button, -1), (self.next_button, 1)):
+            step_button.label.set_color(TEXT)
+            step_button.on_clicked(lambda event, shift=direction: self._move_step(shift))
         button_ax = self.fig.add_axes([0.665, 0.027, 0.105, 0.055])
         self.button = Button(button_ax, "▶  Продолжить", color="#2563eb", hovercolor="#3b82f6")
         self.button.label.set_color("#f8fafc")
@@ -289,32 +308,52 @@ class ServiceFlowWindow:
         self.hover_note.set_position((-12 if right_half else 12, -12 if upper_half else 12))
         self.hover_note.set_ha("right" if right_half else "left")
         self.hover_note.set_va("top" if upper_half else "bottom")
-        self.hover_note.set_text(_node_hover_text(self.model, node_id))
+        self.hover_note.set_text(_node_hover_text(self.model, node_id, self.snapshots[self.step_index]))
         self.hover_note.set_visible(True)
         self.fig.canvas.draw_idle()
 
     def _select_step(self, value: float) -> None:
         if self._syncing_slider:
             return
-        self.step_index = int(value)
+        self.step_index = max(0, min(len(self.snapshots) - 1, int(value)))
+        if int(value) != self.step_index:
+            self._sync_slider()
         self.frame_in_step = (
             0
             if self.step_index == 0
             else int(round(((self.step_index * 0.173) % 1.0) * self.frames_per_step))
         )
         self.paused = True
+        self.hover_note.set_visible(False)
         self._set_playback_style()
         self._render_snapshot(update_edges=True)
         self.fig.canvas.draw_idle()
 
+    def _move_step(self, direction: int) -> None:
+        """Выбрать соседний сохранённый снимок и остановить воспроизведение."""
+        self._select_step(self.step_index + direction)
+        self._sync_slider()
+
+    def _on_key(self, event) -> None:
+        if event.key in {"right", "left"}:
+            self._move_step(1 if event.key == "right" else -1)
+        elif event.key in {" ", "space"}:
+            self._toggle_pause(event)
+        elif event.key in {"home", "end"}:
+            self._select_step(0 if event.key == "home" else len(self.snapshots) - 1)
+            self._sync_slider()
+
     def _toggle_pause(self, _event) -> None:
+        restarted = False
         if self.paused and self.step_index == len(self.snapshots) - 1 and self.frame_in_step >= self.frames_per_step:
             self.step_index = 0
             self.frame_in_step = 0
+            self.hover_note.set_visible(False)
+            restarted = True
             self._sync_slider()
         self.paused = not self.paused
         self._set_playback_style()
-        self._render_snapshot(update_edges=False)
+        self._render_snapshot(update_edges=restarted)
         self.fig.canvas.draw_idle()
 
     def _update(self, _frame_number):
@@ -328,6 +367,7 @@ class ServiceFlowWindow:
                 frames_per_step=self.frames_per_step,
             )
             if self.step_index != previous_step:
+                self.hover_note.set_visible(False)
                 self._sync_slider()
                 self._set_playback_style()
                 update_edges = True
@@ -340,12 +380,14 @@ class ServiceFlowWindow:
         self._syncing_slider = True
         try:
             self.slider.set_val(self.step_index)
+            self.slider.valtext.set_text(str(self.snapshots[self.step_index].get("step_index", self.step_index)))
         finally:
             self._syncing_slider = False
 
     def _set_playback_style(self, *, finished: bool = False) -> None:
         snapshot = self.snapshots[self.step_index]
         actual_step = int(snapshot.get("step_index", self.step_index))
+        self.slider.valtext.set_text(str(actual_step))
         final_actual_step = int(
             self.snapshots[-1].get("step_index", len(self.snapshots) - 1)
         )
@@ -371,7 +413,7 @@ class ServiceFlowWindow:
 
     def _render_snapshot(self, *, update_edges: bool):
         snapshot = self.snapshots[self.step_index]
-        flows = snapshot["traffic"]["flows"]
+        flows = snapshot.get("traffic", {}).get("flows", [])
         loads = self.edge_loads[self.step_index]
         if update_edges:
             for key, line in self.edge_artists.items():
@@ -457,7 +499,12 @@ class ServiceFlowWindow:
             if failover_servers else np.empty((0, 2))
         )
         self.failover_servers.set_sizes([310.0 for _ in failover_servers])
-        self.status.set_text(_interactive_snapshot_summary(snapshot, flows, loads, self.paused, self.model))
+        for section, (heading, body, panel) in zip(
+                _interactive_status_sections(snapshot, flows, loads, self.paused, self.model), self.status_cards):
+            heading.set_text(section["title"])
+            heading.set_color(section["color"])
+            body.set_text("\n".join(textwrap.fill(line, width=57) for line in section["lines"]))
+            panel.set_edgecolor(section["color"])
         return (
             self.particle_glow,
             self.particles,
@@ -465,7 +512,7 @@ class ServiceFlowWindow:
             self.warning_targets,
             self.isolated_nodes,
             self.failover_servers,
-            self.status,
+            *(text for heading, body, _ in self.status_cards for text in (heading, body)),
             *self.edge_artists.values(),
         )
 
@@ -715,11 +762,14 @@ def _draw_legend(ax, *, static=False, compact=False, applications=None,
         handles = [
             *flow_handles[:6],
             *subscriber_handles,
-            semantic_handles[1], semantic_handles[2], semantic_handles[3],
-            semantic_handles[7], semantic_handles[8], semantic_handles[11],
-            semantic_handles[12], semantic_handles[13],
+            semantic_handles[7], semantic_handles[9], semantic_handles[10],
+            semantic_handles[11], semantic_handles[12], semantic_handles[13],
         ]
-        legend_options = {"loc": "upper left", "bbox_to_anchor": (0.0, 1.0), "ncol": 1, "borderaxespad": 0.0}
+        for handle, label in zip(handles[-6:], ("Цель атаки", "Область прогноза", "Изолированный абонент",
+                                               "Резервный сервер", "Маршрут изменён", "Резерв без потока")):
+            handle.set_label(label)
+        legend_options = {"loc": "upper left", "bbox_to_anchor": (0.0, 1.0), "ncol": 2,
+                          "columnspacing": 0.9, "handlelength": 1.7, "borderaxespad": 0.0}
     else:
         handles = [*flow_handles, *subscriber_handles, *semantic_handles]
         legend_options = (
@@ -728,15 +778,16 @@ def _draw_legend(ax, *, static=False, compact=False, applications=None,
         )
     legend = ax.legend(
         handles=handles, framealpha=0.96, facecolor="#111827", edgecolor="#475569",
-        labelcolor="#e2e8f0", fontsize=8.2 if static else 6.7 if compact else 7.05,
+        labelcolor="#e2e8f0", fontsize=8.2 if static else 8.6 if compact else 7.05,
         title="Узлы и связи" if topology_only else "Условные обозначения" if compact else "Узлы и потоки",
-        title_fontsize=7.6 if compact else 8.3, **legend_options,
+        title_fontsize=10.0 if compact else 8.3, **legend_options,
     )
     legend.get_title().set_color("#f8fafc")
     legend.set_zorder(20)
 
 
 def _spread_sample(flows: list[dict[str, Any]], limit: int, frame: int) -> list[dict[str, Any]]:
+    flows = [flow for flow in flows if _flow_is_visible(flow)]
     if len(flows) <= limit:
         return flows
     attack_flows = [flow for flow in flows if flow.get("is_attack_traffic")]
@@ -777,6 +828,8 @@ def _particle_progress(
 
 
 def _point_on_route(route: list[str], pos: dict[str, tuple[float, float]], progress: float) -> tuple[float, float] | None:
+    if any(node not in pos for node in route):
+        return None
     points = [pos[node] for node in route if node in pos]
     if len(points) < 2:
         return None
