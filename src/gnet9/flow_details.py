@@ -3,9 +3,7 @@
 from collections import Counter
 from typing import Any
 
-import numpy as np
-
-from .constants import ACTION_DISPLAY_NAMES, SERVICE_DISPLAY_NAMES
+from .constants import ACTION_DISPLAY_NAMES, ATTACK_KIND_DISPLAY_NAMES, SERVICE_DISPLAY_NAMES
 
 FLOW_SHORT_LABELS = {
     "RTP_OPUS": "Голос · Opus/RTP",
@@ -69,7 +67,7 @@ def _flow_summary(flows: list[dict[str, Any]]) -> str:
     wire_bytes = sum(int(flow.get("wire_bytes", 0)) for flow in flows)
     routed_flows = [
         flow for flow in flows
-        if flow.get("route") and not flow.get("isolated") and int(flow.get("packet_count", 0)) > 0
+        if _flow_is_visible(flow)
     ]
     routed_wire_bytes = sum(int(flow.get("wire_bytes", 0)) for flow in routed_flows)
     delivered_packets = sum(
@@ -99,78 +97,132 @@ def _flow_summary(flows: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _interactive_snapshot_summary(snapshot, flows, loads, paused: bool, model) -> str:
-    """Краткая карточка для окна: она всегда помещается в выделенную панель."""
-    legitimate = [flow for flow in flows if not flow.get("is_attack_traffic")]
-    active_attacks = snapshot.get("attacks", {})
+def _flow_is_visible(flow: dict[str, Any]) -> bool:
+    """Анимация показывает выборку только реально маршрутизируемых потоков."""
+    return (len(flow.get("route") or []) >= 2 and not flow.get("isolated")
+            and not flow.get("quarantined") and int(flow.get("packet_count", 0)) > 0
+            and flow.get("route_available", True) is not False)
+
+
+def _interactive_status_sections(snapshot, flows, loads, paused: bool, model):
+    """Готовые наблюдения и решения; интерфейс не пересчитывает пороги."""
+    attacks = snapshot.get("attacks", {})
     koopman = snapshot.get("koopman", {})
-    routing = active_attacks.get("routing", {})
-    latencies = [
-        float(flow.get("one_way_latency_ms", 0.0))
-        for flow in legitimate
-        if not flow.get("isolated")
-    ]
-    mode = "ПАУЗА" if paused else "ВОСПРОИЗВЕДЕНИЕ"
+    routing = attacks.get("routing", {})
     step = int(snapshot.get("step_index", 0))
-    time_seconds = float(snapshot.get("time_seconds", 0.0))
-    remap = snapshot.get("arbitrator", {}).get("remap", {}).get("action", "—")
-    attack_names = ", ".join(
-        str(event.get("name_ru") or event.get("attack_id") or "атака")
-        for event in active_attacks.get("events", [])[:2]
-    )
-    if len(active_attacks.get("events", [])) > 2:
-        attack_names += f" и ещё {len(active_attacks['events']) - 2}"
+    now = float(snapshot.get("time_seconds", 0.0))
     warning = bool(koopman.get("forecast_is_early_warning"))
-    targets = ", ".join(map(str, koopman.get("forecast_target_ids", [])[:3])) or "—"
-    if active_attacks.get("active"):
-        status = "НАБЛЮДАЕМАЯ АТАКА"
-    elif warning:
-        status = "ПРЕДУПРЕЖДЕНИЕ ПОДТВЕРЖДЕНО"
-    elif active_attacks.get("precursor_active"):
-        status = "НАБЛЮДАЮТСЯ ПРИЗНАКИ УГРОЗЫ"
+    if attacks.get("active"):
+        state, color = "НАБЛЮДАЕМАЯ АТАКА", "#fb7185"
+    elif attacks.get("precursor_active"):
+        state, color = "НАБЛЮДАЮТСЯ ПРИЗНАКИ УГРОЗЫ", "#fbbf24"
     elif koopman.get("risk_state", "nominal") != "nominal":
-        status = "ПРОДОЛЖАЕТСЯ НАБЛЮДЕНИЕ"
+        state, color = "ПРОДОЛЖАЕТСЯ НАБЛЮДЕНИЕ", "#fbbf24"
     else:
-        status = "ИСПРАВНАЯ СЕТЬ"
-    tiers = active_attacks.get("sla_restoration", {}).get("tiers", [])
-    gold = next((t for t in tiers if t["sla_grade"] == "gold"), {})
-    count = gold.get("flow_count", 0)
-    gold_sla = f"{100 * gold['sla_compliant_flow_count'] / count:.2f}%" if count else "нет данных"
-    max_link = max(
-        (item.get("wire_bytes", 0) for item in loads.values()),
-        default=0,
-    ) / 1_000_000
-    lines = [
-        f"ШАГ {step} · t = {time_seconds:.0f} с · {mode}",
-        "─" * 30,
-        f"Обычных потоков: {len(legitimate)}",
-        f"Связей с трафиком: {len(loads)} из {model.graph.number_of_edges()}",
-        f"Средняя / макс. задержка: {np.mean(latencies) if latencies else 0.0:.2f} / {max(latencies, default=0.0):.2f} мс",
-        f"Макс. объём на связи: {max_link:.1f} МБ за шаг",
-        "",
-        f"КУПМАН: {status}",
-        f"Риск: {float(koopman.get('forecast_risk_score', 0.0)) * 100:.1f}% (не вероятность)",
-        f"Цель: {targets}",
-        f"Окно: {koopman.get('forecast_window_start_seconds', '—')}…{koopman.get('forecast_window_end_seconds', '—')} с",
-        f"Запас: ≥ {koopman.get('prediction_slo_seconds', '—')} с",
-        "",
-        f"Защита: {ACTION_DISPLAY_NAMES.get(remap, remap)}",
-        f"Переназначено / резерв сервера / изолировано: {routing.get('rerouted_flow_count', 0)} / {routing.get('failover_flow_count', 0)} / {routing.get('isolated_flow_count', 0)}",
-        f"SLA золотого класса (качество услуг): {gold_sla}",
-    ]
-    if active_attacks.get("active"):
-        lines.extend([
-            "",
-            f"АТАКА: {attack_names}",
-            f"После защиты: {float(active_attacks.get('attack_rate_mbps', 0.0)):,.1f} Мбит/с",
-            f"Этап: {routing.get('protection_stage', 'подтверждение/защита')}",
-        ])
+        state, color = "ИСПРАВНАЯ СЕТЬ", "#86efac"
+    ordinary = [f for f in flows if not f.get("is_attack_traffic")]
+    carried = [f for f in flows if _flow_is_visible(f)]
+    normal_rate = sum(float(f.get("wire_bytes", 0)) * 8 / max(float(f.get("interval_seconds", 1)), 1e-9) / 1e6
+                      for f in carried if not f.get("is_attack_traffic"))
+    attack_rate = sum(float(f.get("wire_bytes", 0)) * 8 / max(float(f.get("interval_seconds", 1)), 1e-9) / 1e6
+                      for f in carried if f.get("is_attack_traffic"))
+    observed = [state, f"Обычный трафик: {normal_rate:,.1f} Мбит/с",
+                f"Атакующий трафик: {attack_rate:,.1f} Мбит/с"]
+    if "flows" not in snapshot.get("traffic", {}):
+        observed[1:3] = ["Обычный трафик: нет подробных потоков",
+                         "Атакующий трафик: нет подробных потоков"]
+    events = attacks.get("events", [])
+    if events:
+        kinds = list(dict.fromkeys(str(e.get("kind", "")) for e in events))
+        names = {"dos": "DoS (перегрузка)", "ddos": "DDoS (распределённая перегрузка)",
+                 "syn_flood": "SYN-флуд (неполные соединения)", "brute_force": "попытки входа",
+                 "power_attack": "нарушение питания"}
+        observed.append("Воздействие: " + ", ".join(names.get(kind, kind) for kind in kinds[:2]))
     elif step == 0:
-        lines.append("t0: исправный эталон с рабочей нагрузкой")
-    return "\n".join(lines)
+        observed.append("t0: исправный эталон с рабочей нагрузкой")
+    observed.append(f"Связей с потоком: {len(loads)} / {model.graph.number_of_edges()}")
+
+    forecast = ["ПРЕДУПРЕЖДЕНИЕ ПОДТВЕРЖДЕНО" if warning else "Подтверждённого предупреждения нет"]
+    if warning:
+        start = koopman.get("forecast_window_start_seconds")
+        end = koopman.get("forecast_window_end_seconds")
+        if start is not None and end is not None:
+            forecast.append(f"Окно: t = {start:g}…{end:g} с")
+            forecast.append(f"От текущего шага: {float(start) - now:+g}…{float(end) - now:+g} с")
+        forecast.append("Область: " + (", ".join(map(str, koopman.get("forecast_target_ids", [])[:3])) or "не локализована"))
+    else:
+        horizon = koopman.get("maximum_forecast_horizon_seconds")
+        forecast.append(f"Горизонт расчёта: до {horizon:g} с" if horizon is not None else "Горизонт: нет текущей оценки")
+    score = koopman.get("forecast_risk_score")
+    forecast.append(f"Риск: {100 * float(score):.1f}% · не вероятность" if score is not None else "Риск: нет текущей оценки")
+
+    tiers = {t.get("sla_grade"): t for t in attacks.get("sla_restoration", {}).get("tiers", [])}
+    quality = []
+    for grade, label in (("gold", "Золотой"), ("silver", "Серебряный"), ("bronze", "Бронзовый")):
+        tier = tiers.get(grade, {})
+        total = int(tier.get("flow_count", 0))
+        compliant = tier.get("sla_compliant_flow_count")
+        quality.append(f"{label}: {100 * int(compliant) / total:.2f}% · {compliant}/{total} потоков"
+                       if total and compliant is not None else f"{label}: нет данных")
+    accounted = attacks.get("sla_accounted_flow_count", sum(int(t.get("flow_count", 0)) for t in tiers.values()))
+    excluded = attacks.get("security_excluded_flow_count", sum(int(t.get("security_excluded_flow_count", 0)) for t in tiers.values()))
+    quality.append(f"Учтено в SLA: {accounted} · исключено: {excluded}")
+    limited = sum(int(t.get("slo_limited_coverage_flow_count", 0)) for t in tiers.values())
+    quality.append(f"Неполная оценка требований: {limited} потоков" if limited else "Показаны сохранённые оценки требований")
+
+    rerouted = routing.get("rerouted_flow_count", sum(bool(f.get("rerouted")) for f in ordinary))
+    failover = routing.get("failover_flow_count", sum(bool(f.get("failover_active")) for f in ordinary))
+    isolated = routing.get("isolated_flow_count", sum(bool(f.get("isolated")) for f in ordinary))
+    quarantined = {f.get("client_node") for f in flows if f.get("quarantined") or f.get("routing_action") == "quarantine_attack_source"}
+    blocked = int(attacks.get("blocked_attack_packet_count", 0))
+    actions = [f"Смена маршрута: {rerouted} · резерв сервера: {failover}",
+               f"Изолировано потоков: {isolated} · карантин: {len(quarantined)}",
+               f"Отфильтровано атакующих пакетов: {blocked:,}"]
+    remap = snapshot.get("arbitrator", {}).get("remap", {}).get("action")
+    if remap:
+        actions.append("Решение на следующий шаг: " + {
+            "NO_REMAP": "сохранить маршруты", "OBSERVE_PRECURSOR": "наблюдать",
+            "PLAN_REMAP": "подготовить маршруты",
+            "ISOLATE_CONFIRMED_SOURCES_AND_REMAP": "изоляция и смена маршрутов",
+        }.get(remap, ACTION_DISPLAY_NAMES.get(remap, remap)))
+
+    training = snapshot.get("training", {})
+    nominal = koopman.get("nominal_training", {})
+    accepted = nominal.get("transition_accepted", training.get("operator_updated"))
+    if step == 0:
+        learning = ["t0 зафиксирован; перехода для обучения ещё нет"]
+    elif accepted is True:
+        learning = ["Обучение: принят исправный переход", "Обновлённый оператор — со следующего шага"]
+    elif accepted is False:
+        reason = "угроза или нарушение качества" if nominal.get("observation_eligible") is False else "нужны два исправных наблюдения подряд"
+        learning = ["Обучение приостановлено", reason.capitalize()]
+    else:
+        learning = ["Обучение: нет текущей оценки"]
+    kalman = koopman.get("kalman_filter", {})
+    if "applied_to_nominal_observation" in kalman:
+        learning.append("Калман: обычный шум сглажен" if kalman["applied_to_nominal_observation"] else "Калман: признаки угрозы сохранены")
+    return [
+        {"title": f"СЕЙЧАС · ШАГ {step} · {now:g} с", "lines": observed, "color": color},
+        {"title": "ПРОГНОЗ КУПМАНА", "lines": forecast, "color": "#c4b5fd"},
+        {"title": "КАЧЕСТВО УСЛУГ · SLA", "lines": quality, "color": "#bae6fd"},
+        {"title": "ВЫПОЛНЕНО НА ЭТОМ ШАГЕ", "lines": actions, "color": "#86efac"},
+        {"title": "ОБУЧЕНИЕ И ФИЛЬТР", "lines": learning, "color": "#cbd5e1"},
+    ]
 
 
-def _node_hover_text(model, node_id: str) -> str:
+def _interactive_snapshot_summary(snapshot, flows, loads, paused: bool, model) -> str:
+    """Текстовый вариант тех же карточек, без нового решения в интерфейсе."""
+    sections = _interactive_status_sections(snapshot, flows, loads, paused, model)
+    text = "\n\n".join(section["title"] + "\n" + "\n".join(section["lines"]) for section in sections)
+    # Сохраняем точную подпись текстового экспорта для прежних потребителей.
+    if sections[2]["lines"][0] == "Золотой: нет данных":
+        text += "\nSLA золотого класса (качество услуг): нет данных"
+    return text
+
+
+def _node_hover_text(model, node_id: str, snapshot=None) -> str:
+    if snapshot is not None:
+        return _current_node_hover_text(model, node_id, snapshot)
     attrs = model.graph.nodes[node_id]
     role = attrs.get("role")
     if role in {"core-router", "aggregation-switch", "radio-access-node", "optical-line-terminal"}:
@@ -250,6 +302,66 @@ def _node_hover_text(model, node_id: str) -> str:
             "не является транзитным сетевым устройством"
         )
     return f"{node_id}\nРоль: {role}\nУровень: {attrs.get('level')}"
+
+
+def _current_node_hover_text(model, node_id: str, snapshot) -> str:
+    """Текущие значения из снимка; конфигурация графа не выдаётся за измерение."""
+    attrs = model.graph.nodes[node_id]
+    state = snapshot.get("traffic", {}).get("network_state", {})
+    row = next((n for n in state.get("nodes", []) if n.get("id") == node_id), None)
+    metrics = row.get("metrics", {}) if row else {}
+    attack_rate = row.get("attack_arrival_rate_pps") if row else None
+    if not row and node_id in state.get("node_ids", []):
+        index = state["node_ids"].index(node_id)
+        vectors = state.get("vertex_vectors", [])
+        metrics = dict(zip(state.get("vertex_metric_names", []), vectors[index])) if index < len(vectors) else {}
+        rates = state.get("node_attack_arrival_rates_pps", [])
+        attack_rate = rates[index] if index < len(rates) else None
+    role = {
+        "core-router": "маршрутизатор", "aggregation-switch": "коммутатор",
+        "radio-access-node": "радиодоступ", "optical-line-terminal": "оптический доступ",
+        "service-server": "сервер", "service": "услуга", "arbitrator": "арбитратор",
+        "mobile-subscriber": "мобильный абонент", "fixed-subscriber": "проводной абонент",
+    }.get(attrs.get("role"), attrs.get("level", "объект модели"))
+    lines = [f"{node_id} · {role}",
+             f"ШАГ {snapshot.get('step_index', '—')} · t = {snapshot.get('time_seconds', '—')} с",
+             f"IP: {attrs.get('ip_address', '—')}"]
+    if not metrics:
+        lines.extend(["Текущие показатели отсутствуют в снимке.",
+                      "Доступна только конфигурация эталона t0."])
+        return "\n".join(lines)
+    def value(name, digits=2, factor=1.0):
+        raw = metrics.get(name)
+        return f"{float(raw) * factor:,.{digits}f}" if raw is not None else "—"
+    lines.extend([
+        "ТЕКУЩИЕ ПОКАЗАТЕЛИ · расчёт модели",
+        f"Обычное поступление: {value('normal_arrival_rate_pps', 1)} пак./с",
+        f"Атакующий поток: {float(attack_rate):,.1f} пак./с" if attack_rate is not None else "Атакующий поток: нет отдельной оценки",
+        f"Уничтожение (эквивалент): {value('negative_arrival_rate_pps', 1)} пак./с",
+        f"Обслуживание: {value('service_rate_pps', 1)} пак./с · занятость: {value('utilization_ratio', 1, 100)}%",
+        f"Учётные потери: {value('destroyed_packet_fraction', 2, 100)}% · очередь: {value('mean_queue_packets')} пак.",
+        f"Задержка очереди: {value('mean_delay_ms')} мс",
+        f"Дисперсия задержки: {value('delay_variance_ms2')} мс²",
+        f"ЦП: {value('cpu_load_percent', 1)}% · буфер: {value('buffer_memory_mib', 4)} МиБ [оценки]",
+    ])
+    profiles = {code: name for name, code in state.get("attack_profiles", {}).items()}
+    profile = profiles.get(metrics.get("attack_profile"))
+    if profile:
+        lines.append("Профиль: " + ATTACK_KIND_DISPLAY_NAMES.get(profile, {"normal": "обычный", "mixed": "смешанный"}.get(profile, profile)))
+    own_flows = [f for f in snapshot.get("traffic", {}).get("flows", []) if f.get("client_node") == node_id and not f.get("is_attack_traffic")]
+    if own_flows:
+        flow = own_flows[0]
+        if flow.get("security_excluded_from_sla_accounting"):
+            lines.append("Карантин: поток исключён из клиентского SLA")
+        elif flow.get("isolated"):
+            lines.append("Поток изолирован; передача приостановлена")
+        elif not flow.get("route"):
+            lines.append("Маршрут отсутствует; передача приостановлена")
+        else:
+            lines.append("Текущий маршрут: " + " → ".join(map(str, flow["route"])))
+        lines.append(f"Потери потока: {flow.get('observed_dropped_packets', 0)} / {flow.get('packet_count', 0)} пакетов")
+    lines.append("Потери приписаны учётной точке; место сброса неизвестно.")
+    return "\n".join(lines)
 
 
 def _equipment_hover_text(model, node_id: str, attrs: dict[str, Any]) -> str:

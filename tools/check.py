@@ -34,6 +34,7 @@ SMOKE_FILES = (
     "network_logic.png", "layer_scheme.png", "ip_address_map.png", "service_flows.png",
     "charts/dynamics_overview.png", "charts/capacity_bottlenecks.png",
     "step_log.csv",
+    "run_summary.json", "run_summary.md",
 )
 
 
@@ -118,6 +119,18 @@ def verify_smoke_exports(output: Path) -> dict[str, str]:
         if sum(1 for _ in csv.DictReader(stream)) != 480 * 30:
             raise ValueError("Unexpected monitoring row count")
     dynamics = json.loads((output / "network_dynamics.json").read_text(encoding="utf-8"))
+    summary = json.loads((output / "run_summary.json").read_text(encoding="utf-8"))
+    if dynamics.get("export_metadata", {}).get("schema_version") != 2:
+        raise ValueError("Не указана версия представления результатов")
+    if summary.get("schema_version") != 1:
+        raise ValueError("Неизвестная версия краткого результата")
+    if summary["training"]["accepted_transitions_total"] != dynamics["training_summary"]["nominal_transitions"]:
+        raise ValueError("Итог обучения расходится с полными результатами")
+    if summary["prediction"]["evaluated"] or summary["prediction"]["prediction_precision"] is not None:
+        raise ValueError("Исправный smoke не должен утверждать точность прогноза атак")
+    for grade in ("gold", "silver", "bronze"):
+        if summary["sla"]["by_class"][grade]["minimum_compliance_ratio"] != 1.0:
+            raise ValueError(f"Smoke не подтвердил SLA класса {grade}")
     if not dynamics["health"]["ok"] or len(dynamics["snapshots"]) != 2:
         raise ValueError("Smoke requires healthy t0 and one subsequent snapshot")
     if [item["step_index"] for item in dynamics["snapshots"]] != [0, 1]:

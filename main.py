@@ -33,6 +33,7 @@ from src.gnet9.flow_visualizer import (
 from src.gnet9.service_catalog import CODEC_CATALOG
 from src.gnet9.runtime_metrics import compact_runtime_state
 from src.gnet9.kalman import DEFAULT_PROCESS_VARIANCE, DEFAULT_MEASUREMENT_VARIANCE
+from src.gnet9.run_report import build_run_summary, export_run_summary
 from src.gnet9.standards_audit import build_standards_and_equipment_audit
 from src.gnet9.telemetry_validation import (
     TelemetryValidationConfig,
@@ -259,6 +260,15 @@ def _dynamics_export_view(dynamics: dict[str, Any], packet_detail: str) -> dict[
         "packet_detail": packet_detail,
         "runtime_packet_detail": runtime_detail,
     }
+    exported["export_metadata"] = {
+        "schema_version": 2,
+        "time_unit": "s",
+        "risk_semantics": "score_0_1_not_calibrated_probability",
+        "missing_value_semantics": "null_is_not_observed_not_success",
+        "packet_detail": packet_detail,
+        "metric_axes": "names_and_units_in_traffic.network_state",
+        "reference_semantics": "immutable_loaded_healthy_t0",
+    }
     exported_snapshots: list[dict[str, Any]] = []
     for source_snapshot in dynamics.get("snapshots", []):
         snapshot = dict(source_snapshot)
@@ -275,7 +285,8 @@ def _dynamics_export_view(dynamics: dict[str, Any], packet_detail: str) -> dict[
             snapshot["traffic"] = traffic
         exported_snapshots.append(snapshot)
     exported["snapshots"] = exported_snapshots
-    return exported
+    return {"export_metadata": exported.pop("export_metadata"),
+            "result_summary": build_run_summary(dynamics), **exported}
 
 
 def export_stationary_dynamics(
@@ -289,15 +300,20 @@ def export_stationary_dynamics(
     dynamics = simulate_stationary_dynamics(model, config)
     export_detail = packet_detail or str(dynamics.get("config", {}).get("packet_detail", "sample"))
     export_view = _dynamics_export_view(dynamics, export_detail)
-    path.write_text(json.dumps(export_view, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(export_view, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
     export_step_log(dynamics, path.with_name("step_log.csv"))
+    export_run_summary(dynamics, path.parent)
     return dynamics
 
 
 def export_step_log(dynamics: dict[str, Any], path: Path) -> None:
     """Записать короткий журнал с одной строкой на шаг."""
-    columns = ["шаг", "время_с", "фаза", "обучающих_переходов", "модель_обновлена", "Хаусдорф", "риск_Купмана", "рост_Ляпунова_в_секунду", "тип_угрозы", "решение", "причина", "изменённых_маршрутов", "обычный_трафик_пакетов_с", "атаки_пакетов_с", "отклонение_до_фильтра", "отклонение_после_фильтра", "соблюдение_SLA"]
-    phases = {"reference": "эталон", "nominal_training": "обучение на исправной сети", "observation_and_protection": "наблюдение и защита"}
+    columns = ["шаг", "время_с", "фаза", "обучающих_переходов", "модель_обновлена", "Хаусдорф", "риск_Купмана", "рост_Ляпунова_в_секунду", "тип_угрозы", "решение", "причина", "изменённых_маршрутов", "обычный_трафик_пакетов_с", "атаки_пакетов_с", "отклонение_до_фильтра", "отклонение_после_фильтра", "соблюдение_SLA",
+        "фильтр_применён", "переход_принят_в_обучение", "раннее_предупреждение",
+        "окно_прогноза_начало_с", "окно_прогноза_конец_с",
+        "SLA_gold", "SLA_silver", "SLA_bronze", "наблюдаемые_события", "цели_атак",
+        "исполненные_действия", "максимум_ресурсов_новых_маршрутов_процентов"]
+    phases = {"reference": "эталон", "nominal_training": "начальный участок наблюдения", "observation_and_protection": "наблюдение и защита"}
     sla_by_step = {point["step_index"]: point["score"]
                    for point in dynamics.get("sla_resilience", {}).get("points", [])}
     with path.open("w", encoding="utf-8-sig", newline="") as stream:
@@ -312,6 +328,17 @@ def export_step_log(dynamics: dict[str, Any], path: Path) -> None:
             raw = kalman.get("raw_normalized_vector", [])
             filtered = kalman.get("filtered_normalized_vector", [])
             sla = sla_by_step.get(snapshot["step_index"], "")
+            attacks = snapshot.get("attacks", {})
+            routing = attacks.get("routing", {})
+            grades = {tier.get("sla_grade"): tier for tier in attacks.get("sla_restoration", {}).get("tiers", [])}
+            sla_values = []
+            for grade in ("gold", "silver", "bronze"):
+                tier = grades.get(grade, {})
+                count = tier.get("flow_count", 0)
+                compliant = tier.get("sla_compliant_flow_count")
+                sla_values.append(compliant / count if count and compliant is not None else "")
+            def yes_no(value):
+                return "да" if value is True else "нет" if value is False else ""
             writer.writerow([
                 snapshot["step_index"], snapshot["time_seconds"], phases[training["phase"]],
                 training["nominal_transitions"], "да" if training["operator_updated"] else "нет",
@@ -319,9 +346,18 @@ def export_step_log(dynamics: dict[str, Any], path: Path) -> None:
                 koopman["lyapunov_derivative_per_second"], "; ".join(ATTACK_KIND_DISPLAY_NAMES.get(kind, "неопределённая угроза") for kind in card["attack_kind"].split("+")),
                 RESPONSE_STAGE_DISPLAY_NAMES[card["response_stage"]], card["reason_ru"],
                 snapshot.get("attacks", {}).get("routing", {}).get("rerouted_flow_count", 0),
-                traffic_summary.get("normal_arrival_rate_pps", 0), traffic_summary.get("attack_arrival_rate_pps", 0),
-                (sum(v*v for v in raw) / max(len(raw), 1)) ** 0.5,
-                (sum(v*v for v in filtered) / max(len(filtered), 1)) ** 0.5, sla,
+                traffic_summary.get("normal_arrival_rate_pps", ""), traffic_summary.get("attack_arrival_rate_pps", ""),
+                (sum(v*v for v in raw) / len(raw)) ** 0.5 if raw else "",
+                (sum(v*v for v in filtered) / len(filtered)) ** 0.5 if filtered else "", sla,
+                yes_no(kalman.get("applied_to_nominal_observation")),
+                yes_no(koopman.get("nominal_training", {}).get("transition_accepted")),
+                yes_no(koopman.get("forecast_is_early_warning")),
+                koopman.get("forecast_window_start_seconds", ""), koopman.get("forecast_window_end_seconds", ""),
+                *sla_values,
+                "; ".join(str(e.get("attack_id", "")) for e in attacks.get("events", [])),
+                "; ".join(sorted({str(e["target_id"]) for e in attacks.get("events", []) if e.get("target_id")})),
+                "; ".join(sorted({str(a.get("action", "")) for a in routing.get("actions", [])})),
+                routing.get("maximum_admitted_route_utilization_percent", ""),
             ])
 
 
@@ -794,7 +830,9 @@ def main() -> None:
     training = dynamics["training_summary"]
     first_attack = training["first_attack_step"]
     attack_timing = "воздействия не заданы" if first_attack is None else f"первое воздействие — шаг {first_attack}"
-    print(f"Обучение: {training['clean_training_steps']} чистых шагов; {attack_timing}; журнал — {output_dir / 'step_log.csv'}")
+    print(f"Обучение: принято {training['nominal_transitions']} исправных переходов за весь прогон; "
+          f"начальный участок по плану — {training['clean_training_steps']} шагов; {attack_timing}.")
+    print(f"Итог прогона: {output_dir / 'run_summary.md'}; журнал — {output_dir / 'step_log.csv'}")
     if koopman_evaluation.get("attack_onset_count"):
         print(
             "Купман: заранее распознано "

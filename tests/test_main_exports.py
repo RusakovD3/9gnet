@@ -51,7 +51,10 @@ def test_compact_dynamics_export_keeps_runtime_flows_without_serializing_them(
     with (tmp_path / "step_log.csv").open(encoding="utf-8-sig", newline="") as stream:
         journal = list(csv.DictReader(stream))
     assert [row["шаг"] for row in journal] == ["0", "1"]
-    assert journal[1]["фаза"] == "обучение на исправной сети"
+    assert journal[1]["фаза"] == "начальный участок наблюдения"
+    assert journal[1]["переход_принят_в_обучение"] == "да"
+    assert journal[1]["SLA_gold"] == "1.0"
+    assert journal[1]["фильтр_применён"] == "да"
     assert journal[1]["решение"] == "наблюдать"
     exported = json.loads(destination.read_text(encoding="utf-8"))
 
@@ -66,6 +69,11 @@ def test_compact_dynamics_export_keeps_runtime_flows_without_serializing_them(
     assert compact_state["edge_vectors"] == [list(e["metrics"].values()) for e in original_state["edges"]]
     assert exported["config"]["packet_detail"] == "summary"
     assert exported["config"]["runtime_packet_detail"] == "flows"
+    assert exported["export_metadata"]["schema_version"] == 2
+    summary = json.loads((tmp_path / "run_summary.json").read_text(encoding="utf-8"))
+    assert summary["training"]["accepted_transitions_total"] == 1
+    assert summary["prediction"]["evaluated"] is False
+    assert (tmp_path / "run_summary.md").is_file()
 
 
 @pytest.mark.parametrize(
