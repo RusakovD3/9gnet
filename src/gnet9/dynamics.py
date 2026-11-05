@@ -1,9 +1,9 @@
-"""Discrete GNet9 dynamics, attacks, forecasting and closed-loop protection.
+"""Discrete GNet9 observations, attacks, forecasts and human recommendations.
 
 The compatibility name :func:`simulate_stationary_dynamics` is retained from
 the original healthy-baseline implementation.  It now also runs the MITRE and
-predictive scenarios, causal Koopman/DMD analysis, Lyapunov feedback and
-capacity-aware remapping while preserving the ideal ``t0`` reference.
+predictive scenarios, causal Koopman/DMD analysis, Lyapunov analysis and
+recommendations for a human operator while preserving the ideal ``t0`` reference.
 """
 
 from __future__ import annotations
@@ -109,7 +109,6 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
         config,
         0,
         0,
-        defense_plan=None,
         power_runtime_state=power_runtime_state,
     )
     reference_tensor_state = reference_snapshot.pop("_analysis_tensor_state")
@@ -149,7 +148,6 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
         kalman_process_variance=config.kalman_process_variance,
         kalman_measurement_variance=config.kalman_measurement_variance,
     )
-    pending_defense_plan: dict[str, Any] | None = None
     for step_index in range(start_step, config.step_count + 1):
         snapshot = (
             reference_snapshot
@@ -159,7 +157,6 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
                 config,
                 step_index,
                 step_index * config.step_seconds,
-                defense_plan=pending_defense_plan,
                 power_runtime_state=power_runtime_state,
                 reference_tensor_state=reference_tensor_state,
                 state_hausdorff_reference=state_hausdorff_reference,
@@ -184,7 +181,7 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
             time_seconds=step_index * config.step_seconds,
             runtime_state=snapshot.get("traffic", {}).get("network_state"),
         )
-        proposed_plan = apply_koopman_to_arbitrator(
+        apply_koopman_to_arbitrator(
             snapshot,
             koopman_view,
             model=model,
@@ -194,22 +191,13 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
         elif step_index < first_precursor_step:
             phase = "nominal_training"
         else:
-            phase = "observation_and_protection"
+            phase = "observation_and_recommendations"
         snapshot["training"] = {
             "phase": phase,
             "clean_training_steps": min(config.step_count, max(0, first_precursor_step - 1)),
             "nominal_transitions": koopman_view["observed_nominal_transition_count_after_update"],
             "operator_updated": koopman_view["update_applied_for_next_step"],
         }
-        pending_defense_plan = _plan_for_next_step(
-            current_plan=pending_defense_plan,
-            proposed_plan=proposed_plan,
-            next_step=step_index + 1,
-            retain_current_plan=bool(
-                snapshot.get("attacks", {}).get("active")
-                or snapshot.get("attacks", {}).get("precursor_active")
-            ),
-        )
         snapshots.append(snapshot)
 
     ideal_t0 = validate_ideal_t0(model, snapshots[0] if config.include_t0 and snapshots else None)
@@ -225,6 +213,7 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
             else "stationary_healthy_baseline"
         ),
         "config": config.to_dict(),
+        "operation_mode": "forecast_and_human_recommendations_only",
         "attack_catalog": catalog,
         "training_summary": {
             "clean_training_steps": min(config.step_count, max(0, first_precursor_step - 1)),
@@ -264,14 +253,13 @@ def _attack_response_evaluation(snapshots: list[dict[str, Any]]) -> list[dict[st
     records: dict[str, dict[str, Any]] = {}
     for snapshot in snapshots:
         analysis = snapshot["arbitrator"]["analysis"]
-        remap = snapshot["arbitrator"]["remap"]
-        routing = snapshot.get("attacks", {}).get("routing", {})
+        recommendation = snapshot["arbitrator"]["recommendation"]
         for event in snapshot.get("attacks", {}).get("events", []):
             record = records.setdefault(event["attack_id"], {
                 "attack_id": event["attack_id"], "kind": event["kind"], "target_id": event["target_id"],
                 "first_step": snapshot["step_index"], "last_step": snapshot["step_index"],
                 "maximum_hausdorff": 0.0, "maximum_koopman_risk": 0.0,
-                "maximum_lyapunov_pressure": 0.0, "maximum_rerouted_flows": 0,
+                "maximum_lyapunov_pressure": 0.0,
                 "response_stages": [], "actions": [],
                 "scope": "whole_network_snapshots_during_event_not_isolated_causal_effect",
             })
@@ -279,8 +267,7 @@ def _attack_response_evaluation(snapshots: list[dict[str, Any]]) -> list[dict[st
             record["maximum_hausdorff"] = max(record["maximum_hausdorff"], float(analysis["state_hausdorff"].get("normalized_distance", 0.0)))
             record["maximum_koopman_risk"] = max(record["maximum_koopman_risk"], float(snapshot["koopman"]["forecast_risk_score"]))
             record["maximum_lyapunov_pressure"] = max(record["maximum_lyapunov_pressure"], float(snapshot["koopman"]["lyapunov_remap_pressure"]))
-            record["maximum_rerouted_flows"] = max(record["maximum_rerouted_flows"], int(routing.get("rerouted_flow_count", 0)))
-            for key, value in (("actions", remap["action"]), ("response_stages", remap["response_stage"])):
+            for key, value in (("actions", recommendation["action"]), ("response_stages", recommendation["response_stage"])):
                 if value not in record[key]:
                     record[key].append(value)
     return list(records.values())
@@ -640,11 +627,11 @@ def validate_ideal_t0(model: NetworkModel, snapshot: dict[str, Any] | None = Non
         violations.append({"scope": "L2", "reason": "insufficient_transport_connectivity"})
 
     if snapshot is not None:
-        remap = snapshot.get("arbitrator", {}).get("remap", {})
+        recommendation = snapshot.get("arbitrator", {}).get("recommendation", {})
         analysis = snapshot.get("arbitrator", {}).get("analysis", {})
-        if remap.get("action") != "NO_REMAP" or analysis.get("remap_pressure", 1.0) > 0.05 or analysis.get("decision_confidence", 0.0) < 0.80:
-            violations.append({"scope": "L7", "reason": "baseline_requires_remap"})
-        metrics["l7_decision"] = remap.get("action")
+        if recommendation.get("action") != "OBSERVE" or analysis.get("remap_pressure", 1.0) > 0.05 or analysis.get("decision_confidence", 0.0) < 0.80:
+            violations.append({"scope": "L7", "reason": "baseline_requires_security_review"})
+        metrics["l7_decision"] = recommendation.get("action")
         koopman = snapshot.get("koopman", {})
         metrics["koopman_t0_reference_distance"] = float(koopman.get("reference_distance", 1.0))
         metrics["koopman_t0_one_step_residual"] = float(koopman.get("one_step_residual", 1.0))
@@ -753,7 +740,6 @@ def _snapshot(
     step_index: int,
     time_seconds: int,
     *,
-    defense_plan: dict[str, Any] | None = None,
     power_runtime_state: dict[str, dict[str, Any]] | None = None,
     reference_tensor_state: dict[str, Any] | None = None,
     state_hausdorff_reference: StateTensorHausdorffReference | None = None,
@@ -797,7 +783,6 @@ def _snapshot(
             packet_sample_limit=config.packet_sample_limit,
             attack_events=attack_events,
             attack_precursors=attack_precursors,
-            defense_plan=defense_plan,
             attack_scenario=config.attack_scenario,
             power_runtime_state=power_runtime,
         )
@@ -1177,11 +1162,6 @@ def _koopman_evaluation(
         warning = min(candidates, key=lambda item: int(item.get("time_seconds", 0)), default=None)
         lead_seconds = 0 if warning is None else onset_time - int(warning.get("time_seconds", 0))
         predicted = warning is not None and lead_seconds >= step_seconds
-        protected_ids = set(
-            onset_snapshot.get("attacks", {})
-            .get("preventive_defense", {})
-            .get("protected_attack_ids", [])
-        )
         records.append(
             {
                 "attack_id": attack_id,
@@ -1193,7 +1173,6 @@ def _koopman_evaluation(
                 "warning_time_seconds": None if warning is None else int(warning.get("time_seconds", 0)),
                 "lead_time_seconds": lead_seconds,
                 "predicted_before_onset": predicted,
-                "preventive_defense_applied": attack_id in protected_ids,
             }
         )
 
@@ -1236,7 +1215,6 @@ def _koopman_evaluation(
                     )
                 last_false_step_by_pair[pair] = warning_step
     predicted_count = sum(1 for item in records if item["predicted_before_onset"])
-    protected_count = sum(1 for item in records if item["preventive_defense_applied"])
     leads = [int(item["lead_time_seconds"]) for item in records if item["predicted_before_onset"]]
     slo_predicted_count = sum(
         bool(item["predicted_before_onset"])
@@ -1327,7 +1305,7 @@ def _koopman_evaluation(
         "prediction_recall": recall,
         "prediction_precision": precision,
         "prediction_f1": f1,
-        "validation_scope": "single_seed_closed_loop_showcase_post_run_scoring",
+        "validation_scope": "single_seed_fixed_topology_showcase_post_run_scoring",
         "independent_holdout_validation_performed": False,
         "generalization_claimed": False,
         "causal_observation_contract": (
@@ -1362,7 +1340,6 @@ def _koopman_evaluation(
         ),
         "per_attack_kind": per_kind,
         "all_attacks_predicted_at_least_one_step_ahead": bool(records) and predicted_count == len(records),
-        "preventive_defense_applied_count": protected_count,
         "records": records,
     }
 
@@ -1481,28 +1458,6 @@ def _resilience_evaluation(
         ),
         default=1.0,
     )
-    maximum_post_remap_utilization = max(
-        (
-            float(
-                snapshot.get("attacks", {})
-                .get("routing", {})
-                .get("maximum_projected_utilization_percent", 0.0)
-            )
-            for snapshot in attack_snapshots
-        ),
-        default=0.0,
-    )
-    maximum_isolated_flows = max(
-        (
-            int(
-                snapshot.get("attacks", {})
-                .get("routing", {})
-                .get("isolated_flow_count", 0)
-            )
-            for snapshot in attack_snapshots
-        ),
-        default=0,
-    )
     if not attack_snapshots:
         status = "NOT_APPLICABLE_NO_ATTACKS"
     elif final_recovered and minimum_sla_compliance["gold"] >= 0.95:
@@ -1527,11 +1482,6 @@ def _resilience_evaluation(
             minimum_sla_compliance["gold"] >= minimum_sla_compliance["silver"]
             and minimum_sla_compliance["gold"] >= minimum_sla_compliance["bronze"]
         ),
-        "maximum_post_remap_utilization_percent": round(
-            maximum_post_remap_utilization,
-            6,
-        ),
-        "maximum_isolated_flow_count": maximum_isolated_flows,
         "final_state_recovered": final_recovered,
         "sampling_interval_seconds": step_seconds,
         "episodes": recovery_records,
@@ -1563,23 +1513,6 @@ def _forecast_entity_pairs(koopman: dict[str, Any]) -> set[tuple[str, str]]:
         if item and item != "none"
     ]
     return {(target, kind) for target in targets for kind in kinds}
-
-
-def _plan_for_next_step(
-    *,
-    current_plan: dict[str, Any] | None,
-    proposed_plan: dict[str, Any] | None,
-    next_step: int,
-    retain_current_plan: bool = True,
-) -> dict[str, Any] | None:
-    """Сохранить план только пока его подтверждает наблюдаемая телеметрия."""
-    if proposed_plan:
-        return proposed_plan
-    if not current_plan or not retain_current_plan:
-        return None
-    start = int(current_plan.get("valid_from_step", current_plan.get("valid_for_step", next_step)))
-    end = int(current_plan.get("valid_until_step", current_plan.get("valid_for_step", start)))
-    return current_plan if start <= next_step <= end else None
 
 
 def _validate_config(config: DynamicsConfig) -> None:

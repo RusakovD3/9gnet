@@ -41,10 +41,10 @@ def test_trigger_card_requires_confirmation_and_distinguishes_threats(monkeypatc
     options = dict(hausdorff=0.9, risk=0.9, lyapunov_pressure=0.8, decision_pressure=0.9, source_confirmed=False)
     unconfirmed = build_trigger_card(**options, confirmed=False, attack_kind="ddos")
     assert unconfirmed["action"] == "OBSERVE_PRECURSOR"
-    assert not unconfirmed["source_quarantine_allowed"]
+    assert unconfirmed["execution_mode"] == "human_only"
     power = build_trigger_card(**options, confirmed=True, attack_kind="power_attack")
     syn = build_trigger_card(**options, confirmed=True, attack_kind="syn_flood")
-    assert "prefer_nodes_with_energy_reserve" in power["controls"]
+    assert "check_energy_reserve" in power["controls"]
     assert "enable_syn_protection" in syn["controls"]
     assert not set(power["controls"]) & set(syn["controls"])
     assert trigger_state(0.349999, "koopman")["state"] == "watch"
@@ -54,13 +54,13 @@ def test_trigger_card_requires_confirmation_and_distinguishes_threats(monkeypatc
         card = build_trigger_card(**(options | {"decision_pressure": pressure}), confirmed=True, attack_kind="ddos")
         assert card["response_stage"] == stage
     power_with_source = build_trigger_card(**(options | {"source_confirmed": True}), confirmed=True, attack_kind="power_attack")
-    assert not power_with_source["source_quarantine_allowed"]
+    assert power_with_source["source_confirmed"] is True
     with pytest.raises(ValueError):
         trigger_state(float("nan"), "koopman")
     from src.gnet9.arbitrator import TRIGGER_BANDS
     monkeypatch.setitem(TRIGGER_BANDS, "decision", (0.30, 0.60, 0.90))
     card = build_trigger_card(**(options | {"decision_pressure": 0.25}), confirmed=True, attack_kind="ddos")
-    assert card["action"] == "NO_REMAP"
+    assert card["action"] == "OBSERVE"
     card = build_trigger_card(**(options | {"decision_pressure": 0.55}), confirmed=True, attack_kind="ddos")
     assert card["response_stage"] == "prepare"
 
@@ -77,6 +77,16 @@ def test_finite_queue_known_solution_and_heavy_overload():
     assert _mm1k_stationary_metrics(0, 1, 128) == (0, 0, 0, 0, 0)
     with pytest.raises(ValueError):
         _mm1k_stationary_metrics(float("nan"), 1, 128)
+
+
+def test_finite_queue_rare_arrivals_keep_service_time_and_zero_waiting():
+    # K=1: принятая заявка сразу обслуживается, среднее время = 1/μ.
+    blocking, admitted, population, waiting, delay = _mm1k_stationary_metrics(1e-20, 1, 1)
+    assert blocking == pytest.approx(1e-20, rel=1e-12, abs=0)
+    assert admitted == pytest.approx(1e-20, rel=1e-12, abs=0)
+    assert population == pytest.approx(1e-20, rel=1e-12, abs=0)
+    assert waiting == 0.0
+    assert delay == pytest.approx(1000.0)
 
 
 def test_tcp_recovery_and_udp_do_not_double_count_loss(model):
@@ -109,7 +119,7 @@ def test_cli_schedule_and_training_before_step_50(model):
     assert len(clean) == 39
     assert all(s["training"]["operator_updated"] for s in clean)
     assert all(not s["attacks"]["active"] and not s["attacks"]["precursor_active"] for s in clean)
-    assert all(s["arbitrator"]["remap"]["action"] == "NO_REMAP" for s in clean)
+    assert all(s["arbitrator"]["recommendation"]["action"] == "OBSERVE" for s in clean)
     assert result["training_summary"]["first_attack_step"] == 50
     assert result["ideal_t0"]["ok"]
     np.testing.assert_array_equal(model.graph.nodes["C1"]["tensor"].data, original)

@@ -22,7 +22,7 @@ from typing import Any
 
 import numpy as np
 
-from .hypernetwork import CONTROLLED_LEVELS, EMBEDDING_LEVEL_PAIRS, hypernetwork_embedding
+from .hypernetwork import DIAGNOSTIC_LEVELS, EMBEDDING_LEVEL_PAIRS, hypernetwork_embedding
 
 
 TENSOR_MATRIX_LEVELS = ("L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8", "EDGE")
@@ -227,7 +227,7 @@ class TensorKroneckerKoopman:
             # Без графа известна только схема уровней; нельзя выдумывать
             # полную связность, в частности управление L4/L8 арбитром.
             pairs = (EMBEDDING_LEVEL_PAIRS + (("L0", "L7"),)
-                     + tuple(("L7", level) for level in CONTROLLED_LEVELS))
+                     + tuple(("L7", level) for level in DIAGNOSTIC_LEVELS))
             for source_level, target_level in pairs:
                 if source_level in index and target_level in index:
                     coupling[index[target_level], index[source_level]] = 1.0

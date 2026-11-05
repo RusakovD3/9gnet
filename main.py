@@ -11,6 +11,7 @@ from typing import Any
 
 from src.gnet9.address_visualizer import draw_ip_address_map, export_ip_address_plan
 from src.gnet9.attacks import (
+    MITRE_DEMO_STEP_COUNT,
     PREDICTIVE_DEMO_DEFAULT_SEED,
     PREDICTIVE_DEMO_STEP_COUNT,
     PREDICTIVE_DEMO_FIRST_ATTACK_STEP,
@@ -27,6 +28,7 @@ from src.gnet9.dynamics_charts import export_dynamics_charts
 from src.gnet9.flow_visualizer import (
     create_service_flow_window,
     draw_service_flow_map,
+    draw_security_dashboard,
     ensure_interactive_backend,
     show_visualization_windows,
 )
@@ -167,30 +169,42 @@ def export_attack_catalog(
         for node_id, attrs in model.graph.nodes(data=True)
         if attrs.get("critical_protection", {}).get("is_critical")
     ]
-    predictive_config = predictive_config or DynamicsConfig(
-        step_seconds=PREDICTIVE_DEMO_STEP_SECONDS,
-        step_count=PREDICTIVE_DEMO_STEP_COUNT,
-        attack_scenario="predictive-demo",
-        attack_seed=PREDICTIVE_DEMO_DEFAULT_SEED,
+    selected_config = predictive_config
+    mitre_catalog = attack_catalog(
+        model, "mitre-demo",
+        config=selected_config if selected_config and selected_config.attack_scenario == "mitre-demo" else None,
+    )
+    predictive_config = (
+        selected_config
+        if selected_config and selected_config.attack_scenario == "predictive-demo"
+        else DynamicsConfig(
+            step_seconds=PREDICTIVE_DEMO_STEP_SECONDS,
+            step_count=PREDICTIVE_DEMO_STEP_COUNT,
+            attack_scenario="predictive-demo",
+            attack_seed=PREDICTIVE_DEMO_DEFAULT_SEED,
+        )
     )
     payload = {
         # `attacks` оставлен совместимым alias для прежнего mitre-demo.
-        "attacks": attack_catalog(model, "mitre-demo"),
+        "attacks": mitre_catalog,
         "tensor_mappings": mitre_tensor_mapping_catalog(),
         "scenarios": {
-            "mitre-demo": attack_catalog(model, "mitre-demo"),
+            "mitre-demo": mitre_catalog,
             "predictive-demo": attack_catalog(
                 model,
                 "predictive-demo",
                 seed=predictive_config.attack_seed,
                 step_seconds=predictive_config.step_seconds,
                 step_count=predictive_config.step_count,
+                config=predictive_config,
             ),
         },
         "predictive_scenario_configuration": {
             "seed": predictive_config.attack_seed,
             "step_seconds": predictive_config.step_seconds,
             "step_count": predictive_config.step_count,
+            "attack_start_step": predictive_config.attack_start_step,
+            "attack_interval_steps": predictive_config.attack_interval_steps,
             "prediction_slo_seconds": predictive_config.to_dict().get(
                 "resolved_prediction_slo_seconds"
             ),
@@ -261,7 +275,7 @@ def _dynamics_export_view(dynamics: dict[str, Any], packet_detail: str) -> dict[
         "runtime_packet_detail": runtime_detail,
     }
     exported["export_metadata"] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "time_unit": "s",
         "risk_semantics": "score_0_1_not_calibrated_probability",
         "missing_value_semantics": "null_is_not_observed_not_success",
@@ -308,12 +322,12 @@ def export_stationary_dynamics(
 
 def export_step_log(dynamics: dict[str, Any], path: Path) -> None:
     """Записать короткий журнал с одной строкой на шаг."""
-    columns = ["шаг", "время_с", "фаза", "обучающих_переходов", "модель_обновлена", "Хаусдорф", "риск_Купмана", "рост_Ляпунова_в_секунду", "тип_угрозы", "решение", "причина", "изменённых_маршрутов", "обычный_трафик_пакетов_с", "атаки_пакетов_с", "отклонение_до_фильтра", "отклонение_после_фильтра", "соблюдение_SLA",
+    columns = ["шаг", "время_с", "фаза", "обучающих_переходов", "модель_обновлена", "Хаусдорф", "риск_Купмана", "рост_Ляпунова_в_секунду", "тип_угрозы", "решение", "причина", "обычный_трафик_пакетов_с", "атаки_пакетов_с", "отклонение_до_фильтра", "отклонение_после_фильтра", "соблюдение_SLA",
         "фильтр_применён", "переход_принят_в_обучение", "раннее_предупреждение",
         "окно_прогноза_начало_с", "окно_прогноза_конец_с",
         "SLA_gold", "SLA_silver", "SLA_bronze", "наблюдаемые_события", "цели_атак",
-        "исполненные_действия", "максимум_ресурсов_новых_маршрутов_процентов"]
-    phases = {"reference": "эталон", "nominal_training": "начальный участок наблюдения", "observation_and_protection": "наблюдение и защита"}
+        "рекомендации_человеку"]
+    phases = {"reference": "эталон", "nominal_training": "начальный участок наблюдения", "observation_and_recommendations": "наблюдение и рекомендации"}
     sla_by_step = {point["step_index"]: point["score"]
                    for point in dynamics.get("sla_resilience", {}).get("points", [])}
     with path.open("w", encoding="utf-8-sig", newline="") as stream:
@@ -329,7 +343,6 @@ def export_step_log(dynamics: dict[str, Any], path: Path) -> None:
             filtered = kalman.get("filtered_normalized_vector", [])
             sla = sla_by_step.get(snapshot["step_index"], "")
             attacks = snapshot.get("attacks", {})
-            routing = attacks.get("routing", {})
             grades = {tier.get("sla_grade"): tier for tier in attacks.get("sla_restoration", {}).get("tiers", [])}
             sla_values = []
             for grade in ("gold", "silver", "bronze"):
@@ -345,7 +358,6 @@ def export_step_log(dynamics: dict[str, Any], path: Path) -> None:
                 card["signals"]["hausdorff"]["value"], koopman["forecast_risk_score"],
                 koopman["lyapunov_derivative_per_second"], "; ".join(ATTACK_KIND_DISPLAY_NAMES.get(kind, "неопределённая угроза") for kind in card["attack_kind"].split("+")),
                 RESPONSE_STAGE_DISPLAY_NAMES[card["response_stage"]], card["reason_ru"],
-                snapshot.get("attacks", {}).get("routing", {}).get("rerouted_flow_count", 0),
                 traffic_summary.get("normal_arrival_rate_pps", ""), traffic_summary.get("attack_arrival_rate_pps", ""),
                 (sum(v*v for v in raw) / len(raw)) ** 0.5 if raw else "",
                 (sum(v*v for v in filtered) / len(filtered)) ** 0.5 if filtered else "", sla,
@@ -356,8 +368,7 @@ def export_step_log(dynamics: dict[str, Any], path: Path) -> None:
                 *sla_values,
                 "; ".join(str(e.get("attack_id", "")) for e in attacks.get("events", [])),
                 "; ".join(sorted({str(e["target_id"]) for e in attacks.get("events", []) if e.get("target_id")})),
-                "; ".join(sorted({str(a.get("action", "")) for a in routing.get("actions", [])})),
-                routing.get("maximum_admitted_route_utilization_percent", ""),
+                "; ".join(snapshot["arbitrator"]["recommendation"]["steps_ru"]),
             ])
 
 
@@ -402,7 +413,7 @@ def _simulation_timing(args: argparse.Namespace) -> tuple[int, int]:
         step_seconds = PREDICTIVE_DEMO_STEP_SECONDS
     else:
         defaults = DynamicsConfig()
-        step_count = defaults.step_count
+        step_count = MITRE_DEMO_STEP_COUNT if args.attack_scenario == "mitre-demo" else defaults.step_count
         step_seconds = defaults.step_seconds
     if args.dynamics_steps is not None:
         step_count = args.dynamics_steps
@@ -440,7 +451,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Число переходов после t0. По умолчанию "
             f"{PREDICTIVE_DEMO_STEP_COUNT} для predictive-demo и "
-            f"{DynamicsConfig().step_count} для остальных режимов."
+            f"{MITRE_DEMO_STEP_COUNT} для mitre-demo и {DynamicsConfig().step_count} без атак."
         ),
     )
     parser.add_argument(
@@ -581,7 +592,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="none",
         help=(
             "Сценарий: none, фиксированный mitre-demo или predictive-demo "
-            "с прогнозом по наблюдениям и защитой прежде всего абонентов золотого класса."
+            "с прогнозом по наблюдениям и рекомендациями человеку по защите услуг."
         ),
     )
     args = parser.parse_args(argv)
@@ -613,16 +624,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.validate_telemetry_csv and args.calibration_report:
         parser.error("используйте либо --validate-telemetry-csv, либо --calibration-report, но не оба аргумента")
     return args
-
-
-def _routing_action_score(snapshot: dict[str, Any]) -> int:
-    routing = snapshot.get("attacks", {}).get("routing", {})
-    return (
-        int(routing.get("rerouted_flow_count", 0))
-        + int(routing.get("failover_flow_count", 0))
-        + int(routing.get("isolated_flow_count", 0))
-        + int(routing.get("protected_endpoint_flow_count", 0))
-    )
 
 
 def main() -> None:
@@ -669,6 +670,7 @@ def main() -> None:
     # Артефакты ранних ручных прототипов больше не входят в контракт output/.
     # Удаляем только известные имена, не затрагивая пользовательские файлы.
     for legacy_preview in (
+        "service_flows_remapped.png",
         "interactive_flow_preview.png",
         "koopman_warning_window_test.png",
     ):
@@ -732,7 +734,6 @@ def main() -> None:
         "network_png": output_dir / "network_logic.png",
         "layers_png": output_dir / "layer_scheme.png",
         "flows_png": output_dir / "service_flows.png",
-        "remapped_flows_png": output_dir / "service_flows_remapped.png",
         "ip_map_png": output_dir / "ip_address_map.png",
         "debug_dir": output_dir / "debug",
     }
@@ -757,7 +758,7 @@ def main() -> None:
     export_attack_catalog(
         model,
         artifacts["attacks"],
-        dynamics_config if predictive_demo else None,
+        dynamics_config,
     )
     export_parsed_d0sl_catalog(model, artifacts["d0sl_parsed"])
     dynamics = export_stationary_dynamics(
@@ -774,23 +775,6 @@ def main() -> None:
     flow_snapshots = dynamics["snapshots"] if dynamics_config.include_packet_simulation else []
     if flow_snapshots:
         draw_service_flow_map(model, flow_snapshots[0]["traffic"]["flows"], artifacts["flows_png"])
-        most_active_snapshot = max(flow_snapshots, key=_routing_action_score)
-        if _routing_action_score(most_active_snapshot) > 0:
-            attack_names = ", ".join(
-                str(event.get("name_ru", event.get("kind", "")))
-                for event in most_active_snapshot.get("attacks", {}).get("events", [])
-            ) or "предиктивная защита до начала воздействия"
-            draw_service_flow_map(
-                model,
-                most_active_snapshot["traffic"]["flows"],
-                artifacts["remapped_flows_png"],
-                title_suffix=(
-                    f"максимум управляющих действий · шаг {most_active_snapshot.get('step_index', 0)} · "
-                    f"t = {most_active_snapshot.get('time_seconds', 0)} с · {attack_names}"
-                ),
-            )
-        else:
-            artifacts["remapped_flows_png"].unlink(missing_ok=True)
     else:
         draw_service_flow_map(
             model,
@@ -798,7 +782,7 @@ def main() -> None:
             artifacts["flows_png"],
             title_suffix="пакетная модель отключена: показана только топология",
         )
-        artifacts["remapped_flows_png"].unlink(missing_ok=True)
+    draw_security_dashboard(model, flow_snapshots, artifacts["charts_dir"] / "security_dashboard.png")
     chart_paths = export_dynamics_charts(
         dynamics,
         artifacts["charts_dir"],
@@ -842,7 +826,7 @@ def main() -> None:
             f"доля верных предупреждений={koopman_evaluation.get('prediction_precision', 0.0) * 100:.1f}%; "
             f"доля распознанных атак={koopman_evaluation.get('prediction_recall', 0.0) * 100:.1f}%; "
             f"максимальный горизонт={koopman_evaluation.get('forecast_horizon_seconds', 0)} с; "
-            f"защита применена к {koopman_evaluation.get('preventive_defense_applied_count', 0)} воздействиям."
+            "рекомендации выполняются человеком."
         )
         print(
             "Требуемое упреждение: не менее "
@@ -855,8 +839,6 @@ def main() -> None:
     for path in chart_paths.values():
         print(f"  - {path}")
     print(f"Карта сервисных потоков: {artifacts['flows_png']}")
-    if artifacts["remapped_flows_png"].exists():
-        print(f"Карта наиболее активного переназначения: {artifacts['remapped_flows_png']}")
     print(f"Карта IP-адресации: {artifacts['ip_map_png']}")
     print(f"Пояснения к решениям: {artifacts['algorithm_dialogue_md']}")
     print(f"Аудит RFC и характеристик: {artifacts['standards_audit']}")

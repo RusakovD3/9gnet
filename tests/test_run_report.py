@@ -43,20 +43,10 @@ def test_planned_training_is_distinct_from_accepted_and_sla_uses_denominator(tmp
 def test_empty_sla_class_and_missing_observations_are_unavailable():
     report = build_run_summary({"snapshots": [_snapshot(1, False, 0, 0)]})
     assert report["sla"]["by_class"]["gold"]["minimum_compliance_ratio"] is None
-    assert report["protection"]["maximum_total_projected_utilization_percent"] is None
+    assert report["recommendations"] == []
     assert report["prediction"]["attack_onset_count"] is None
     assert report["sla"]["weighted_time_mean_ratio"] is None
     assert build_run_summary({})["training"]["accepted_transitions_before_first_precursor"] is None
-
-
-def test_total_overload_is_not_relabelled_as_admitted_route_load():
-    snapshot = _snapshot(1, False)
-    snapshot["attacks"]["routing"] = {"maximum_projected_utilization_percent": 140.,
-        "maximum_admitted_route_utilization_percent": 79., "maximum_safe_utilization_percent": 80.}
-    protection = build_run_summary({"snapshots": [snapshot]})["protection"]
-    assert protection["maximum_total_projected_utilization_percent"] == 140.
-    assert protection["maximum_admitted_route_utilization_percent"] == 79.
-    assert protection["admission_limit_percent"] == 80.
 
 
 def test_export_metadata_keeps_existing_keys_and_input_immutable():
@@ -78,7 +68,7 @@ def test_csv_missing_packet_observations_are_blank_and_actions_are_executed(tmp_
     # Имя этапа берём из существующего публичного словаря представления.
     from src.gnet9.constants import RESPONSE_STAGE_DISPLAY_NAMES
     snapshot["arbitrator"]["trigger_card"]["response_stage"] = next(iter(RESPONSE_STAGE_DISPLAY_NAMES))
-    snapshot["attacks"]["routing"] = {"actions": [{"action": "quarantine_attack_source"}]}
+    snapshot["arbitrator"]["recommendation"] = {"steps_ru": ["Проверьте журнал"]}
     target = tmp_path / "step_log.csv"
     export_step_log({"snapshots": [snapshot]}, target)
     with target.open(encoding="utf-8-sig", newline="") as stream:
@@ -86,7 +76,8 @@ def test_csv_missing_packet_observations_are_blank_and_actions_are_executed(tmp_
     assert row["обычный_трафик_пакетов_с"] == row["атаки_пакетов_с"] == ""
     assert row["отклонение_до_фильтра"] == ""
     assert row["SLA_gold"] == "0.9" and row["SLA_silver"] == ""
-    assert row["исполненные_действия"] == "quarantine_attack_source"
+    assert row["рекомендации_человеку"] == "Проверьте журнал"
+    assert "исполненные_действия" not in row
     assert row["переход_принят_в_обучение"] == "нет"
 
 
@@ -104,11 +95,11 @@ def test_nonfinite_json_is_rejected_without_overwriting_previous_result(tmp_path
 
 def test_dialogue_distinguishes_proposed_plan_from_executed_actions():
     snapshot = _snapshot(1, False)
-    snapshot["arbitrator"] = {"remap": {"action": "NO_REMAP"}}
-    snapshot["attacks"]["routing"] = {"actions": [{"action": "quarantine_attack_source"}]}
+    snapshot["arbitrator"] = {"recommendation": {"action": "OBSERVE"}}
+    snapshot["arbitrator"]["recommendation"] = {"steps_ru": ["Проверьте журнал"]}
     snapshot["koopman"]["kalman_filter"] = {"applied_to_nominal_observation": False}
     report = build_algorithm_dialogue({"snapshots": [snapshot]})
     turns = {turn["algorithm"]: turn for turn in report["records"][0]["turns"]}
-    assert "Предложение арбитра" in turns["Выбор защитного действия"]["message_ru"]
-    assert turns["Фактическое исполнение и качество услуг"]["evidence"]["actions"] == [{"action": "quarantine_attack_source"}]
+    assert "Рекомендация человеку" in turns["Выбор защитного действия"]["message_ru"]
+    assert turns["Рекомендации человеку и качество услуг"]["evidence"]["recommendation"]["steps_ru"] == ["Проверьте журнал"]
     assert "Сглаживание обойдено" in turns["Нормировка и фильтр Калмана"]["message_ru"]

@@ -16,7 +16,7 @@ def _snapshots():
             "koopman": {"nominal_training": {"transition_accepted": step == 1},
                         "forecast_is_early_warning": step == 2,
                         "warning_risk_threshold": .37},
-            "traffic": {"network_state": {"edge_metric_names": ["capacity_mbps", "speed_mbps"],
+            "traffic": {"network_state": {"node_metric_maxima": {"cpu_load_percent": 240}, "edge_metric_names": ["capacity_mbps", "speed_mbps"],
                                              "edge_ids": [["a", "b"]], "edge_vectors": [[10, 2]]}},
             "attacks": {"events": [], "routing": {
                 "maximum_projected_utilization_percent": 999,
@@ -33,7 +33,7 @@ def _snapshots():
 
 def test_unknown_measurements_are_gaps_instead_of_zero_or_success():
     series = charts.extract_dynamics_chart_series({"snapshots": [{"time_seconds": 2}]})
-    for name in ("gold_availability_percent", "legitimate_delivery_percent", "gold_sla_percent",
+    for name in ("legitimate_delivery_percent", "gold_sla_percent",
                  "sla_margin_min", "koopman_forecast_risk", "normal_arrival_rate_pps"):
         assert np.isnan(series[name][0]), name
     assert np.isnan(charts._snapshot_peak_load(None, {}))
@@ -61,15 +61,31 @@ def test_capacity_separates_resources_keeps_outliers_and_saved_admission_limit(t
     figure = captured[0]
     try:
         _, network, servers = figure.axes
-        assert network.get_ylim()[1] > 140
+        assert network.get_ylim()[1] >= 100
         assert servers.get_ylim()[1] > 240
         network_lines = {line.get_label(): np.asarray(line.get_ydata()) for line in network.lines}
         server_lines = {line.get_label(): np.asarray(line.get_ydata()) for line in servers.lines}
         np.testing.assert_array_equal(network_lines["максимальная нагрузка линии"], [20] * 4)
-        np.testing.assert_array_equal(network_lines["линии: оценка резервирования"], [140] * 4)
         np.testing.assert_array_equal(server_lines["CPU (процессор)"], [240] * 4)
-        np.testing.assert_array_equal(network_lines["сохранённый допуск нового маршрута"], [82.5] * 4)
+        assert "сохранённый допуск нового маршрута" not in network_lines
         assert not any(999 in values for values in (*network_lines.values(), *server_lines.values()))
+    finally:
+        plt.close(figure)
+
+
+def test_capacity_shows_target_work_when_packet_queue_cpu_is_low(tmp_path, monkeypatch):
+    captured = []
+    snapshots = _snapshots()
+    for snapshot, pressure in zip(snapshots, [0, 75, 100, 0]):
+        snapshot["traffic"]["network_state"]["node_metric_maxima"]["cpu_load_percent"] = 22
+        snapshot["attacks"]["maximum_target_utilization_percent"] = pressure
+    monkeypatch.setattr(charts, "save_figure", lambda figure, path: captured.append(figure))
+    charts._plot_capacity_bottlenecks(None, snapshots, tmp_path / "capacity.png")
+    figure = captured[0]
+    try:
+        lines = {line.get_label(): line.get_ydata() for line in figure.axes[2].lines}
+        np.testing.assert_array_equal(lines["CPU (процессор)"], [22] * 4)
+        np.testing.assert_array_equal(lines["ресурс атакованной цели"], [0, 75, 100, 0])
     finally:
         plt.close(figure)
 

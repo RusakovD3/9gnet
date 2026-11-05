@@ -1,11 +1,30 @@
 import json
 from pathlib import Path
 
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch
+
 from src.gnet9.arbitrator import aggregate_metric
-from src.gnet9.debug_visualizer import PROCESS_BLOCKS, RuntimeCallTracer, export_debug_artifacts
+from src.gnet9.debug_visualizer import PROCESS_BLOCKS, RuntimeCallTracer, export_debug_artifacts, _draw_process_graph
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_process_diagram_does_not_clip_any_block() -> None:
+    figure, axis = plt.subplots()
+    try:
+        _draw_process_graph(axis)
+        left, right = axis.get_xlim()
+        bottom, top = axis.get_ylim()
+        blocks = [patch for patch in axis.patches if isinstance(patch, FancyBboxPatch)]
+        assert len(blocks) == len(PROCESS_BLOCKS)
+        for block in blocks:
+            bounds = block.get_bbox()
+            assert left < bounds.x0 < bounds.x1 < right
+            assert bottom < bounds.y0 < bounds.y1 < top
+    finally:
+        plt.close(figure)
 
 
 def test_runtime_tracer_records_only_project_function_calls() -> None:
@@ -42,3 +61,6 @@ def test_debug_artifacts_include_diagrams_and_full_trace(tmp_path: Path) -> None
     process = json.loads(paths["process_json"].read_text(encoding="utf-8"))
     assert len(process["blocks"]) == len(PROCESS_BLOCKS)
     assert any(block["block_id"] == "arb" for block in process["blocks"])
+    arb = next(block for block in process["blocks"] if block["block_id"] == "arb")
+    assert "рекомендации человеку" in arb["description"]
+    assert "переназначении" not in arb["description"]

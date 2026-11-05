@@ -42,7 +42,7 @@ def test_sla_chart_shows_compliance_and_marks_missing_data():
                              {"sla_grade": "gold", "flow_count": 10, "sla_compliant_flow_count": 9}]}},
                          "koopman": {"kalman_filter": {"applied_to_nominal_observation": False}}}]}
     series = extract_dynamics_chart_series(d)
-    assert series["gold_availability_percent"] == [100]
+    assert "gold_availability_percent" not in series
     assert series["gold_sla_percent"] == [90]
     assert np.isnan(series["silver_sla_percent"][0])
     assert series["kalman_applied"] == [False]
@@ -85,3 +85,22 @@ def test_active_attack_and_nominal_queues_are_labelled_truthfully():
     t0 = _interactive_snapshot_summary({"step_index": 0}, [], {}, True, model)
     assert "без потерь, очередей" not in t0
     assert "SLA золотого класса (качество услуг): нет данных" in t0
+
+
+def test_scheme_and_hover_describe_recommendations_on_fixed_routes(tmp_path, monkeypatch):
+    from src.gnet9 import visualizer
+    from src.gnet9.flow_details import _node_hover_text
+    model = GNetBaselineBuilder().build()
+    labels = []
+    original_save = visualizer.save_figure
+    def capture(figure, path):
+        labels.extend(text.get_text() for axis in figure.axes for text in axis.texts)
+        original_save(figure, path)
+    monkeypatch.setattr(visualizer, "save_figure", capture)
+    visualizer.GNetVisualizer(model).draw_layer_scheme(tmp_path / "layers.png")
+    assert any("Маршруты фиксированы" in label for label in labels)
+    assert not any("Защита меняет" in label for label in labels)
+    arb = _node_hover_text(model, "ARB")
+    assert "рекомендации человеку" in arb
+    assert "переназначении" not in arb
+    assert "при переназначении" not in _node_hover_text(model, "C1")

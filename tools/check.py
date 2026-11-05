@@ -33,6 +33,7 @@ SMOKE_FILES = (
     "algorithm_dialogue.json", "algorithm_dialogue.md", "standards_and_equipment_audit.json",
     "network_logic.png", "layer_scheme.png", "ip_address_map.png", "service_flows.png",
     "charts/dynamics_overview.png", "charts/capacity_bottlenecks.png",
+    "charts/security_dashboard.png",
     "step_log.csv",
     "run_summary.json", "run_summary.md",
 )
@@ -120,9 +121,9 @@ def verify_smoke_exports(output: Path) -> dict[str, str]:
             raise ValueError("Unexpected monitoring row count")
     dynamics = json.loads((output / "network_dynamics.json").read_text(encoding="utf-8"))
     summary = json.loads((output / "run_summary.json").read_text(encoding="utf-8"))
-    if dynamics.get("export_metadata", {}).get("schema_version") != 2:
+    if dynamics.get("export_metadata", {}).get("schema_version") != 3:
         raise ValueError("Не указана версия представления результатов")
-    if summary.get("schema_version") != 1:
+    if summary.get("schema_version") != 2:
         raise ValueError("Неизвестная версия краткого результата")
     if summary["training"]["accepted_transitions_total"] != dynamics["training_summary"]["nominal_transitions"]:
         raise ValueError("Итог обучения расходится с полными результатами")

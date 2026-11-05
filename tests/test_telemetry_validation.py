@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -88,3 +89,35 @@ def test_external_csv_requires_strict_monotonic_time_and_required_columns(tmp_pa
 
     with pytest.raises(TelemetryValidationError, match="строго возрастать"):
         read_telemetry_csv(invalid)
+
+
+def test_calibration_preserves_threshold_precision_when_scores_are_close(tmp_path: Path) -> None:
+    trace = tmp_path / "telemetry.csv"
+    _write_known_trace(trace)
+    points = [replace(point, risk_score=0.9200004 if point.risk_score > 0.5 else 0.9200002)
+              for point in read_telemetry_csv(trace)]
+    report = validate_external_telemetry(
+        points, TelemetryValidationConfig(minimum_events_per_partition=3),
+    )
+    assert report["deployment_gate"]["passed"] is True
+    assert report["threshold_selection"]["selected_warning_risk_threshold"] == 0.9200004
+    assert report["independent_holdout"]["metrics"]["false_warning_episode_count"] == 0
+    path = tmp_path / "report.json"
+    write_validation_report(report, path)
+    assert load_pilot_calibration(path)["warning_risk_threshold"] == 0.9200004
+
+
+def test_external_csv_does_not_treat_missing_attack_label_as_healthy(tmp_path: Path) -> None:
+    path = tmp_path / "missing_label.csv"
+    path.write_text("timestamp_seconds,risk_score,attack_onset\n0,0.1,0\n5,0.9,\n10,0.1,1\n",
+                    encoding="utf-8")
+    with pytest.raises(TelemetryValidationError, match="attack_onset"):
+        read_telemetry_csv(path)
+
+
+@pytest.mark.parametrize("field", ["minimum_lead_seconds", "maximum_lead_seconds",
+    "maximum_false_warnings_per_hour", "minimum_events_per_partition"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_external_validation_rejects_nonfinite_configuration(field: str, value: float) -> None:
+    with pytest.raises(TelemetryValidationError, match="конечными"):
+        replace(TelemetryValidationConfig(), **{field: value}).validate()

@@ -79,7 +79,7 @@ class LocalObservationFilter:
         result = {"model": "local_diagonal_cholesky_random_walk",
                   "applied_to_nominal_observation": nominal,
                   "mask_origin": "engineering_hypotheses_not_mitre_calibration",
-                  "decision_role": "diagnostic_only_not_remap_authorization",
+                  "decision_role": "diagnostic_only",
                   "unsupported_local_techniques": ["T1110.001", "T0831"],
                   "process_variance": self.process_variance,
                   "measurement_variance": self.measurement_variance}

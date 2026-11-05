@@ -28,7 +28,7 @@ class GNetVisualizer:
             "L4": "Длина линий · восстановление",
             "L5": "Правила передачи · приоритеты",
             "L6": "Питание · запас энергии",
-            "L7": "Состояние → прогноз → защита",
+            "L7": "Состояние → прогноз → рекомендации",
             "L8": "Координаты · местность",
         }
         fig, ax = plt.subplots(figsize=(13, 8))
@@ -49,5 +49,5 @@ class GNetVisualizer:
             ax.text(x + .2, y + .7, title, color=TEXT, fontsize=10, fontweight="bold")
             ax.text(x + .2, y + .28, descriptions[level], color=MUTED, fontsize=9)
         ax.text(0, .5, "Свойства оборудования и линий → наблюдения по уровням → арбитр L7", color=TEXT, fontsize=11)
-        ax.text(0, .1, "Защита меняет рабочие маршруты; исходное исправное состояние t0 сохраняется.", color=MUTED, fontsize=10)
+        ax.text(0, .1, "Маршруты фиксированы; арбитр выдаёт рекомендации человеку. Эталон t0 сохраняется.", color=MUTED, fontsize=10)
         save_figure(fig, path)

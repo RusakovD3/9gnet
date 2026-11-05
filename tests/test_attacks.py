@@ -16,7 +16,7 @@ MODEL = GNetBaselineBuilder().build()
 def test_attack_catalog_uses_official_mitre_techniques_and_explicit_assumptions() -> None:
     catalog = attack_catalog()
     assert {item["mitre_technique_id"] for item in catalog} == {
-        "T1498.001", "T1498.002", "T1499.001", "T1110.001", "T0831", "T1529"
+        "T1498.001", "T1498.002", "T1499.001", "T1499.002", "T1499.003", "T1110.001", "T0831", "T1529"
     }
     power = [item for item in catalog if item["kind"] == "power_attack"]
     assert {item["power_failure_mode"] for item in power} == {
@@ -30,7 +30,7 @@ def test_attack_catalog_uses_official_mitre_techniques_and_explicit_assumptions(
         "mitre_technique_id"
     ] == "T1529"
     assert {item["kind"] for item in catalog} == {
-        "dos", "ddos", "syn_flood", "brute_force", "power_attack"
+        "dos", "ddos", "syn_flood", "brute_force", "power_attack", "dns_flood", "application_flood"
     }
     assert all(item["mitre_url"].startswith("https://attack.mitre.org/techniques/") for item in catalog)
     assert all(
@@ -66,12 +66,12 @@ def test_attack_catalog_uses_official_mitre_techniques_and_explicit_assumptions(
     assert any(item["technique_id"] == "T1110.001" for item in mitre_tensor_mapping_catalog())
 
 
-def test_gold_routes_mark_critical_nodes_and_safe_remap_limit() -> None:
+def test_gold_routes_mark_critical_nodes_for_human_review() -> None:
     for node_id in ("C1", "SRV_MEDIA", "M1_01"):
         protection = MODEL.graph.nodes[node_id]["critical_protection"]
         assert protection["is_critical"] is True
         assert protection["protection_priority"] == 1
-        assert protection["maximum_safe_utilization_percent"] == 80.0
+        assert protection["policy"] == "review_gold_service_impact_first"
     assert MODEL.graph.nodes["M1_01"]["sla_grade"] == "gold"
 
 
@@ -88,34 +88,23 @@ def test_mitre_demo_schedule_and_network_reaction() -> None:
     assert snapshots[0]["koopman"]["forecast_horizon_seconds"] == 5
     assert snapshots[0]["koopman"]["alert_level"] == "NORMAL"
     assert snapshots[6]["attacks"]["raw_attack_rate_mbps"] == 24_000.0
-    assert snapshots[6]["attacks"]["attack_rate_mbps"] < snapshots[6]["attacks"]["raw_attack_rate_mbps"]
-    assert snapshots[6]["attacks"]["blocked_attack_rate_mbps"] > 0.0
-    routing = snapshots[6]["attacks"]["routing"]
-    assert routing["failover_flow_count"] > 0
-    assert routing["maximum_projected_utilization_percent"] <= 80.0
-    assert routing["by_sla"]["gold"]["availability_ratio"] == 1.0
-    assert all(
-        "SRV_MEDIA" not in flow.get("route", [])
-        for flow in snapshots[6]["traffic"]["flows"]
-        if (
-            not flow.get("is_attack_traffic")
-            and flow.get("original_server_node") == "SRV_MEDIA"
-            # M1_01 is concurrently the safe T1110.001 account target.  Its
-            # legitimate service path is protected, not failed over.
-            and flow.get("client_node") != "M1_01"
-        )
-    )
+    assert snapshots[6]["attacks"]["attack_rate_mbps"] == snapshots[6]["attacks"]["raw_attack_rate_mbps"]
+    assert snapshots[6]["attacks"]["blocked_attack_rate_mbps"] == 0.0
+    baseline = {flow["client_node"]: (flow["route"], flow["server_node"])
+                for flow in snapshots[0]["traffic"]["flows"]}
+    assert all((flow["route"], flow["server_node"]) == baseline[flow["client_node"]]
+               for flow in snapshots[6]["traffic"]["flows"] if not flow.get("is_attack_traffic"))
     assert snapshots[6]["attacks"]["raw_target_resource_pressure"] >= 0.90
-    assert snapshots[6]["arbitrator"]["analysis"]["attack_pressure"] < snapshots[6]["attacks"]["raw_target_resource_pressure"]
+    assert snapshots[6]["arbitrator"]["analysis"]["attack_pressure"] == snapshots[6]["attacks"]["raw_target_resource_pressure"]
     assert snapshots[6]["arbitrator"]["analysis"]["koopman_forecast_risk"] > 0.50
-    assert snapshots[6]["arbitrator"]["remap"]["reason"] == "mitre_attack_observed_with_koopman_confirmation"
+    assert snapshots[6]["arbitrator"]["recommendation"]["requires_human_action"] is True
     assert {event["kind"] for event in snapshots[7]["attacks"]["events"]} == {"brute_force"}
     assert snapshots[7]["attacks"]["attack_rate_mbps"] == 0.0
     assert snapshots[10]["attacks"]["active_count"] == 2
     assert {event["kind"] for event in snapshots[10]["attacks"]["events"]} == {"power_attack"}
     assert snapshots[10]["attacks"]["attack_rate_mbps"] == 0.0
     assert snapshots[10]["arbitrator"]["analysis"]["lyapunov_value"] > snapshots[0]["arbitrator"]["analysis"]["lyapunov_value"]
-    assert snapshots[10]["arbitrator"]["remap"]["koopman_forecast"]["attack_kind"] == "power_attack"
+    assert snapshots[10]["arbitrator"]["recommendation"]["attack_kind"] == "dns_flood+power_attack"
 
 
 def test_slow_brute_force_is_safe_authentication_telemetry() -> None:
@@ -157,7 +146,7 @@ def test_attack_flows_are_visible_and_separate_from_legitimate_flows() -> None:
     assert len(legitimate_flows) == SUBSCRIBER_COUNT
     assert {flow["application"] for flow in attack_flows} == {"ATTACK_DOS"}
     assert all(flow["mitre_technique_id"] == "T1498.001" for flow in attack_flows)
-    assert len(MITRE_DEMO_ATTACKS) == 6
+    assert len(MITRE_DEMO_ATTACKS) == 8
 
 
 def test_koopman_predictor_exports_causal_forecast_and_residual() -> None:
@@ -193,15 +182,14 @@ def test_koopman_predictor_exports_causal_forecast_and_residual() -> None:
 def test_koopman_warns_five_seconds_before_every_attack_onset() -> None:
     dynamics = simulate_stationary_dynamics(
         MODEL,
-        DynamicsConfig(step_count=10, snapshot_detail="summary", packet_detail="flows", attack_scenario="mitre-demo"),
+        DynamicsConfig(step_count=16, snapshot_detail="summary", packet_detail="flows", attack_scenario="mitre-demo"),
     )
     evaluation = dynamics["koopman_evaluation"]
-    assert evaluation["attack_onset_count"] == 6
-    assert evaluation["predicted_before_onset_count"] == 6
+    assert evaluation["attack_onset_count"] == 8
+    assert evaluation["predicted_before_onset_count"] == 8
     assert evaluation["minimum_observed_lead_seconds"] >= 5
     assert evaluation["false_positive_attack_id_count"] == 0
     assert evaluation["all_attacks_predicted_at_least_one_step_ahead"] is True
-    assert evaluation["preventive_defense_applied_count"] == 6
 
     for record in evaluation["records"]:
         warning = dynamics["snapshots"][record["warning_step"]]
@@ -212,7 +200,7 @@ def test_koopman_warns_five_seconds_before_every_attack_onset() -> None:
         assert warning["koopman"]["forecast_correlation_ids"]
         assert warning["koopman"]["forecast_attack_ids"] == []
         assert warning["koopman"]["probability_is_calibrated"] is False
-        assert warning["arbitrator"]["remap"]["koopman_forecast"]["probability_is_calibrated"] is False
+        assert warning["arbitrator"]["recommendation"]["probability_is_calibrated"] is False
         assert all(
             "attack_id" not in item
             and "suspected_kind" not in item
@@ -220,7 +208,6 @@ def test_koopman_warns_five_seconds_before_every_attack_onset() -> None:
             and "forecast_horizon_seconds" not in item
             for item in warning["attacks"]["precursors"]
         )
-        assert warning["arbitrator"]["prevention"]["status"] == "ARMED_FOR_NEXT_STEP"
 
 
 def test_healthy_run_has_no_false_positive_and_keeps_t0_operator() -> None:
@@ -239,40 +226,8 @@ def test_healthy_run_has_no_false_positive_and_keeps_t0_operator() -> None:
         # Эталон t0 неизменен, рабочее правило учится на исправном трафике.
         assert koopman["online_baseline_update_applied"] is (snapshot["step_index"] > 0)
         assert koopman["operator_revision_after_update"] == snapshot["step_index"]
-        assert snapshot["arbitrator"]["remap"]["action"] == "NO_REMAP"
-        assert snapshot["arbitrator"]["prevention"]["status"] == "STANDBY"
+        assert snapshot["arbitrator"]["recommendation"]["action"] == "OBSERVE"
     assert len(fingerprints) == 1
-
-
-def test_preventive_defense_reduces_damage_with_gold_first_priority() -> None:
-    dynamics = simulate_stationary_dynamics(
-        MODEL,
-        DynamicsConfig(step_count=6, snapshot_detail="summary", packet_detail="flows", attack_scenario="mitre-demo"),
-    )
-    ddos = dynamics["snapshots"][6]
-    attacks = ddos["attacks"]
-    assert attacks["preventive_defense"]["effective"] is True
-    assert attacks["attack_rate_mbps"] < attacks["raw_attack_rate_mbps"]
-    routing = attacks["routing"]
-    assert routing["policy"] == "gold_then_silver_then_bronze"
-    assert routing["failover_flow_count"] > 0
-    assert routing["maximum_projected_utilization_percent"] <= 80.0
-    assert [tier["priority"] for tier in routing["tiers"]] == [1, 2, 3]
-    assert routing["by_sla"]["gold"]["availability_ratio"] >= routing["by_sla"]["silver"]["availability_ratio"]
-    reflected = [
-        flow for flow in ddos["traffic"]["flows"]
-        if flow.get("application") == "ATTACK_DDOS"
-    ]
-    assert reflected
-    assert all(not flow.get("quarantined") for flow in reflected)
-    assert all(
-        flow.get("attack_traffic_leg") == "amplified_external_reflector_response"
-        for flow in reflected
-    )
-    assert all(flow.get("quarantined_request_initiator_ids") for flow in reflected)
-    plan = ddos["arbitrator"]["remap"]["sla_restoration_plan"]
-    assert plan["order"] == ["gold", "silver", "bronze"]
-    assert [tier["priority"] for tier in plan["tiers"]] == [1, 2, 3]
 
 
 def test_reflection_ddos_separates_trigger_and_amplified_response_routes() -> None:
@@ -327,56 +282,6 @@ def test_subscribers_have_explicit_recovery_priority() -> None:
             assert attrs["recovery_priority"] == expected[attrs["sla_grade"]]
 
 
-def test_packet_sample_reflects_quarantine_and_post_defense_flow_state() -> None:
-    dynamics = simulate_stationary_dynamics(
-        MODEL,
-        DynamicsConfig(
-            step_count=3,
-            snapshot_detail="summary",
-            packet_detail="sample",
-            packet_sample_limit=64,
-            attack_scenario="mitre-demo",
-        ),
-    )
-    traffic = dynamics["snapshots"][3]["traffic"]
-    packets = traffic["packet_sample"]
-    attack_flows = [flow for flow in traffic["flows"] if flow.get("is_attack_traffic")]
-    assert attack_flows
-    assert all(flow.get("quarantined") and not flow.get("route") for flow in attack_flows)
-    assert all(packet["application"] != "ATTACK_DOS" for packet in packets)
-    assert dynamics["snapshots"][3]["attacks"]["raw_attack_rate_mbps"] > 0.0
-    assert dynamics["snapshots"][3]["attacks"]["attack_rate_mbps"] == 0.0
-    assert dynamics["snapshots"][3]["attacks"]["routing"]["rerouted_flow_count"] > 0
-
-
-def test_syn_is_quarantined_and_power_attack_has_no_fake_packet() -> None:
-    dynamics = simulate_stationary_dynamics(
-        MODEL,
-        DynamicsConfig(
-            step_count=10,
-            snapshot_detail="summary",
-            packet_detail="sample",
-            packet_sample_limit=32,
-            attack_scenario="mitre-demo",
-        ),
-    )
-    syn_packets = dynamics["snapshots"][8]["traffic"]["packet_sample"]
-    assert all(packet["packet_role"] != "attack_syn" for packet in syn_packets)
-    syn_flows = [
-        flow for flow in dynamics["snapshots"][8]["traffic"]["flows"]
-        if flow.get("application") == "ATTACK_SYN"
-    ]
-    assert syn_flows and all(flow.get("quarantined") for flow in syn_flows)
-    assert dynamics["snapshots"][8]["attacks"]["routing"]["protected_endpoint_flow_count"] > 0
-
-    power_snapshot = dynamics["snapshots"][10]
-    assert power_snapshot["attacks"]["active"] is True
-    assert all(
-        not packet["application"].startswith("ATTACK_")
-        for packet in power_snapshot["traffic"]["packet_sample"]
-    )
-
-
 def test_power_runtime_separates_ups_ride_through_from_cyber_shutdown() -> None:
     dynamics = simulate_stationary_dynamics(
         MODEL,
@@ -411,17 +316,16 @@ def test_power_runtime_separates_ups_ride_through_from_cyber_shutdown() -> None:
     assert observations["A3"]["ups_on_battery"] is True
     assert observations["SRV_RTC"]["estimated_availability_ratio"] == 0.0
     assert observations["SRV_RTC"]["estimated_power_availability_ratio"] == 1.0
-    routing = onset["attacks"]["routing"]
-    assert "A3" in routing["service_transparent_power_targets"]
-    assert "A3" not in routing["avoid_nodes"]
-    assert "SRV_RTC" in routing["avoid_nodes"]
+    assert "routing" not in onset["attacks"]
+    assert onset["arbitrator"]["recommendation"]["execution_mode"] == "human_only"
 
     recovery = dynamics["snapshots"][11]
     recovery_runtime = {
         item["target_id"]: item
         for item in recovery["attacks"]["power_runtime_state"]
     }
-    assert recovery["attacks"]["intrusion_active"] is False
+    assert {event["kind"] for event in recovery["attacks"]["events"]
+            if not event.get("is_recovery_effect")} == {"dns_flood"}
     assert recovery_runtime["A3"]["phase"] == "battery_recharge"
     assert recovery_runtime["A3"]["service_availability_ratio"] == 1.0
     assert recovery_runtime["SRV_RTC"]["phase"] == "rebooting"

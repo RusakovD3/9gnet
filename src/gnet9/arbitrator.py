@@ -2,7 +2,7 @@
 
 The arbitrator does not own topology construction or time stepping. It receives
 tensor snapshots from `dynamics.py`, reduces them to stable metrics and prepares
-the fields later needed for remapping, Koopman/DMD and Lyapunov analysis.
+Koopman/DMD and Lyapunov diagnostics for a human operator.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from .models import NetworkModel, StateTensor
 
 
 # Keep the observed set intentionally small: these metrics are enough for a
-# readable first remapping signal and a compact state vector for time-series math.
+# readable security diagnostic and a compact state vector for time-series math.
 ARBITRATOR_OBSERVED_METRICS = {
     "L1": ("sla_margin", "traffic_intensity_rho"),
     "L2": ("cpu_load_percent", "ram_load_percent", "stability_margin"),
@@ -54,11 +54,13 @@ TRIGGER_BANDS = {
 STATE_NAMES = ("normal", "watch", "alert", "critical")
 STATE_LABELS = ("норма", "наблюдение", "защита", "срочная защита")
 THREAT_CONTROLS = {
-    "dos": ["rate_limit_attack_traffic", "protect_gold_paths"],
-    "ddos": ["rate_limit_attack_traffic", "protect_gold_paths", "distribute_service_load"],
+    "dos": ["rate_limit_attack_traffic", "review_gold_service_impact"],
+    "ddos": ["rate_limit_attack_traffic", "review_gold_service_impact", "review_upstream_protection"],
     "syn_flood": ["enable_syn_protection", "protect_endpoint_queue"],
+    "dns_flood": ["review_dns_request_limits", "review_dns_service_logs"],
+    "application_flood": ["review_expensive_request_limits", "review_application_cpu_budget"],
     "brute_force": ["enforce_account_lockout_policy", "review_failed_authentication_events"],
-    "power_attack": ["check_power_domain", "prefer_nodes_with_energy_reserve"],
+    "power_attack": ["check_power_domain", "check_energy_reserve"],
 }
 
 
@@ -80,7 +82,7 @@ def build_trigger_card(
     decision_pressure: float, confirmed: bool, attack_kind: str,
     source_confirmed: bool,
 ) -> dict[str, Any]:
-    """Карта состояния связывает наблюдения с допустимой защитой."""
+    """Карта состояния объясняет срочность проверки человеком."""
     signals = {
         "hausdorff": trigger_state(hausdorff, "hausdorff"),
         "koopman": trigger_state(risk, "koopman"),
@@ -88,26 +90,27 @@ def build_trigger_card(
         "decision": trigger_state(decision_pressure, "decision"),
     }
     controls = sorted({control for kind in attack_kind.split("+") for control in THREAT_CONTROLS.get(kind, [])})
-    # Порог исполнения сохраняет строгую границу > 0,20. Одиночное
+    # Порог срочности рекомендации сохраняет границу > 0,20. Одиночное
     # отклонение любого расчёта не подтверждает источник или класс угрозы.
     observe_limit, protection_limit, emergency_limit = TRIGGER_BANDS["decision"]
     if decision_pressure <= observe_limit:
-        action, stage = "NO_REMAP", "observe"
+        action, stage = "OBSERVE", "observe"
     elif not confirmed:
         action, stage = "OBSERVE_PRECURSOR", "confirm_observation"
     else:
-        action = "PLAN_REMAP"
+        action = "RECOMMEND_REVIEW"
         stage = "prepare" if decision_pressure < protection_limit else "protect" if decision_pressure < emergency_limit else "emergency"
-    if source_confirmed and confirmed and stage == "emergency" and set(attack_kind.split("+")) & {"dos", "ddos", "syn_flood"}:
-        controls.append("isolate_confirmed_attack_sources")
+    if source_confirmed and confirmed and stage == "emergency" and set(attack_kind.split("+")) & {"dos", "ddos", "syn_flood", "dns_flood", "application_flood"}:
+        controls.append("review_confirmed_attack_sources")
     return {
         "signals": signals, "attack_kind": attack_kind, "confirmed": confirmed,
         "action": action, "response_stage": stage, "controls": controls if confirmed else [],
-        "source_quarantine_allowed": source_confirmed and confirmed and bool(set(attack_kind.split("+")) & {"dos", "ddos", "syn_flood"}),
+        "source_confirmed": source_confirmed,
+        "execution_mode": "human_only",
         "reason_ru": (
-            "Оснований для изменения маршрутов нет." if action == "NO_REMAP" else
-            "Сигнал требует повторного наблюдения; источник не изолируется." if not confirmed else
-            f"Угроза подтверждена; диапазон реакции: {signals['decision']['label_ru']}."
+            "Продолжайте наблюдение за показателями безопасности." if action == "OBSERVE" else
+            "Сигнал требует повторного наблюдения и проверки человеком." if not confirmed else
+            f"Есть подтверждённые признаки угрозы; срочность рекомендации: {signals['decision']['label_ru']}."
         ),
     }
 
@@ -119,12 +122,7 @@ def build_arbitrator_view(
     observation: dict[str, Any] | None = None,
     state_hausdorff: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Return L7 analysis and a no-remap decision for the current snapshot.
-
-    Healthy baseline dynamics should keep `remap.needed` false. Future degraded
-    modes can feed the same tensor-state structure and let these thresholds start
-    proposing remap actions.
-    """
+    """Return L7 mathematical diagnostics without a network-control decision."""
     aggregates = level_metric_aggregates(tensor_state, observed_only=True)
     full_aggregates = level_metric_aggregates(tensor_state, observed_only=False)
     l7_tensor = model.graph.nodes["ARB"].get("tensor") if "ARB" in model.graph.nodes else None
@@ -145,8 +143,6 @@ def build_arbitrator_view(
         observation=observation,
         state_hausdorff=state_hausdorff,
     )
-    attack_active = bool(observation.get("attacks", {}).get("active", False))
-    needs_remap = remap_pressure > TRIGGER_BANDS["decision"][0]
 
     return {
         "node_id": "ARB",
@@ -168,17 +164,7 @@ def build_arbitrator_view(
         },
         "critical_node_hierarchy": critical_node_hierarchy(model),
         "observations": observation,
-        "remap": {
-            "needed": needs_remap,
-            "action": "PLAN_REMAP" if needs_remap else "NO_REMAP",
-            "reason": (
-                "healthy_stationary_baseline" if not needs_remap
-                else "mitre_attack_observed" if attack_active else "tensor_threshold_pressure"
-            ),
-            "candidate_actions": [] if not needs_remap else [
-                "rate_limit_attack_traffic", "protect_gold_paths", "reroute_high_pressure_flows"
-            ],
-        },
+
     }
 
 
@@ -255,10 +241,10 @@ def evaluate_defense_game(
         max(float(threat_pressure), 0.35 * float(matrix_koopman_pressure)),
     )
     defender_actions = (
-        ("NO_REMAP", 0.00, 0.00),
+        ("OBSERVE", 0.00, 0.00),
         ("OBSERVE_PRECURSOR", 0.12, 0.025),
-        ("PLAN_REMAP", 0.58, 0.12),
-        ("ISOLATE_CONFIRMED_SOURCES_AND_REMAP", 0.76, 0.23),
+        ("RECOMMEND_REVIEW", 0.58, 0.12),
+        ("REVIEW_CONFIRMED_SOURCES", 0.76, 0.23),
     )
     attacker_actions = (("MAINTAIN", 0.72), ("ESCALATE", 1.00), ("DISTRIBUTE", 0.88))
     matrix: list[dict[str, Any]] = []
@@ -370,7 +356,6 @@ def build_state_vector(
     observation = observation or {}
     attacks = observation.get("attacks", {})
     traffic = observation.get("traffic", {})
-    routing = attacks.get("routing", observation.get("routing", {}))
     sla_tiers = {
         str(item.get("sla_grade")): item
         for item in attacks.get("sla_restoration", {}).get("tiers", [])
@@ -422,20 +407,18 @@ def build_state_vector(
         float((state_hausdorff or {}).get("distance") or 0.0),
         float((state_hausdorff or {}).get("normalized_distance", 0.0)),
         float((state_hausdorff or {}).get("coordinate_hausdorff_distance") or 0.0),
-        float(routing.get("by_sla", {}).get("gold", {}).get("rerouted_flow_count", 0.0)),
-        float(routing.get("by_sla", {}).get("silver", {}).get("rerouted_flow_count", 0.0)),
-        float(routing.get("by_sla", {}).get("bronze", {}).get("rerouted_flow_count", 0.0)),
-        float(routing.get("isolated_flow_count", 0.0)),
-        float(routing.get("service_failover_flow_count", 0.0)),
-        float(routing.get("route_change_ratio", 0.0)),
-        float(routing.get("maximum_projected_utilization_percent", 0.0)),
+        # Зарезервированные оси прежней схемы: управление удалено.
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
         _tier_compliance_ratio(sla_tiers, "gold"),
         _tier_compliance_ratio(sla_tiers, "silver"),
         _tier_compliance_ratio(sla_tiers, "bronze"),
     ]
     return {
-        "metric_names": metric_names + observed_names + ["OBS.normal_arrival_rate_pps"],
-        "vector": vector + observed_vector + [float(traffic.get("normal_arrival_rate_pps", 0.0))],
+        "metric_names": metric_names + observed_names + ["OBS.normal_arrival_rate_pps",
+            "OBS.dns_query_pressure_ratio", "OBS.application_work_pressure_ratio"],
+        "vector": vector + observed_vector + [float(traffic.get("normal_arrival_rate_pps", 0.0)),
+            float(attacks.get("dns_query_pressure_ratio", 0.0)),
+            float(attacks.get("application_work_pressure_ratio", 0.0))],
     }
 
 
@@ -462,7 +445,7 @@ def remap_pressure_from_tensors(
     # A non-zero state Hausdorff value records routine observed-versus-t0
     # variation as well as damage. It remains visible to the analyst and the
     # predictor, but only a material normalised divergence can independently
-    # request remapping; otherwise a healthy packet snapshot would create a
+    # request human attention; otherwise a healthy packet snapshot would create a
     # false L7 pressure.
     state_hausdorff_remap_pressure = max(
         0.0, (state_hausdorff_drift - 0.25) / 0.75
@@ -480,8 +463,7 @@ def remap_pressure_from_tensors(
     ]
     pressure = max(0.0, min(1.0, max(pressures)))
     # Keep every positive mathematical component in the diagnostic value.  The
-    # remapping decision has its own 0.20 control threshold, so small values
-    # remain observable without creating a false mitigation action.
+    # recommendation urgency has a separate threshold; diagnostics stay visible.
     return round(pressure, 6)
 
 

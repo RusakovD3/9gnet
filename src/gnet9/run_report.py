@@ -17,11 +17,6 @@ def _number(value):
     return value if math.isfinite(value) else None
 
 
-def _maximum(values):
-    available = [number for value in values if (number := _number(value)) is not None]
-    return max(available) if available else None
-
-
 def _sla_by_class(snapshots):
     result = {grade: {"observed_steps": 0, "minimum_compliance_ratio": None,
                       "worst_step": None, "worst_time_seconds": None,
@@ -66,7 +61,6 @@ def build_run_summary(dynamics):
     snapshots = dynamics.get("snapshots", [])
     evaluation = dynamics.get("koopman_evaluation", {})
     training = dynamics.get("training_summary", {})
-    routing = [snapshot.get("attacks", {}).get("routing", {}) for snapshot in snapshots]
     precursor_step = training.get("first_precursor_step")
     accepted = [snapshot for snapshot in snapshots
                 if snapshot.get("koopman", {}).get("nominal_training", {}).get("transition_accepted") is True]
@@ -75,7 +69,7 @@ def build_run_summary(dynamics):
                     if (time := _number(snapshot.get("time_seconds"))) is not None]
     observed_attacks = [snapshot for snapshot in snapshots if snapshot.get("attacks", {}).get("events")]
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "scope": "offline_simulation_not_independent_external_validation",
         "runtime": {"python": platform.python_version(),
                     "packages": {name: metadata.version(name) for name in ("numpy", "networkx", "matplotlib")}},
@@ -102,20 +96,15 @@ def build_run_summary(dynamics):
             "weighted_time_mean_ratio": _number(dynamics.get("sla_resilience", {}).get("time_mean")),
             "weighted_minimum_ratio": _number(dynamics.get("sla_resilience", {}).get("minimum")),
             "by_class": _sla_by_class(snapshots),
-            "accounting": "confirmed_attack_sources_excluded;all_other_isolated_flows_count_as_failures",
+            "accounting": "all_legitimate_flows_on_fixed_routes",
         },
-        "protection": {
-            "maximum_rerouted_flows_in_one_step": _maximum(row.get("rerouted_flow_count") for row in routing),
-            "maximum_failover_flows_in_one_step": _maximum(row.get("failover_flow_count") for row in routing),
-            "maximum_isolated_flows_in_one_step": _maximum(row.get("isolated_flow_count") for row in routing),
-            "maximum_admitted_route_utilization_percent": _maximum(
-                row.get("maximum_admitted_route_utilization_percent") for row in routing),
-            "maximum_total_projected_utilization_percent": _maximum(
-                row.get("maximum_projected_utilization_percent") for row in routing),
-            "admission_limit_percent": next((row["maximum_safe_utilization_percent"] for row in routing
-                                                if "maximum_safe_utilization_percent" in row), None),
-            "scope": "maxima_of_step_counts_not_counts_of_distinct_lifetime_actions",
-        },
+        "recommendations": [
+            {"step_index": snapshot.get("step_index"), "time_seconds": snapshot.get("time_seconds"),
+             **snapshot["arbitrator"]["recommendation"]}
+            for snapshot in snapshots
+            if snapshot.get("arbitrator", {}).get("recommendation", {}).get("requires_human_action")
+        ],
+        "operation_mode": "forecast_and_human_recommendations_only",
         "events": [{key: record.get(key) for key in (
             "attack_id", "kind", "target_id", "first_step", "last_step", "actions", "response_stages")}
             for record in dynamics.get("attack_response_evaluation", [])],
@@ -138,11 +127,6 @@ def _display(value, *, percent=False):
     if number is None:
         return "нет данных"
     return f"{number * 100:.2f}%" if percent else f"{number:g}"
-
-
-def _percent_points(value):
-    number = _number(value)
-    return "нет данных" if number is None else f"{number:g}%"
 
 
 def export_run_summary(dynamics, directory: Path):
@@ -172,11 +156,17 @@ def export_run_summary(dynamics, directory: Path):
         lines.append(f"| {label} | {_display(row['minimum_compliance_ratio'], percent=True)} "
             f"| {_display(row['worst_step'])} | {_display(row['compliant_flows_at_worst_step'])} / "
             f"{_display(row['accounted_flows_at_worst_step'])} |")
-    protection = summary["protection"]
-    lines += ["", f"Максимальная загрузка ресурсов принятых новых маршрутов: "
-        f"{_percent_points(protection['maximum_admitted_route_utilization_percent'])} "
-        f"при пределе допуска {_percent_points(protection['admission_limit_percent'])}.",
-        "Общая перегрузка сети и допуск новых маршрутов — разные показатели.", "", "## Наблюдённые события", ""]
+    lines += ["", "## Рекомендации человеку", "",
+              "Структура сети и маршруты фиксированы. Меры защиты программа не исполняет.", ""]
+    for item in summary["recommendations"]:
+        lines.append(f"### Шаг {item['step_index']} · t = {item['time_seconds']} с")
+        lines.append(f"Наблюдаемые цели: {', '.join(item['target_ids']) or 'не определены'}; "
+                     f"окно прогноза: {item['forecast_window_start_seconds']}–{item['forecast_window_end_seconds']} с.")
+        lines.extend(f"- {step}" for step in item["steps_ru"])
+        lines.append("")
+    if not summary["recommendations"]:
+        lines.append("Сигналов, требующих защитных действий человека, не было.")
+    lines += ["", "## Наблюдённые события", ""]
     for event in summary["events"]:
         lines.append(f"- `{event['attack_id']}`: {ATTACK_KIND_DISPLAY_NAMES.get(event['kind'], event['kind'])}; "
             f"цель `{event['target_id']}`, шаги {_display(event['first_step'])}–{_display(event['last_step'])}.")

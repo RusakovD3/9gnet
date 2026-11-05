@@ -55,6 +55,8 @@ class TelemetryValidationConfig:
     maximum_false_warnings_per_hour: float = 0.10
 
     def validate(self) -> None:
+        if not all(math.isfinite(value) for value in asdict(self).values()):
+            raise TelemetryValidationError("Параметры проверки должны быть конечными числами")
         if not 0.5 <= self.training_fraction < 1.0:
             raise TelemetryValidationError("training_fraction должен быть в диапазоне [0.5, 1.0)")
         if self.minimum_lead_seconds <= 0:
@@ -216,7 +218,7 @@ def validate_external_telemetry(
             "status": "PASSED_FOR_SUPERVISED_PILOT" if eligible else "FAILED",
             "passed": eligible,
             "semantics_ru": (
-                "Прохождение допускает только наблюдаемый пилот с ручным утверждением ремаппинга; "
+                "Прохождение допускает только наблюдаемый пилот с рекомендациями человеку; "
                 "оно не является гарантией отсутствия ошибок и не разрешает автоматически менять реальную сеть."
             ),
             "training_quality_gate_passed": training_gate,
@@ -263,7 +265,7 @@ def _parse_bool(value: str | None, row_number: int) -> bool:
     normalized = str(value or "").strip().lower()
     if normalized in {"1", "true", "yes", "да"}:
         return True
-    if normalized in {"0", "false", "no", "нет", ""}:
+    if normalized in {"0", "false", "no", "нет"}:
         return False
     raise TelemetryValidationError(
         f"Строка {row_number}: attack_onset должен быть 0/1, true/false или да/нет"
@@ -328,7 +330,9 @@ def _evaluate_threshold(
     recall = predicted / max(len(onsets), 1)
     leads = [float(record["lead_seconds"]) for record in records if record["lead_seconds"] is not None]
     return {
-        "warning_risk_threshold": round(float(threshold), 6),
+        # Порог — часть правила решения, а не округлённая подпись графика.
+        # Обучение, holdout и сохранённый профиль используют одно значение.
+        "warning_risk_threshold": float(threshold),
         "row_count": len(points),
         "duration_seconds": duration_seconds,
         "attack_onset_count": len(onsets),

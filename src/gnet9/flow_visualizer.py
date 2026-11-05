@@ -9,8 +9,9 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+from matplotlib.collections import LineCollection
 from matplotlib.lines import Line2D
-from matplotlib.patches import FancyBboxPatch
+from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 from matplotlib.widgets import Button, Slider
 import numpy as np
 
@@ -20,6 +21,8 @@ from .flow_details import (FLOW_SHORT_LABELS, _flow_summary, _flow_is_visible,
                            _node_hover_text)
 from .network_layout import network_positions as _positions
 from .plot_style import BACKGROUND, PANEL, TEXT, BORDER, save_figure
+from .security_panel import SecurityPanel
+from .security_dashboard import ATTACK_COLORS
 
 
 FLOW_COLORS = {
@@ -30,8 +33,10 @@ FLOW_COLORS = {
     "RTP_TELEMOST": "#14b8a6",
     "LIVE_HLS": "#eab308",
     "ATTACK_DOS": "#ff1744",
-    "ATTACK_DDOS": "#b91c1c",
-    "ATTACK_SYN": "#f43f5e",
+    "ATTACK_DDOS": "#fb7185",
+    "ATTACK_SYN": "#f472b6",
+    "ATTACK_DNS": "#a78bfa",
+    "ATTACK_APPLICATION": "#fb923c",
 }
 LEVEL_COLORS = {"L0": "#10b981", "L2": "#60a5fa", "L7": "#fb923c", "L8": "#94a3b8"}
 NODE_SIZES = {"L0": 175, "L2": 64, "L7": 105, "L8": 28}
@@ -39,12 +44,7 @@ SUBSCRIBER_STYLES = {
     "mobile-subscriber": {"color": "#22d3ee", "marker": "o", "label": "Мобильные абоненты (М)"},
     "fixed-subscriber": {"color": "#fbbf24", "marker": "s", "label": "Фиксированные абоненты (Ф)"},
 }
-ATTACK_TARGET_COLORS = {
-    "dos": "#ef4444",
-    "ddos": "#b91c1c",
-    "syn_flood": "#f43f5e",
-    "power_attack": "#facc15",
-}
+ATTACK_TARGET_COLORS = ATTACK_COLORS
 
 
 def aggregate_flow_edges(flows: list[dict[str, Any]]) -> dict[frozenset[str], dict[str, Any]]:
@@ -62,15 +62,11 @@ def aggregate_flow_edges(flows: list[dict[str, Any]]) -> dict[frozenset[str], di
                     "flow_count": 0,
                     "wire_bytes": 0,
                     "applications": Counter(),
-                    "rerouted_flow_count": 0,
-                    "failover_flow_count": 0,
                 },
             )
             item["flow_count"] += 1
             item["wire_bytes"] += int(flow.get("wire_bytes", 0))
             item["applications"][flow.get("application", "unknown")] += 1
-            item["rerouted_flow_count"] += int(bool(flow.get("rerouted")))
-            item["failover_flow_count"] += int(bool(flow.get("failover_active")))
     return result
 
 
@@ -101,30 +97,8 @@ def draw_network_map(model, path: Path, *, flows=None, title_suffix="") -> None:
     _draw_access_zones(ax, model, pos)
     _draw_topology(ax, model, pos, loads=loads, max_bytes=max_bytes)
     _draw_labels(ax, model, pos)
-    isolated_nodes = sorted({
-        str(flow.get("client_node")) for flow in flows
-        if flow.get("isolated") and flow.get("client_node") in pos
-    })
-    if isolated_nodes:
-        ax.scatter(
-            [pos[node][0] for node in isolated_nodes],
-            [pos[node][1] for node in isolated_nodes],
-            s=190, marker="x", c="#fb7185", linewidths=2.5, zorder=16,
-        )
-    failover_servers = sorted({
-        str(flow.get("server_node")) for flow in flows
-        if flow.get("failover_active") and flow.get("server_node") in pos
-    })
-    if failover_servers:
-        ax.scatter(
-            [pos[node][0] for node in failover_servers],
-            [pos[node][1] for node in failover_servers],
-            s=310, facecolors="none", edgecolors="#34d399",
-            linewidths=2.5, zorder=16,
-        )
     _set_topology_view(ax, pos)
-    _draw_legend(ax, static=True, topology_only=topology_only, applications=set(f.get("application") for f in flows),
-                 show_isolation=bool(isolated_nodes), show_failover=bool(failover_servers))
+    _draw_legend(ax, static=True, topology_only=topology_only, applications=set(f.get("application") for f in flows))
     summary = (f"СОСТАВ СЕТИ\n\n{sum(a.get('level') == 'L1' for _, a in model.graph.nodes(data=True))} абонентов\n"
                f"{sum(a.get('level') == 'L2' for _, a in model.graph.nodes(data=True))} сетевых устройств\n"
                f"{len(model.servers)} сервера · {len(model.services)} услуг\n\n"
@@ -166,19 +140,19 @@ class ServiceFlowWindow:
         # The main network area is intentionally wider than the side panels:
         # 480 endpoints are readable without zooming into a single access group.
         self.fig, self.ax = plt.subplots(figsize=(28, 16))
-        self.fig.subplots_adjust(bottom=0.125, right=0.770, left=0.018, top=0.94)
-        self.status_ax = self.fig.add_axes([0.790, 0.295, 0.200, 0.650])
-        self.legend_ax = self.fig.add_axes([0.790, 0.140, 0.200, 0.140])
-        self.help_ax = self.fig.add_axes([0.790, 0.025, 0.200, 0.100])
+        self.fig.subplots_adjust(bottom=0.205, right=0.615, left=0.018, top=0.92)
+        self.status_ax = self.fig.add_axes([0.640, 0.145, 0.345, 0.750])
+        self.legend_ax = self.fig.add_axes([0.018, 0.105, 0.595, 0.085])
+        self.help_ax = self.fig.add_axes([0.640, 0.025, 0.345, 0.100])
         for panel_ax in (self.status_ax, self.legend_ax, self.help_ax):
             panel_ax.set_axis_off()
             panel_ax.set_facecolor("none")
         _style_axes(self.ax, "GNet9 · потоки по шагам")
         _draw_access_zones(self.ax, model, self.pos)
         _draw_topology(self.ax, model, self.pos)
-        _draw_labels(self.ax, model, self.pos)
+        _draw_labels(self.ax, model, self.pos, compact=True)
         _set_topology_view(self.ax, self.pos)
-        _draw_legend(self.legend_ax, compact=True)
+        _draw_legend(self.legend_ax, compact=True, dashboard=True)
 
         self.edge_artists: dict[frozenset[str], Any] = {}
         for source, target in model.graph.edges():
@@ -196,13 +170,17 @@ class ServiceFlowWindow:
             [], [], s=[], facecolors="none", edgecolors="#c084fc", linewidths=2.2,
             linestyles="--", alpha=0.95, zorder=14,
         )
-        self.isolated_nodes = self.ax.scatter(
-            [], [], s=[], marker="x", c="#fb7185", linewidths=2.8, alpha=0.96, zorder=16,
-        )
-        self.failover_servers = self.ax.scatter(
-            [], [], s=[], facecolors="none", edgecolors="#34d399",
-            linewidths=2.6, alpha=0.96, zorder=16,
-        )
+        self.attack_routes = LineCollection([], linewidths=2.4, alpha=.80, zorder=10)
+        self.ax.add_collection(self.attack_routes)
+        self.selected_routes = LineCollection([], linewidths=4.8, alpha=.95, zorder=11)
+        self.ax.add_collection(self.selected_routes)
+        self.route_arrows = []
+        self.attack_sources = self.ax.scatter([], [], s=160, marker="s", facecolors="none",
+                                             edgecolors="#e2e8f0", linewidths=2, zorder=16)
+        self.selected_target = self.ax.scatter([], [], s=650, facecolors="none", linewidths=3, zorder=17)
+        self.attack_location = self.ax.text(.015, .02, "", transform=self.ax.transAxes, color=TEXT,
+                                            fontsize=10, zorder=20, va="bottom",
+                                            bbox={"fc": PANEL, "ec": BORDER, "alpha": .96, "pad": 7})
         panel_style = {"boxstyle": "round,pad=0.55", "fc": "#172033", "ec": "#475569", "alpha": 0.96}
         self.status_cards = []
         top = 1.0
@@ -219,11 +197,24 @@ class ServiceFlowWindow:
             self.status_cards.append((heading, body, panel))
             top = bottom
         self.status = self.status_cards[0][1]
+        self.security_panel = SecurityPanel(self.fig, usable, self._select_alarm)
+        self.security_panel.update(0)
+        self.status_ax.set_visible(False)
+        self.security_button = Button(self.fig.add_axes([.640, .913, .168, .034]), "Тревоги и атаки",
+                                      color="#2563eb", hovercolor="#3b82f6")
+        self.metrics_button = Button(self.fig.add_axes([.817, .913, .168, .034]), "Показатели сети",
+                                     color=PANEL, hovercolor=BORDER)
+        for tab in (self.security_button, self.metrics_button):
+            tab.label.set_color(TEXT)
+            tab.label.set_fontsize(11)
+        self.security_button.on_clicked(lambda _: self._show_panel(True))
+        self.metrics_button.on_clicked(lambda _: self._show_panel(False))
         self.help_text = self.help_ax.text(
             0.0, 1.0,
             "КАК ЧИТАТЬ И УПРАВЛЯТЬ\n"
             "Точки — условная выборка потоков, не отдельные пакеты.\n"
-            "Толщина линии — объём за шаг; цвет — услуга.\n"
+            "Цвет контура и пути атаки — её тип; квадрат — точка входа.\n"
+            "Цвет обычной линии — услуга; толщина — объём за шаг.\n"
             "← / → — шаг; пробел — воспроизведение / пауза.\n"
             "Наведение — показатели выбранного шага.",
             transform=self.help_ax.transAxes, va="top", fontsize=9.2, color="#dbeafe",
@@ -243,7 +234,7 @@ class ServiceFlowWindow:
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_hover)
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
 
-        slider_ax = self.fig.add_axes([0.18, 0.045, 0.41, 0.027])
+        slider_ax = self.fig.add_axes([0.18, 0.045, 0.29, 0.027])
         self.slider = Slider(
             slider_ax, "Шаг", 0, max(1, len(usable) - 1), valinit=0, valstep=1,
             valfmt="%d", color="#38bdf8", initcolor="none"
@@ -270,7 +261,7 @@ class ServiceFlowWindow:
         for step_button, direction in ((self.previous_button, -1), (self.next_button, 1)):
             step_button.label.set_color(TEXT)
             step_button.on_clicked(lambda event, shift=direction: self._move_step(shift))
-        button_ax = self.fig.add_axes([0.665, 0.027, 0.105, 0.055])
+        button_ax = self.fig.add_axes([0.505, 0.027, 0.110, 0.055])
         self.button = Button(button_ax, "▶  Продолжить", color="#2563eb", hovercolor="#3b82f6")
         self.button.label.set_color("#f8fafc")
         self.button.label.set_fontweight("bold")
@@ -286,6 +277,68 @@ class ServiceFlowWindow:
         except (AttributeError, RuntimeError):
             pass
         plt.show()
+
+    def _show_panel(self, security: bool) -> None:
+        self.security_panel.set_visible(security)
+        self.status_ax.set_visible(not security)
+        self.security_button.ax.set_facecolor("#2563eb" if security else PANEL)
+        self.metrics_button.ax.set_facecolor(PANEL if security else "#2563eb")
+        self.fig.canvas.draw_idle()
+
+    def _select_alarm(self) -> None:
+        """Выбор меняет только выделение наблюдений на карте."""
+        self._render_attack_context()
+        self.fig.canvas.draw_idle()
+
+    def _render_attack_context(self) -> None:
+        segments, colors = [], []
+        for alarm in self.security_panel.data.get("alarms", []):
+            if alarm["phase"] != "active":
+                continue
+            for route in alarm["routes"]:
+                for source, target in zip(route, route[1:]):
+                    if source in self.pos and target in self.pos and self.model.graph.has_edge(source, target):
+                        segments.append([self.pos[source], self.pos[target]])
+                        colors.append(alarm["color"])
+        self.attack_routes.set_segments(segments)
+        self.attack_routes.set_colors(colors)
+        alarm = self.security_panel.selected
+        selected = []
+        if alarm:
+            for route in alarm["routes"]:
+                for source, target in zip(route, route[1:]):
+                    if source in self.pos and target in self.pos and self.model.graph.has_edge(source, target):
+                        selected.append([self.pos[source], self.pos[target]])
+        self.selected_routes.set_segments(selected)
+        self.selected_routes.set_colors(alarm["color"] if alarm else TEXT)
+        self.selected_routes.set_linestyles("solid" if alarm and alarm["phase"] == "active" else "dashed")
+        for arrow in self.route_arrows:
+            arrow.remove()
+        self.route_arrows = []
+        final_edges = list(dict.fromkeys(tuple(route[-2:]) for route in alarm["routes"] if len(route) >= 2)) if alarm else []
+        for source, target in final_edges[:12]:
+            if source not in self.pos or target not in self.pos or not self.model.graph.has_edge(source, target):
+                continue
+            start, end = np.asarray(self.pos[source]), np.asarray(self.pos[target])
+            arrow = FancyArrowPatch(start + .50 * (end - start), start + .78 * (end - start),
+                                    arrowstyle="-|>", mutation_scale=19, linewidth=1.4,
+                                    color=alarm["color"], zorder=13)
+            self.ax.add_patch(arrow)
+            self.route_arrows.append(arrow)
+        sources = [self.pos[n] for n in alarm["source_ids"] if n in self.pos] if alarm else []
+        self.attack_sources.set_offsets(np.asarray(sources) if sources else np.empty((0, 2)))
+        self.attack_sources.set_edgecolors(alarm["color"] if alarm else TEXT)
+        target = self.pos.get(alarm["target_id"]) if alarm else None
+        self.selected_target.set_offsets(np.asarray([target]) if target else np.empty((0, 2)))
+        self.selected_target.set_edgecolors(alarm["color"] if alarm else TEXT)
+        self.selected_target.set_linestyle("solid" if alarm and alarm["phase"] == "active" else "dashed")
+        if alarm:
+            prefix = "Ранее наблюдалось" if alarm["phase"] == "history" else alarm["phase_label"]
+            self.attack_location.set_text(f"{prefix} · {alarm['target_id']}\n{alarm['kind_label']}")
+            self.attack_location.set_color(alarm["color"])
+        else:
+            self.attack_location.set_text("Наблюдаемых атак нет · выберите шаг для просмотра")
+            self.attack_location.set_color("#86efac")
 
     def _on_hover(self, event) -> None:
         if event.inaxes is not self.ax or event.x is None or event.y is None:
@@ -327,6 +380,7 @@ class ServiceFlowWindow:
         self.hover_note.set_visible(False)
         self._set_playback_style()
         self._render_snapshot(update_edges=True)
+        self._sync_slider()
         self.fig.canvas.draw_idle()
 
     def _move_step(self, direction: int) -> None:
@@ -416,6 +470,8 @@ class ServiceFlowWindow:
         flows = snapshot.get("traffic", {}).get("flows", [])
         loads = self.edge_loads[self.step_index]
         if update_edges:
+            self.security_panel.update(self.step_index)
+            self._render_attack_context()
             for key, line in self.edge_artists.items():
                 load = loads.get(key)
                 if not load:
@@ -425,7 +481,7 @@ class ServiceFlowWindow:
                 line.set_color(FLOW_COLORS.get(dominant, "#ffbe0b"))
                 line.set_linewidth(0.8 + 5.2 * np.sqrt(load["wire_bytes"] / self.max_wire_bytes))
                 line.set_alpha(0.88)
-                line.set_linestyle("--" if load.get("rerouted_flow_count") else "-")
+                line.set_linestyle("-")
 
         selected = _spread_sample(flows, self.particles_per_frame, self.step_index + self.frame_in_step)
         points: list[tuple[float, float]] = []
@@ -480,25 +536,6 @@ class ServiceFlowWindow:
         self.warning_targets.set_sizes(
             [430.0 + 45.0 * np.sin(self.frame_in_step / 5.0) for _ in warning_nodes]
         )
-        isolated_nodes = sorted({
-            str(flow.get("client_node"))
-            for flow in flows
-            if flow.get("isolated") and flow.get("client_node") in self.pos
-        })
-        self.isolated_nodes.set_offsets(
-            np.asarray([self.pos[node] for node in isolated_nodes]) if isolated_nodes else np.empty((0, 2))
-        )
-        self.isolated_nodes.set_sizes([190.0 for _ in isolated_nodes])
-        failover_servers = sorted({
-            str(flow.get("server_node"))
-            for flow in flows
-            if flow.get("failover_active") and flow.get("server_node") in self.pos
-        })
-        self.failover_servers.set_offsets(
-            np.asarray([self.pos[node] for node in failover_servers])
-            if failover_servers else np.empty((0, 2))
-        )
-        self.failover_servers.set_sizes([310.0 for _ in failover_servers])
         for section, (heading, body, panel) in zip(
                 _interactive_status_sections(snapshot, flows, loads, self.paused, self.model), self.status_cards):
             heading.set_text(section["title"])
@@ -510,8 +547,7 @@ class ServiceFlowWindow:
             self.particles,
             self.attack_targets,
             self.warning_targets,
-            self.isolated_nodes,
-            self.failover_servers,
+            self.attack_routes, self.selected_routes, self.attack_sources, self.selected_target,
             *(text for heading, body, _ in self.status_cards for text in (heading, body)),
             *self.edge_artists.values(),
         )
@@ -519,6 +555,32 @@ class ServiceFlowWindow:
 
 def show_service_flow_window(model, snapshots: list[dict[str, Any]]) -> None:
     create_service_flow_window(model, snapshots).show()
+
+
+def draw_security_dashboard(model, snapshots: list[dict[str, Any]], path: Path) -> None:
+    """Сохранить обзор шага с наибольшей готовой срочностью за прогон.
+
+    Это выбор иллюстрации после расчёта, а не вход прогнозатора. При равной
+    срочности предпочитается наблюдаемое воздействие, затем более ранний шаг.
+    Обычное интерактивное окно по-прежнему открывается на t0.
+    Без пакетных снимков удаляется только прежний файл этого обзора.
+    """
+    if not snapshots:
+        path.unlink(missing_ok=True)
+        return
+    ranks = {"observe": 0, "confirm_observation": 1, "prepare": 2, "protect": 3, "emergency": 4}
+    index = max(range(len(snapshots)), key=lambda i: (
+        ranks.get(snapshots[i].get("arbitrator", {}).get("recommendation", {}).get("response_stage"), 0),
+        bool(snapshots[i].get("attacks", {}).get("events")), -i,
+    ))
+    window = ServiceFlowWindow(model, snapshots)
+    try:
+        window.animation.event_source.stop()
+        window._select_step(index)
+        window.fig.canvas.draw()
+        save_figure(window.fig, path, dpi=110)
+    finally:
+        plt.close(window.fig)
 
 
 def create_service_flow_window(model, snapshots: list[dict[str, Any]]) -> ServiceFlowWindow:
@@ -588,9 +650,8 @@ def _draw_topology(ax, model, pos, *, loads=None, max_bytes: int = 1) -> None:
         else:
             color = "#22d3ee" if standby else "#64748b"
             width, alpha, zorder = (0.65, 0.32, 2) if standby else (0.48, 0.36, 1)
-        # Two visually different dashed styles prevent an inactive L2 reserve
-        # from being confused with a route already remapped by the arbitrator.
-        linestyle = "--" if load and load.get("rerouted_flow_count") else ":" if standby else "-"
+        # Неактивная резервная связь отличается от исходного пути с трафиком.
+        linestyle = ":" if standby else "-"
         ax.plot(
             [x1, x2], [y1, y2], color=color, linewidth=width,
             alpha=alpha, zorder=zorder, linestyle=linestyle,
@@ -680,7 +741,7 @@ def _draw_access_zones(ax, model, pos) -> None:
         )
 
 
-def _draw_labels(ax, model, pos) -> None:
+def _draw_labels(ax, model, pos, *, compact=False) -> None:
     for node_id, attrs in model.graph.nodes(data=True):
         level = attrs.get("level")
         if level not in {"L0", "L2", "L7"}:
@@ -691,10 +752,12 @@ def _draw_labels(ax, model, pos) -> None:
             label = node_id.replace("SRV_", "СЕРВЕР ")
         elif level == "L0":
             label = SERVICE_DISPLAY_NAMES.get(attrs.get("label"), attrs.get("label", node_id)).upper()
+            if compact:
+                label = textwrap.fill(label, width=14, break_long_words=False)
         elif level == "L7":
             label = "Арбитр"
         ax.text(
-            x, y + (0.34 if level == "L0" else 0.20), label, ha="center",
+            x, y + (0.65 if compact and level == "L7" else 0.34 if level == "L0" else 0.20), label, ha="center",
             fontsize=8.5, color=TEXT, zorder=7,
         )
 
@@ -719,8 +782,8 @@ def _set_topology_view(ax, pos: dict[str, tuple[float, float]]) -> None:
     ax.set_ylim(min(ys) - max(height * 0.10, 0.80), max(ys) + max(height * 0.08, 0.65))
 
 
-def _draw_legend(ax, *, static=False, compact=False, applications=None,
-                 show_isolation=True, show_failover=True, topology_only=False) -> None:
+def _draw_legend(ax, *, static=False, compact=False, dashboard=False, applications=None,
+                 topology_only=False) -> None:
     flow_labels = FLOW_SHORT_LABELS
     flow_handles = [Line2D([0], [0], color=color, lw=3, label=flow_labels[name]) for name, color in FLOW_COLORS.items() if applications is None or name in applications]
     subscriber_handles = []
@@ -740,9 +803,6 @@ def _draw_legend(ax, *, static=False, compact=False, applications=None,
         Line2D([0], [0], marker="o", color="#ef4444", markerfacecolor="none", markersize=10, label="Цель сетевой атаки"),
         Line2D([0], [0], marker="o", color="#facc15", markerfacecolor="none", markersize=10, label="Цель атаки на питание"),
         Line2D([0], [0], marker="o", color="#c084fc", markerfacecolor="none", markersize=10, label="Подтверждённая область прогноза Купмана"),
-        Line2D([0], [0], marker="x", color="#fb7185", markersize=9, linestyle="none", label="Временно изолированный абонент"),
-        Line2D([0], [0], marker="o", color="#34d399", markerfacecolor="none", markersize=10, label="Активный резервный сервер"),
-        Line2D([0], [0], color="#e2e8f0", lw=2.0, linestyle="--", label="Штрихи — переназначенный маршрут"),
         Line2D([0], [0], color="#22d3ee", lw=1.5, linestyle=":", label="Точки — резервная связь L2 без трафика"),
         Line2D([0], [0], color="#cbd5e1", lw=0.7, label="Линия абонента: цвет M/Ф"),
         Line2D([0], [0], color="#94a3b8", lw=0.7, alpha=0.7, label="Связь без трафика"),
@@ -754,22 +814,19 @@ def _draw_legend(ax, *, static=False, compact=False, applications=None,
     if static:
         # Только обозначения, которые действительно видны на этом рисунке.
         handles = [*flow_handles, *subscriber_handles, *semantic_handles[:7],
-                   *([semantic_handles[10]] if show_isolation else []),
-                   *([semantic_handles[11]] if show_failover else []),
-                   *(semantic_handles[12:] if not topology_only else semantic_handles[-2:]) ]
+                   *(semantic_handles[10:] if not topology_only else semantic_handles[-2:]) ]
         legend_options = {"loc": "lower left", "bbox_to_anchor": (1.018, .015), "ncol": 1}
     elif compact:
         handles = [
-            *flow_handles[:6],
-            *subscriber_handles,
-            semantic_handles[7], semantic_handles[9], semantic_handles[10],
-            semantic_handles[11], semantic_handles[12], semantic_handles[13],
+            *flow_handles[:6], *subscriber_handles,
+            semantic_handles[7], semantic_handles[8], semantic_handles[9], semantic_handles[10],
         ]
-        for handle, label in zip(handles[-6:], ("Цель атаки", "Область прогноза", "Изолированный абонент",
-                                               "Резервный сервер", "Маршрут изменён", "Резерв без потока")):
+        for handle, label in zip(handles[-4:], ("Цель атаки", "Сбой питания", "Область прогноза", "Резерв без потока")):
             handle.set_label(label)
         legend_options = {"loc": "upper left", "bbox_to_anchor": (0.0, 1.0), "ncol": 2,
                           "columnspacing": 0.9, "handlelength": 1.7, "borderaxespad": 0.0}
+        if dashboard:
+            legend_options.update(ncol=4, columnspacing=1.2)
     else:
         handles = [*flow_handles, *subscriber_handles, *semantic_handles]
         legend_options = (

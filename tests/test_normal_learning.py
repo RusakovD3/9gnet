@@ -94,7 +94,8 @@ def test_type_specific_weibull_matches_hazard_and_slow_authentication():
     catalog = attack_catalog(model, "predictive-demo", seed=42, step_seconds=2, step_count=60)
     schedule = predictive_demo_mixed_schedule(seed=42, step_seconds=2, step_count=60)
     assert schedule.raw_intervals_are_iid_weibull is False
-    assert {item["kind"] for item in catalog} == {"dos", "ddos", "syn_flood", "power_attack", "brute_force"}
+    assert {item["kind"] for item in catalog} == {
+        "dos", "ddos", "syn_flood", "power_attack", "brute_force", "dns_flood", "application_flood"}
     for item, duration, k, scale, hazard in zip(catalog, schedule.raw_interarrival_seconds,
             schedule.event_shapes, schedule.event_scales_seconds, schedule.realized_hazard_per_second):
         assert 0 < k < 1 if item["kind"] == "brute_force" else k > 1
@@ -141,24 +142,6 @@ def test_normal_learning_uses_filtered_observations_and_keeps_sla():
         for name in ("OBS.legitimate_loss_ratio", "OBS.gold_sla_compliance_ratio", "OBS.attack_rate_mbps"):
             index = names.index(name)
             assert raw[index] == filtered[index]
-
-
-def test_confirmed_direct_sources_stop_packet_damage():
-    model = GNetBaselineBuilder().build()
-    profile = next(item for item in attack_catalog(model) if item["kind"] == "dos")
-    step = profile["temporal"]["start_step"]
-    event = next(item for item in active_attack_events(model, "mitre-demo", step_index=step,
-        time_seconds=step * 2, step_seconds=2) if item["attack_id"] == profile["attack_id"])
-    plan = {"valid_from_step": step, "valid_until_step": step, "attack_ids": [event["attack_id"]],
-            "mitigation_strength": 1.0, "source_ids": event["ingress_nodes"],
-            "routing_control": {"quarantine_sources": event["ingress_nodes"]}}
-    result = simulate_packet_snapshot(model, step_index=step, time_seconds=step * 2,
-        step_seconds=2, attack_events=[event], defense_plan=plan, detail="flows")
-    legitimate = [f for f in result["flows"] if not f.get("is_attack_traffic") and not f.get("isolated")]
-    assert sum(f["observed_dropped_packets"] for f in legitimate) == 0
-    assert all(f["attack_latency_penalty_ms"] == 0 for f in legitimate)
-    assert sum(f["packet_count"] for f in result["flows"] if f.get("is_attack_traffic")) == 0
-    assert result["attack_state"]["raw_attack_rate_mbps"] > 0
 
 
 def test_low_demand_does_not_hide_loss_and_empty_flow_is_available():

@@ -16,18 +16,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 from .plot_style import (BACKGROUND, PANEL, TEXT, MUTED, BLUE, GREEN,
                          AMBER, RED, PURPLE, save_figure, style_axis)
+from .security_dashboard import ATTACK_COLORS
 
 
 AggregateSeriesSpec = tuple[str, str, str, str, float]
 NestedSeriesSpec = tuple[str, tuple[str, ...], float]
 
-ATTACK_KIND_COLORS = {
-    "dos": "#ef4444",
-    "ddos": "#b91c1c",
-    "syn_flood": "#f43f5e",
-    "brute_force": "#f59e0b",
-    "power_attack": "#facc15",
-}
+ATTACK_KIND_COLORS = ATTACK_COLORS
 
 AGGREGATE_SERIES: tuple[AggregateSeriesSpec, ...] = (
     ("sla_margin_min", "L1", "sla_margin", "min", 1.0),
@@ -40,7 +35,6 @@ TRAFFIC_SERIES: tuple[NestedSeriesSpec, ...] = (
     ("attack_arrival_rate_pps", ("traffic", "summary", "attack_arrival_rate_pps"), 1.0),
     ("filtered_normal_arrival_rate_pps", ("koopman", "kalman_filter", "filtered_normal_arrival_rate_pps"), 1.0),
     ("raw_attack_rate_mbps", ("attacks", "raw_attack_rate_mbps"), 1.0),
-    ("admitted_attack_rate_mbps", ("attacks", "attack_rate_mbps"), 1.0),
     ("packet_count", ("traffic", "summary", "packet_count"), 1.0),
     ("traffic_rate_mbps", ("traffic", "summary", "offered_rate_mbps"), 1.0),
     ("traffic_delivered_rate_mbps", ("traffic", "summary", "delivered_rate_mbps"), 1.0),
@@ -62,12 +56,7 @@ ATTACK_SERIES: tuple[NestedSeriesSpec, ...] = (
     ("attack_intensity_percent", ("attacks", "maximum_intensity_ratio"), 100.0),
     ("precursor_confidence_percent", ("attacks", "precursor_confidence"), 100.0),
     ("legitimate_delivery_percent", ("attacks", "legitimate_delivery_ratio"), 100.0),
-    ("gold_availability_percent", ("attacks", "routing", "by_sla", "gold", "availability_ratio"), 100.0),
     ("koopman_warning_percent", ("koopman", "forecast_is_early_warning"), 100.0),
-    ("rerouted_flows", ("attacks", "routing", "rerouted_flow_count"), 1.0),
-    ("failover_flows", ("attacks", "routing", "failover_flow_count"), 1.0),
-    ("isolated_flows", ("attacks", "routing", "isolated_flow_count"), 1.0),
-    ("post_remap_utilization_percent", ("attacks", "routing", "maximum_projected_utilization_percent"), 1.0),
 )
 
 
@@ -171,7 +160,7 @@ def _plot_dynamics_overview(series, dynamics, path: Path) -> None:
     panels = grid[1, 0].subgridspec(3, 2, hspace=.87, wspace=.25)
     axes = np.array([[fig.add_subplot(panels[row, column]) for column in range(2)]
                      for row in range(3)])
-    fig.suptitle("GNet9 · состояние сети и работа защиты", color=TEXT,
+    fig.suptitle("GNet9 · безопасность и прогноз угроз", color=TEXT,
                  fontsize=20, fontweight="bold", x=.075, ha="left", y=.975)
     time = series["time_seconds"]
     ax = axes[0, 0]
@@ -210,11 +199,8 @@ def _plot_dynamics_overview(series, dynamics, path: Path) -> None:
                 color=MUTED, fontsize=8, va="bottom")
 
     ax = axes[1, 1]
-    _plot_step(ax, time, series["rerouted_flows"], "сменили маршрут", BLUE)
-    _plot_step(ax, time, series["failover_flows"], "перешли на резервный сервер", PURPLE)
-    _plot_step(ax, time, series["isolated_flows"], "изолированы", RED)
-    _style_axes(ax, "04  Действующая защита на каждом шаге", "число потоков",
-                _positive_limits(series["rerouted_flows"], series["failover_flows"], series["isolated_flows"], minimum=1))
+    _plot_step(ax, time, [value / 100 for value in series["koopman_warning_percent"]], "раннее предупреждение", AMBER)
+    _style_axes(ax, "04  Сигналы для действий человека", "сигнал 0 / 1", (0, 1.1))
 
     ax = axes[2, 0]
     _plot_line(ax, time, series["normal_arrival_rate_pps"], "обычные поступления", BLUE)
@@ -231,8 +217,7 @@ def _plot_dynamics_overview(series, dynamics, path: Path) -> None:
                     color=MUTED, fontsize=8, va="bottom")
 
     ax = axes[2, 1]
-    _plot_line(ax, time, series["raw_attack_rate_mbps"], "предложено до защиты", RED)
-    _plot_line(ax, time, series["admitted_attack_rate_mbps"], "допущено после защиты", AMBER, linestyle="--")
+    _plot_line(ax, time, series["raw_attack_rate_mbps"], "наблюдаемый поток атак", RED)
     _style_axes(ax, "06  Пакетный поток атак", "Мбит/с")
     ax.set_ylim(bottom=0)
 
@@ -249,7 +234,7 @@ def _plot_dynamics_overview(series, dynamics, path: Path) -> None:
              color=TEXT, fontsize=11)
     fig.text(.075, .923, "Шкала сверху показывает фактические записи. Предупреждение — время выдачи прогноза, а не длительность будущей атаки.",
              color=MUTED, fontsize=9)
-    fig.text(.075, .015, "Источник: network_dynamics.json · Разрыв линии — нет данных. Тонированный фон — наблюдаемая атака. Меры защиты могут пересекаться по потокам.",
+    fig.text(.075, .015, "Источник: network_dynamics.json · Разрыв линии — нет данных. Тонированный фон — наблюдаемая атака. Рекомендации выполняются человеком.",
              color=MUTED, fontsize=8)
     _save(fig, path, bottom=.115, top=.88)
 
@@ -260,14 +245,10 @@ def _plot_capacity_bottlenecks(model, snapshots, path: Path) -> None:
     ax = fig.add_subplot(grid[0, :])
     trend = fig.add_subplot(grid[1, 0])
     resources = fig.add_subplot(grid[1, 1])
-    fig.suptitle("GNet9 · линии и ресурсы резервирования", color=TEXT,
+    fig.suptitle("GNet9 · наблюдаемая нагрузка и ресурсы", color=TEXT,
                  fontsize=20, fontweight="bold", x=.075, ha="left", y=.975)
     rows = _link_load_rows(model, snapshots)
     top = sorted(rows, key=lambda row: row["utilization_percent"], reverse=True)[:8]
-    limits = [_nested_float(s, ("attacks", "routing", "maximum_safe_utilization_percent"), default=float("nan"))
-              for s in snapshots]
-    finite_limits = {value for value in limits if np.isfinite(value)}
-    limit = next(iter(finite_limits)) if len(finite_limits) == 1 else None
     bars = ax.barh([r["label"] for r in reversed(top)], [r["utilization_percent"] for r in reversed(top)],
                    color=BLUE, height=.6)
     for bar, row in zip(bars, reversed(top)):
@@ -277,44 +258,35 @@ def _plot_capacity_bottlenecks(model, snapshots, path: Path) -> None:
         ax.text(.5, .5, "Нет данных о нагрузке линий", transform=ax.transAxes, color=MUTED, ha="center")
     _style_axes(ax, "01  Пиковая нагрузка линий за весь расчёт", "", legend=False)
     ax.set_xlabel("% пропускной способности линии", color=MUTED, fontsize=9)
-    ax.set_xlim(0, max([100, *(r["utilization_percent"] * 1.3 for r in top), *finite_limits]))
+    ax.set_xlim(0, max([100, *(r["utilization_percent"] * 1.3 for r in top)]))
     ax.grid(False, axis="y")
     ax.grid(axis="x", color=MUTED, linewidth=.5, alpha=.18)
-    if limit is not None:
-        ax.axvline(limit, color=RED, linestyle="--", linewidth=1)
-        ax.text(limit, 1.01, f"допуск нового маршрута: {limit:g}%", transform=ax.get_xaxis_transform(), color=RED, ha="right", fontsize=8)
     time = [s.get("time_seconds", 0) for s in snapshots]
     # Ряд по каждому шагу, а не максимум из ограниченного списка top-8.
     peak_series = [_snapshot_peak_load(model, s) for s in snapshots]
     _plot_line(trend, time, peak_series, "максимальная нагрузка линии", BLUE)
-    projected = [_nested_float(s, ("attacks", "routing", "maximum_projected_edge_utilization_percent"), default=float("nan")) for s in snapshots]
-    projected_nodes = [_nested_float(s, ("attacks", "routing", "maximum_projected_node_utilization_percent"), default=float("nan")) for s in snapshots]
-    _plot_line(trend, time, projected, "линии: оценка резервирования", PURPLE, linestyle="--")
-    _plot_line(trend, time, projected_nodes, "узлы: оценка пропускной способности", GREEN, linestyle=":")
-    _plot_line(trend, time, limits, "сохранённый допуск нового маршрута", RED, linestyle="--")
-    _style_axes(trend, "02  Пропускная способность сети", "% своей пропускной способности",
-                _positive_limits(peak_series, projected, projected_nodes, limits, minimum=100))
-    resource_series = []
-    for metric, label, color, pattern in (("cpu", "CPU (процессор)", BLUE, "-"),
-                                         ("ram", "RAM (оперативная память)", PURPLE, "--"),
-                                         ("session", "сессии (расчётная ёмкость)", AMBER, ":")):
-        values = [_nested_float(s, ("attacks", "routing", f"maximum_projected_server_{metric}_utilization_percent"), default=float("nan")) for s in snapshots]
-        resource_series.append(values)
-        _plot_line(resources, time, values, label, color, linestyle=pattern)
-    _plot_line(resources, time, limits, "сохранённый допуск нового маршрута", RED, linestyle="--")
-    _style_axes(resources, "03  Ресурсы серверов · оценка резервирования", "% ёмкости соответствующего ресурса",
-                _positive_limits(*resource_series, limits, minimum=100))
-    if any(np.isfinite(value) for value in limits) and not any(
-        np.isfinite(value) for values in resource_series for value in values
-    ):
-        resources.text(.5, .5, "Нет раздельных оценок ресурсов", transform=resources.transAxes,
-                       color=MUTED, ha="center", fontsize=9)
+    _style_axes(trend, "02  Наблюдаемая нагрузка линий", "% пропускной способности",
+                _positive_limits(peak_series, minimum=100))
+    cpu = []
+    for snapshot in snapshots:
+        state = snapshot.get("traffic", {}).get("network_state", {})
+        value = state.get("node_metric_maxima", {}).get("cpu_load_percent")
+        if value is None:
+            value = max((node.get("metrics", {}).get("cpu_load_percent", float("nan"))
+                         for node in state.get("nodes", [])), default=float("nan"))
+        cpu.append(float(value))
+    _plot_line(resources, time, cpu, "CPU (процессор)", BLUE)
+    target_resource = [float(snapshot.get("attacks", {}).get(
+        "maximum_target_utilization_percent", float("nan"))) for snapshot in snapshots]
+    _plot_line(resources, time, target_resource, "ресурс атакованной цели", AMBER)
+    _style_axes(resources, "03  Оценки загрузки ресурсов", "% расчётной ёмкости",
+                _positive_limits(cpu + target_resource, minimum=100))
     for axis in (trend, resources):
         axis.set_xlabel("время от t0, с", color=MUTED)
         _set_time_limits(axis, {"snapshots": snapshots})
     fig.text(.075, .932, "Вверху — восемь линий с наибольшим наблюдаемым пиком. Внизу — максимумы каждого вида ресурса на каждом шаге.", color=MUTED, fontsize=10)
-    fig.text(.075, .908, "Оценки учитывают известную нагрузку и резервирование; это не измерение будущего. Допуск новых маршрутов читается из результата расчёта.", color=MUTED, fontsize=9)
-    fig.text(.075, .022, "Разрыв линии — нет данных. CPU, память и сессии имеют разные ёмкости; общий максимум не подменяет нагрузку линии. Ёмкость сессий — допущение стенда.", color=MUTED, fontsize=8)
+    fig.text(.075, .908, "Нагрузка рассчитана на исходных маршрутах; прогноз и рекомендации не меняют пути потоков.", color=MUTED, fontsize=9)
+    fig.text(.075, .022, "Разрыв линии — нет данных. CPU — оценка очереди; ресурс цели — расчёт воздействия. Это не измерения оборудования.", color=MUTED, fontsize=8)
     _save(fig, path, bottom=.20, top=.84, left=.12, hspace=.45)
 
 
@@ -374,7 +346,8 @@ def _plot_event_timeline(axis, dynamics: dict[str, Any]) -> None:
         if snapshot.get("koopman", {}).get("forecast_is_early_warning"):
             axis.broken_barh([(float(snapshot.get("time_seconds", 0)), period)], (3.7, .6), color=AMBER, alpha=.85)
     lanes = {"dos": 3, "ddos": 3, "syn_flood": 3, "brute_force": 2, "power_attack": 1}
-    labels = {"dos": "DoS", "ddos": "DDoS", "syn_flood": "SYN"}
+    labels = {"dos": "DoS", "ddos": "DDoS", "syn_flood": "SYN",
+              "dns_flood": "DNS", "application_flood": "Приложение"}
     extent = max((float(s.get("time_seconds", 0)) for s in dynamics.get("snapshots", [])), default=0) + period
     for window in _attack_windows(dynamics):
         lane = lanes.get(window["kind"], 3)

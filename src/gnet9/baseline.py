@@ -214,7 +214,7 @@ L5_BY_ROLE = {
         "protocol_code": 3.0,
         "socket_binding_present": 1.0,
         "routing_mode_code": 1.0,
-        "remap_algorithm_code": 2.0,
+        "remap_algorithm_code": 0.0,
         "percolation_threshold": 0.72,
         "reconfiguration_time_s": 12.0,
     },
@@ -222,7 +222,7 @@ L5_BY_ROLE = {
         "protocol_code": 2.0,
         "socket_binding_present": 1.0,
         "routing_mode_code": 1.0,
-        "remap_algorithm_code": 1.0,
+        "remap_algorithm_code": 0.0,
         "percolation_threshold": 0.64,
         "reconfiguration_time_s": 20.0,
     },
@@ -230,7 +230,7 @@ L5_BY_ROLE = {
         "protocol_code": 4.0,
         "socket_binding_present": 1.0,
         "routing_mode_code": 1.0,
-        "remap_algorithm_code": 1.0,
+        "remap_algorithm_code": 0.0,
         "percolation_threshold": 0.56,
         "reconfiguration_time_s": 8.0,
     },
@@ -238,7 +238,7 @@ L5_BY_ROLE = {
         "protocol_code": 2.5,
         "socket_binding_present": 1.0,
         "routing_mode_code": 1.0,
-        "remap_algorithm_code": 1.0,
+        "remap_algorithm_code": 0.0,
         "percolation_threshold": 0.58,
         "reconfiguration_time_s": 14.0,
     },
@@ -304,7 +304,7 @@ L6_BY_ROLE = {
 }
 
 
-# L7 is a healthy no-remap decision vector. Future experiments can mutate these
+# L7 is a healthy diagnostic vector. Runtime observations must not mutate these
 # values when attacks, overload or physical relocation are introduced.
 L7_ARBITRATOR_BASELINE = {
     "gold_threat_minimum_distance_ms": 0.0,

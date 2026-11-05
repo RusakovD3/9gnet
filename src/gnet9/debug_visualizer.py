@@ -45,9 +45,9 @@ PROCESS_BLOCKS = (
     ProcessBlock("tensor", "Снимок тензоров", "Наблюдение", "Сбор метрик уровней L0–L8 и транспортных связей.", ("_tensor_state_snapshot",), (9.0, 4.1)),
     ProcessBlock("traffic", "Пакеты и потоки", "Наблюдение", "Маршруты без транзита через endpoint, заголовки, задержки, потери и загрузка каналов.", ("simulate_packet_snapshot", "shortest_data_path"), (9.0, 2.7)),
     ProcessBlock("attacks", "Сценарий MITRE ATT&CK", "Наблюдение", "Расписание DoS, DDoS, SYN-флуда, безопасной T1110.001-аутентификации и атак на питание; ВВХ/ТТХ и воздействие на легитимный трафик.", ("active_attack_events", "apply_attack_effects"), (9.0, 1.25)),
-    ProcessBlock("arb", "Арбитратор L7", "Анализ", "Агрегация наблюдений, вектор состояния, Хаусдорф состояния относительно t0 и решение о переназначении.", ("build_arbitrator_view", "build_state_vector", "state_tensor_hausdorff_view"), (11.3, 4.1)),
+    ProcessBlock("arb", "Арбитратор L7", "Анализ", "Агрегация наблюдений, вектор состояния, Хаусдорф состояния относительно t0 и рекомендации человеку.", ("build_arbitrator_view", "build_state_vector", "state_tensor_hausdorff_view"), (11.3, 4.1)),
     ProcessBlock("koopman", "Купман / устойчивость", "Анализ", "DMD с задержанной историей сравнивает состояние с t0; близость угрозы и Хаусдорф Gold-маршрутов считаются раздельно, а функция Ляпунова показывает рост энергии отклонения.", ("KoopmanOnlineAnalyzer.analyze_step", "gold_threat_proximity_view", "gold_route_hausdorff_view"), (11.3, 1.25)),
-    ProcessBlock("remap", "Защита и переназначение", "Анализ", "Подтверждённый прогноз запускает обход узла, резерв сервиса, карантин и строгое Gold → Silver → Bronze резервирование до 80%.", ("apply_koopman_to_arbitrator", "apply_gold_first_remap"), (13.6, 1.25)),
+    ProcessBlock("recommendations", "Рекомендации человеку", "Анализ", "Прогноз описывает признаки угрозы, окно и меры для проверки человеком; маршруты фиксированы.", ("apply_koopman_to_arbitrator",), (13.6, 1.25)),
     ProcessBlock("charts", "Графики и отчёты", "Представление", "Экспорт диаграмм, JSON, CSV и карт сети.", ("export_dynamics_charts", "draw_service_flow_map"), (13.6, 2.7)),
     ProcessBlock("window", "Интерактивные окна", "Представление", "Независимый просмотр сети и графической диагностики.", ("ServiceFlowWindow", "DebugFlowWindow"), (15.9, 3.0)),
 )
@@ -56,8 +56,8 @@ PROCESS_EDGES = (
     ("cli", "build"), ("build", "policy"), ("build", "topology"),
     ("policy", "validate"), ("topology", "clock"), ("validate", "clock"),
     ("clock", "tensor"), ("clock", "attacks"), ("attacks", "traffic"), ("tensor", "arb"),
-    ("traffic", "arb"), ("arb", "koopman"), ("attacks", "koopman"), ("koopman", "remap"),
-    ("remap", "traffic"), ("remap", "charts"), ("traffic", "charts"), ("arb", "charts"),
+    ("traffic", "arb"), ("arb", "koopman"), ("attacks", "koopman"), ("koopman", "recommendations"),
+    ("recommendations", "charts"), ("traffic", "charts"), ("arb", "charts"),
     ("charts", "window"),
 )
 
@@ -294,7 +294,9 @@ def _draw_process_graph(ax) -> tuple[dict[str, tuple[float, float]], dict[str, s
             f"{block.title}\nЭтап: {block.stage}\n\n{block.description}\n\n"
             f"Ключевые функции:\n" + "\n".join(f"• {name}" for name in block.functions)
         )
-    ax.set_xlim(-1.0, 14.6)
+    # Граница следует за составом схемы: крайний блок окна не обрезается.
+    ax.set_xlim(min(x for x, _ in positions.values()) - 1.0,
+                max(x for x, _ in positions.values()) + 1.0)
     ax.set_ylim(0.55, 5.0)
     legend = "   ".join(f"● {stage}" for stage in STAGE_COLORS)
     ax.text(0.5, 0.02, legend, transform=ax.transAxes, ha="center", color="#cbd5e1", fontsize=8.5)

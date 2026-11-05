@@ -474,6 +474,7 @@ def _mm1k_stationary_metrics(
         p0 = 1.0 / (capacity + 1.0)
         blocking = p0
         mean_system = capacity / 2.0
+        busy_probability = capacity / (capacity + 1.0)
     else:
         # Считаем распределение с конца при перегрузке: rho**K может
         # переполнить число даже у очереди на 128 пакетов.
@@ -484,14 +485,15 @@ def _mm1k_stationary_metrics(
         probabilities = weights / weights.sum()
         p0, blocking = float(probabilities[0]), float(probabilities[-1])
         mean_system = float(probabilities @ indices)
-    busy_probability = 1.0 - p0
+        # Сумма не теряет малую занятость при p0, округлённом до 1.
+        busy_probability = float(probabilities[1:].sum())
     # При сильной перегрузке p_K округляется до 1. Считаем обслуженный
     # поток через занятость канала, иначе вычитание даёт ложный ноль.
     effective_arrival = service_rate * busy_probability if rho >= 1.0 else arrival_rate * (1.0 - blocking)
     mean_queue = max(0.0, mean_system - busy_probability)
     mean_system_time_ms = (
         0.0
-        if effective_arrival <= 1e-15
+        if effective_arrival == 0.0
         else 1000.0 * mean_system / effective_arrival
     )
     return (

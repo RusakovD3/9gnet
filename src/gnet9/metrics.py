@@ -441,7 +441,7 @@ def vertex_proximity_index(graph: nx.Graph, nodes: Iterable[str]) -> dict[str, f
 def hausdorff_distance(points_a: Iterable[tuple[float, float]], points_b: Iterable[tuple[float, float]]) -> float:
     """Return extended symmetric Hausdorff distance for two 2D point sets.
 
-    In this project it is used as an interpretable remapping signal: how far the
+    In this project it is a diagnostic distance: how far the
     affected/changed topology area is from the protected reference area.
     Two empty sets have distance zero; exactly one empty set has infinite
     distance because no finite matching point exists.

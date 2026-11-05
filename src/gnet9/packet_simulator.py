@@ -18,7 +18,6 @@ from .models import NetworkModel, StateTensor
 from .normal_traffic import poisson_arrivals
 from .runtime_metrics import network_runtime_metrics
 from .metrics import gold_route_hausdorff_view
-from .remapping import apply_gold_first_remap
 from .routing import shortest_data_path
 
 
@@ -133,7 +132,6 @@ def simulate_packet_snapshot(
     packet_sample_limit: int = 48,
     attack_events: list[dict[str, Any]] | None = None,
     attack_precursors: list[dict[str, Any]] | None = None,
-    defense_plan: dict[str, Any] | None = None,
     attack_scenario: str | None = None,
     power_runtime_state: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -158,54 +156,15 @@ def simulate_packet_snapshot(
         flow = _build_flow(model, identities, subscriber_id, attrs, flow_index, step_index, time_seconds, step_seconds)
         flows.append(flow)
 
-    # Один набор текущих flood-потоков используется и при допуске маршрутов,
-    # и при расчёте очередей: остаточная нагрузка не исчезает из ограничения 80%.
-    current_attack_flows = build_current_attack_flows(attack_events or [], defense_plan, identities)
-    # Реальный data-plane overlay применяется до моделирования ущерба. Поэтому
-    # успешно переназначенный поток больше не считается проходящим через цель.
-    flows, routing_summary = apply_gold_first_remap(
-        model,
-        flows,
-        attack_events or [],
-        defense_plan,
-        step_index=step_index,
-        identities=identities,
-        background_flows=current_attack_flows,
-    )
-    routing_summary["by_sla"] = {
-        str(item["sla_grade"]): item for item in routing_summary.get("tiers", [])
-    }
-    routing_summary["service_failover_flow_count"] = int(routing_summary.get("failover_flow_count", 0))
-    maximum_network_utilization = max(
-        float(routing_summary.get("maximum_projected_edge_utilization_percent", 0.0)),
-        float(routing_summary.get("maximum_projected_node_utilization_percent", 0.0)),
-    )
-    # ``apply_gold_first_remap`` already includes projected server CPU, RAM and
-    # sessions in the aggregate maximum.  Keep that value: replacing it with
-    # the network-only maximum would hide a binding server admission resource
-    # from the arbitrator state vector and from exported diagnostics.
-    routing_summary["maximum_projected_network_utilization_percent"] = (
-        maximum_network_utilization
-    )
-    routing_summary["maximum_projected_utilization_percent"] = max(
-        float(routing_summary.get("maximum_projected_utilization_percent", 0.0)),
-        maximum_network_utilization,
-        float(
-            routing_summary.get(
-                "maximum_projected_server_resource_utilization_percent",
-                0.0,
-            )
-        ),
-    )
-    routing_summary["route_change_ratio"] = float(routing_summary.get("rerouted_flow_count", 0)) / max(len(flows), 1)
-    routing_summary["gold_route_hausdorff"] = gold_route_hausdorff_view(model, flows)
+    # Все шаги используют исходные пути; прогноз не влияет на трафик.
+    current_attack_flows = build_current_attack_flows(attack_events or [], identities=identities)
+    route_observation = gold_route_hausdorff_view(model, flows)
 
     flows, attack_state = apply_attack_effects(
         model,
         flows,
         attack_events or [],
         precursor_events=attack_precursors or [],
-        defense_plan=defense_plan,
         identities=identities,
         scenario=attack_scenario,
         power_runtime_state=power_runtime_state,
@@ -216,7 +175,7 @@ def simulate_packet_snapshot(
         for event in (attack_events or [])
     ):
         attack_state["scenario"] = "predictive-demo"
-    attack_state["routing"] = routing_summary
+    attack_state["route_observation"] = route_observation
     result: dict[str, Any] = {
         "summary": _traffic_summary(flows, model),
         "network_state": network_runtime_metrics(model, flows, attack_events or [], detail=detail),
@@ -617,7 +576,7 @@ def _build_packet_sample(
     model: NetworkModel,
     limit: int,
 ) -> list[dict[str, Any]]:
-    """Снять репрезентативные пакеты после применения атак и защиты."""
+    """Снять репрезентативные пакеты после расчёта текущего воздействия атак."""
     if limit <= 0:
         return []
     attacks = sorted(
@@ -692,7 +651,8 @@ def _attack_packet_samples(
     if not route or limit <= 0:
         return []
     protocol = str(flow["transport"])
-    is_syn = protocol == "TCP"
+    is_syn = flow.get("traffic_kind") == "syn_flood"
+    is_udp = protocol == "UDP"
     attack_payload_bytes = 0 if is_syn else int(
         flow.get("attack_payload_bytes_per_packet", 0)
     )
@@ -700,7 +660,9 @@ def _attack_packet_samples(
         model,
         identities,
         flow=flow,
-        packet_role="attack_syn" if is_syn else "attack_udp_flood",
+        packet_role=("attack_syn" if is_syn else "attack_dns_query"
+                     if flow.get("traffic_kind") == "dns_flood" else "attack_application_request"
+                     if protocol == "TCP" else "attack_udp_flood"),
         route=route,
         src_node=route[0],
         dst_node=route[-1],
@@ -710,11 +672,11 @@ def _attack_packet_samples(
         payload_bytes=attack_payload_bytes,
         udp_length_bytes=(
             UDP_HEADER_BYTES + attack_payload_bytes
-            if not is_syn
+            if is_udp
             else None
         ),
         sequence_number=int(flow.get("sequence_base", 0)),
-        tcp_flags="S" if is_syn else None,
+        tcp_flags="S" if is_syn else "PA" if protocol == "TCP" else None,
         src_ip_override=(
             str(flow.get("client_ip"))
             if flow.get("external_reflector_traffic")

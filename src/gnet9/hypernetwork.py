@@ -10,7 +10,7 @@ EMBEDDING_LEVEL_PAIRS = (
     ("L3", "L4"), ("L3", "L8"), ("L4", "L8"),
     ("L5", "L2"), ("L5", "L3"), ("L6", "L4"),
 )
-CONTROLLED_LEVELS = ("L1", "L2", "L3", "L5", "L6")
+DIAGNOSTIC_LEVELS = ("L1", "L2", "L3", "L5", "L6")
 
 
 def hypernetwork_embedding(model) -> dict:
@@ -70,13 +70,13 @@ def hypernetwork_embedding(model) -> dict:
         services = [(service.service_id, "L0") for service in model.services
                     if (service.service_id, "L0") in coordinates]
         add("sla_observation", services + arbitrators, (("L0", "L7"),))
-        for level in CONTROLLED_LEVELS:
+        for level in DIAGNOSTIC_LEVELS:
             targets = sorted(member for member in coordinates if member[1] == level)
-            add("control", arbitrators + targets, (("L7", level),))
+            add("diagnostic_dependency", arbitrators + targets, (("L7", level),))
     return {"representation": "named_incidence_hypergraph", "relations": relations,
             "relation_count": len(relations),
             "member_semantics": ["existing_entity_id", "level"],
             "dependency_semantics": "source_level_to_target_level",
             "embedding_level_pairs": [list(pair) for pair in EMBEDDING_LEVEL_PAIRS],
             "sla_observation_level_pairs": [["L0", "L7"]],
-            "control_level_pairs": [["L7", level] for level in CONTROLLED_LEVELS]}
+            "diagnostic_level_pairs": [["L7", level] for level in DIAGNOSTIC_LEVELS]}

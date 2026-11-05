@@ -38,6 +38,8 @@ class AttackKind(str, Enum):
     DOS = "dos"
     DDOS = "ddos"
     SYN_FLOOD = "syn_flood"
+    DNS_FLOOD = "dns_flood"
+    APPLICATION_FLOOD = "application_flood"
     BRUTE_FORCE = "brute_force"
     POWER_ATTACK = "power_attack"
 
@@ -75,6 +77,8 @@ class AttackTechnicalCharacteristics:
     authentication_failure_ratio: float = 0.0
     authentication_attempt_rate_origin: str = "not_applicable"
     authentication_attempt_rate_reference_url: str | None = None
+    request_rate_per_second: float = 0.0
+    request_cpu_cost_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -200,6 +204,20 @@ class MitreTensorMapping:
 
 MITRE_TENSOR_MAPPINGS = (
     MitreTensorMapping(
+        "T1499.002", "Service Exhaustion Flood", AttackKind.DNS_FLOOD,
+        ("L0", "L1", "EDGE", "L7"),
+        ("L1.sla_margin", "EDGE.loss_probability"),
+        ("dns_query_pressure_ratio", "maximum_target_utilization_percent"),
+        ("M1037",), ("review_dns_request_limits", "confirm_request_sources"),
+    ),
+    MitreTensorMapping(
+        "T1499.003", "Application Exhaustion Flood", AttackKind.APPLICATION_FLOOD,
+        ("L0", "L1", "EDGE", "L7"),
+        ("L1.sla_margin", "EDGE.loss_probability"),
+        ("application_work_pressure_ratio", "maximum_target_utilization_percent"),
+        ("M1037",), ("review_expensive_request_limits", "confirm_request_sources"),
+    ),
+    MitreTensorMapping(
         "T1498.001", "Direct Network Flood", AttackKind.DOS,
         ("L1", "L2", "EDGE", "L7"),
         ("L1.sla_margin", "L2.cpu_load_percent", "EDGE.utilization", "EDGE.loss_probability"),
@@ -250,7 +268,7 @@ def mitre_tensor_mapping_catalog() -> list[dict[str, Any]]:
     return [item.to_dict() for item in MITRE_TENSOR_MAPPINGS]
 
 
-# Расписание рассчитано на стандартные 10 переходов по 5 секунд.
+# Прежние события занимают шаги 2–10; дополнительные службы ниже — 11–16.
 MITRE_DEMO_ATTACKS = (
     AttackProfile(
         "DOS_CORE_C1", "DoS на маршрутизатор ядра C1", AttackKind.DOS,
@@ -355,6 +373,41 @@ MITRE_DEMO_ATTACKS = (
 )
 
 
+# Два дополнительных сценария используют существующие серверы и услуги.
+# Один запрос представлен одним пакетом; ответы и установка TCP/TLS здесь
+# не генерируются. Числа — допущения стенда, а не скорости из MITRE.
+SERVICE_REQUEST_ATTACKS = (
+    AttackProfile(
+        "DNS_DATA_SERVER", "Перегрузка DNS-службы запросами", AttackKind.DNS_FLOOD,
+        "T1499.002", "Service Exhaustion Flood", (), "SRV_DATA", "service-server", ("F3_40",),
+        AttackTemporalCharacteristics(11, 2, 1, "request-ramp-then-peak"),
+        AttackTechnicalCharacteristics(
+            "DNS/UDP", 128, 12.416, 8_000, 1, 1.0, 0.0,
+            on_wire_size_bytes=194, resource_axis="dns_service_request_processing",
+            request_rate_per_second=8_000.0, request_cpu_cost_ms=1.0,
+        ),
+        90.0, 0.08, 1.0,
+        "Прямые DNS-запросы расходуют ресурс службы SRV_DATA без отражения и усиления. "
+        "Прикладное ухудшение затрагивает DNS; файловые потоки не получают штраф DNS-службы.",
+    ),
+    AttackProfile(
+        "APPLICATION_MEDIA_SERVER", "Тяжёлые запросы к медиасерверу", AttackKind.APPLICATION_FLOOD,
+        "T1499.003", "Application Exhaustion Flood", (), "SRV_MEDIA", "service-server", ("M3_40",),
+        AttackTemporalCharacteristics(14, 3, 1, "request-ramp-then-peak"),
+        AttackTechnicalCharacteristics(
+            "HTTPS application requests", 320, 0.9552, 300, 1, 1.0, 0.0,
+            packet_size_semantics="application_payload_bytes_in_one_modeled_request_packet",
+            on_wire_size_bytes=398, resource_axis="expensive_media_request_cpu_work",
+            request_rate_per_second=300.0, request_cpu_cost_ms=20.0,
+        ),
+        180.0, 0.12, 1.0,
+        "Повторные тяжёлые запросы обработки медиа расходуют общий вычислительный ресурс SRV_MEDIA. "
+        "Малый входящий поток ухудшает размещённые на нём услуги без насыщения канала.",
+    ),
+)
+MITRE_DEMO_ATTACKS += SERVICE_REQUEST_ATTACKS
+MITRE_DEMO_STEP_COUNT = 16
+
 # Новый демонстрационный профиль рассчитан на 160 переходов по 2 секунды.
 # Девять — это верхняя граница числа атак в одном прогоне, а не гарантия:
 # renewal-процесс Вейбулла прекращается на правой границе окна. Квоты ниже
@@ -389,8 +442,10 @@ PREDICTIVE_DEMO_WEIBULL_SHAPE = 1.5
 PREDICTIVE_BRUTE_FORCE_WEIBULL_SHAPE = 0.7
 PREDICTIVE_DEMO_KIND_COUNTS = {
     AttackKind.DOS: 3,
-    AttackKind.DDOS: 2,
-    AttackKind.SYN_FLOOD: 2,
+    AttackKind.DDOS: 1,
+    AttackKind.SYN_FLOOD: 1,
+    AttackKind.DNS_FLOOD: 1,
+    AttackKind.APPLICATION_FLOOD: 1,
     AttackKind.POWER_ATTACK: 1,
     AttackKind.BRUTE_FORCE: 1,
 }
@@ -410,31 +465,8 @@ TRAFFIC_SERVICE_NODES = {
 }
 
 
-# Эффективность — явное допущение симулятора, а не норматив MITRE ATT&CK.
-# Значение показывает долю воздействия, которую подготовленная за предыдущий
-# шаг защита способна отсечь. Для легитимных потоков коэффициент дополнительно
-# умножается на приоритет SLA: Gold восстанавливается раньше Silver и Bronze.
-PREVENTIVE_DEFENSE_EFFECTIVENESS = {
-    AttackKind.DOS.value: 0.70,
-    AttackKind.DDOS.value: 0.78,
-    AttackKind.SYN_FLOOD.value: 0.84,
-    AttackKind.BRUTE_FORCE.value: 0.95,
-    AttackKind.POWER_ATTACK.value: 0.68,
-}
-SLA_PROTECTION_FACTOR = {"gold": 1.0, "silver": 0.72, "bronze": 0.45}
+# Порядок отчёта по классам услуг.
 SLA_RESTORATION_PRIORITY = {"gold": 1, "silver": 2, "bronze": 3}
-# Независимая от силы атаки ёмкость контура восстановления легитимных пакетов.
-# Это лабораторный профиль PPS для ACL/policer/SYN-proxy/резервного питания,
-# а не паспортная производительность конкретного ASIC.
-DEFENSE_RECOVERY_CAPACITY_PPS = {
-    "core-router": 1_200,
-    "aggregation-switch": 1_000,
-    "radio-access-node": 850,
-    "optical-line-terminal": 900,
-    "service-server": 800,
-    "mobile-subscriber": 250,
-    "fixed-subscriber": 250,
-}
 
 # Не паспортные значения Cisco/Dell, а калибруемые пороги стенда для трафика,
 # адресованного самой цели (control plane, приложение, SYN backlog). Линейная
@@ -468,6 +500,13 @@ TARGET_SYN_STATE_BUDGET_PPS = {
     "service-server": 75_000,
     "mobile-subscriber": 10_000,
     "fixed-subscriber": 20_000,
+}
+
+# Доступное процессорное время в мс за секунду: пять и четыре условных
+# рабочих обработчика. Не паспортные характеристики серверов.
+TARGET_REQUEST_CPU_BUDGET_MS_PER_SECOND = {
+    AttackKind.DNS_FLOOD: 5_000.0,
+    AttackKind.APPLICATION_FLOOD: 4_000.0,
 }
 
 # Stateful recovery is intentionally slower than the accelerated attack pulse.
@@ -761,10 +800,10 @@ def predictive_demo_weibull_schedule(
     )
 
 
-
 def _predictive_kind_sequence(seed: int) -> tuple[AttackKind, ...]:
     rng = random.Random(int(seed))
-    kinds = [AttackKind.DOS, AttackKind.DDOS, AttackKind.SYN_FLOOD, AttackKind.POWER_ATTACK]
+    kinds = [AttackKind.DOS, AttackKind.DDOS, AttackKind.SYN_FLOOD, AttackKind.POWER_ATTACK,
+             AttackKind.DNS_FLOOD, AttackKind.APPLICATION_FLOOD]
     rng.shuffle(kinds)
     kinds.append(AttackKind.BRUTE_FORCE)
     remaining = [kind for kind, count in PREDICTIVE_DEMO_KIND_COUNTS.items() for _ in range(count)]
@@ -859,6 +898,8 @@ def predictive_demo_attack_profiles(
             AttackKind.DOS: 1,
             AttackKind.DDOS: 8,
             AttackKind.SYN_FLOOD: 4,
+            AttackKind.DNS_FLOOD: 1,
+            AttackKind.APPLICATION_FLOOD: 1,
             AttackKind.POWER_ATTACK: 1,
             AttackKind.BRUTE_FORCE: 1,
         }[kind]
@@ -882,6 +923,8 @@ def predictive_demo_attack_profiles(
             AttackKind.DOS: 2,
             AttackKind.DDOS: 3,
             AttackKind.SYN_FLOOD: 2,
+            AttackKind.DNS_FLOOD: 2,
+            AttackKind.APPLICATION_FLOOD: 3,
             AttackKind.POWER_ATTACK: 2,
             AttackKind.BRUTE_FORCE: 6,
         }[kind]
@@ -890,6 +933,8 @@ def predictive_demo_attack_profiles(
             AttackKind.DOS: (46.0, 0.075, 0.70),
             AttackKind.DDOS: (210.0, 0.25, 0.95),
             AttackKind.SYN_FLOOD: (360.0, 0.34, 0.90),
+            AttackKind.DNS_FLOOD: (90.0, 0.08, 1.0),
+            AttackKind.APPLICATION_FLOOD: (180.0, 0.12, 1.0),
             AttackKind.BRUTE_FORCE: (0.0, 0.0, 0.06),
             AttackKind.POWER_ATTACK: (
                 (125.0, 0.20, 1.0)
@@ -911,6 +956,8 @@ def predictive_demo_attack_profiles(
                     AttackKind.DOS: "T1498.001",
                     AttackKind.DDOS: "T1498.002",
                     AttackKind.SYN_FLOOD: "T1499.001",
+                    AttackKind.DNS_FLOOD: "T1499.002",
+                    AttackKind.APPLICATION_FLOOD: "T1499.003",
                     AttackKind.BRUTE_FORCE: "T1110.001",
                     AttackKind.POWER_ATTACK: (
                         "T1529" if power_failure_mode == "cyber_shutdown" else "T0831"
@@ -920,6 +967,8 @@ def predictive_demo_attack_profiles(
                     AttackKind.DOS: "Direct Network Flood",
                     AttackKind.DDOS: "Reflection Amplification",
                     AttackKind.SYN_FLOOD: "OS Exhaustion Flood",
+                    AttackKind.DNS_FLOOD: "Service Exhaustion Flood",
+                    AttackKind.APPLICATION_FLOOD: "Application Exhaustion Flood",
                     AttackKind.BRUTE_FORCE: "Password Guessing",
                     AttackKind.POWER_ATTACK: (
                         "System Shutdown/Reboot"
@@ -1086,6 +1135,13 @@ def _target_pool_for_kind(
         category = ("subscribers", "servers")[occurrence_index % 2]
     elif kind == AttackKind.BRUTE_FORCE:
         category = "subscribers"
+    elif kind in TARGET_REQUEST_CPU_BUDGET_MS_PER_SECOND:
+        # Служба должна существовать на выбранном сервере; произвольный
+        # запасной сервер не получает выдуманную DNS- или медиа-службу.
+        target = "SRV_DATA" if kind == AttackKind.DNS_FLOOD else "SRV_MEDIA"
+        if target not in pools["servers"]:
+            raise ValueError(f"В модели нет сервера {target} для {kind.value}")
+        return (target,)
     else:
         # При чётном seed демонстрируется питание сетевого узла, при нечётном
         # — сервера. Так обе допустимые области достижимы без изменения весов.
@@ -1166,6 +1222,8 @@ def _predictive_technical_profile(
     *,
     power_failure_mode: str | None = None,
 ) -> AttackTechnicalCharacteristics:
+    if kind in TARGET_REQUEST_CPU_BUDGET_MS_PER_SECOND:
+        return next(profile.technical for profile in SERVICE_REQUEST_ATTACKS if profile.kind == kind)
     if kind == AttackKind.BRUTE_FORCE:
         return next(profile.technical for profile in MITRE_DEMO_ATTACKS if profile.kind == AttackKind.BRUTE_FORCE)
     aggregate_access = sum(_subscriber_access_capacity_mbps(model, node) for node in ingress_nodes)
@@ -1253,6 +1311,9 @@ def _predictive_attack_text(
     *,
     power_failure_mode: str | None = None,
 ) -> tuple[str, str]:
+    if kind in TARGET_REQUEST_CPU_BUDGET_MS_PER_SECOND:
+        profile = next(profile for profile in SERVICE_REQUEST_ATTACKS if profile.kind == kind)
+        return f"{profile.name_ru}: {target_id}", profile.description_ru
     if kind == AttackKind.DOS:
         return (
             f"DoS от скомпрометированного абонента на {target_id}",
@@ -1387,8 +1448,7 @@ def mark_critical_nodes(model: NetworkModel) -> dict[str, Any]:
             "gold_service_flow_count": hosted,
             "gold_recovery_reserve_flow_count": reserve,
             "critical_involvement_coefficient": round(involvement, 6),
-            "maximum_safe_utilization_percent": 80.0 if is_critical else 90.0,
-            "policy": "do_not_accept_silver_or_bronze_remap_above_80_percent" if is_critical else "standard",
+            "policy": "review_gold_service_impact_first" if is_critical else "standard",
         }
         if is_critical:
             critical_nodes.append(node)
@@ -1470,6 +1530,12 @@ def _attack_capacity_context(
         processing_ratio = packet_rate / budget
         peak_pressure = min(1.0, max(bandwidth_ratio, processing_ratio))
         pressure_basis = "max(path_bandwidth_ratio,tcp_syn_state_rate_ratio)"
+    elif profile.kind in TARGET_REQUEST_CPU_BUDGET_MS_PER_SECOND:
+        processing_ratio = _request_work_ratio(profile)
+        # Прикладной ущерб определяется работой обработчиков. Конкуренция
+        # за полосу отдельно учитывается транспортной очередью.
+        peak_pressure = min(1.0, processing_ratio)
+        pressure_basis = "request_rate_per_second*request_cpu_cost_ms/cpu_budget_ms_per_second"
     elif profile.kind == AttackKind.DOS:
         budget = float(TARGET_SINGLE_SOURCE_DOS_BUDGET_PPS[target_type])
         processing_ratio = packet_rate / budget
@@ -1489,7 +1555,18 @@ def _attack_capacity_context(
         "target_resource_pressure": round(peak_pressure, 6),
         "target_resource_pressure_basis": pressure_basis,
         "target_resource_budget_origin": "gnet9_calibrated_scenario_assumption",
+        "request_cpu_budget_ms_per_second": TARGET_REQUEST_CPU_BUDGET_MS_PER_SECOND.get(profile.kind),
     }
+
+
+def _request_work_ratio(profile: AttackProfile) -> float:
+    """Доля бюджета: (запрос/с × мс/запрос) / (мс/с), без ограничения сверху.
+
+    Профили задают конечную неотрицательную частоту и стоимость, бюджет > 0.
+    Пример: 300 запрос/с × 20 мс / 4000 мс/с = 1,5.
+    """
+    return (profile.technical.request_rate_per_second * profile.technical.request_cpu_cost_ms
+            / TARGET_REQUEST_CPU_BUDGET_MS_PER_SECOND[profile.kind])
 
 
 def _reflection_route_context(
@@ -1651,6 +1728,11 @@ def active_attack_events(
                 * resolved_step_seconds
                 * float(profile.technical.authentication_failure_ratio),
                 6,
+            )
+        if profile.kind in TARGET_REQUEST_CPU_BUDGET_MS_PER_SECOND:
+            event["effective_request_rate_per_second"] = profile.technical.request_rate_per_second * intensity
+            event["effective_request_cpu_work_ms_per_second"] = (
+                event["effective_request_rate_per_second"] * profile.technical.request_cpu_cost_ms
             )
         if profile.kind == AttackKind.DDOS:
             event["effective_request_rate_mbps"] = round(
@@ -2066,21 +2148,10 @@ def observe_attack_precursors(
 
 def build_current_attack_flows(
     events: list[dict[str, Any]],
-    defense_plan: dict[str, Any] | None = None,
     identities: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Текущая остаточная нагрузка после защиты, общая для допуска и очередей.
-
-    Здесь только уже наблюдаемые события текущего шага. Ни расписание будущих
-    событий, ни новое решение защиты следующего шага не используются.
-    """
-    result = []
-    for event in events:
-        mitigation = _event_defense_mitigation(defense_plan, event)
-        result.extend(_build_attack_flows(event, mitigation_ratio=mitigation,
-            quarantined_sources=_active_quarantined_sources(
-                defense_plan, event, mitigation_ratio=mitigation), identities=identities))
-    return result
+    """Текущая нагрузка атак без управляющего воздействия прогноза."""
+    return [flow for event in events for flow in _build_attack_flows(event, identities=identities)]
 
 
 def apply_attack_effects(
@@ -2089,7 +2160,6 @@ def apply_attack_effects(
     events: list[dict[str, Any]],
     *,
     precursor_events: list[dict[str, Any]] | None = None,
-    defense_plan: dict[str, Any] | None = None,
     identities: Mapping[str, Any] | None = None,
     scenario: str | None = None,
     power_runtime_state: Mapping[str, Mapping[str, Any]] | None = None,
@@ -2108,24 +2178,6 @@ def apply_attack_effects(
         flow["preventive_mitigation_ratio"] = 0.0
         flow["attack_latency_penalty_ms"] = 0.0
 
-    event_mitigation = {
-        event["attack_id"]: _event_defense_mitigation(defense_plan, event)
-        for event in events
-    }
-    source_delivery_fraction = {}
-    for event in events:
-        sources = set(event.get("ingress_nodes", []))
-        quarantined = _active_quarantined_sources(
-            defense_plan, event, mitigation_ratio=event_mitigation[event["attack_id"]],
-        )
-        direct = event["kind"] in {AttackKind.DOS.value, AttackKind.SYN_FLOOD.value}
-        source_delivery_fraction[event["attack_id"]] = len(sources - quarantined) / len(sources) if direct and sources else 1.0
-    flow_mitigation, allocation_reports = _allocate_sla_defense_budget(
-        flows,
-        events,
-        event_mitigation,
-    )
-
     for flow in flows:
         for event in events:
             if not _flow_is_affected(flow, event):
@@ -2143,11 +2195,7 @@ def apply_attack_effects(
                 0.95,
                 float(event["legitimate_loss_ratio"]) * intensity * resource_pressure,
             )
-            mitigation = flow_mitigation.get((event["attack_id"], str(flow["flow_id"])), 0.0)
-            admitted_fraction = source_delivery_fraction[event["attack_id"]]
-            filtering_mitigation = mitigation
-            mitigation = 1.0 - (1.0 - mitigation) * admitted_fraction
-            loss_ratio = raw_loss_ratio * (1.0 - mitigation)
+            loss_ratio = raw_loss_ratio
             raw_dropped = min(int(flow["packet_count"]), math.ceil(int(flow["packet_count"]) * raw_loss_ratio))
             raw_already_dropped = int(flow.get("raw_attack_dropped_packets", 0))
             raw_increment = min(
@@ -2161,16 +2209,12 @@ def apply_attack_effects(
             )
             flow["observed_dropped_packets"] = already_dropped + dropped
             flow["raw_attack_dropped_packets"] = raw_already_dropped + raw_increment
-            flow["prevented_dropped_packets"] += max(0, raw_increment - dropped)
-            flow["preventive_mitigation_ratio"] = max(float(flow["preventive_mitigation_ratio"]), mitigation)
             if flow.get("transport") == "TCP":
                 flow["observed_retransmissions"] = int(flow.get("observed_retransmissions", 0)) + dropped
             latency_penalty_ms = (
                 float(event["latency_penalty_ms"])
                 * intensity
                 * resource_pressure
-                * (1.0 - filtering_mitigation * 0.85)
-                * admitted_fraction
             )
             flow["attack_latency_penalty_ms"] = round(
                 float(flow.get("attack_latency_penalty_ms", 0.0))
@@ -2191,26 +2235,13 @@ def apply_attack_effects(
             flow["attack_impacted"] = True
 
     attack_flows = (prepared_attack_flows if prepared_attack_flows is not None
-                    else build_current_attack_flows(events, defense_plan, identities))
+                    else build_current_attack_flows(events, identities=identities))
     apply_transport_queues(model, flows, attack_flows)
     all_flows = flows + attack_flows
     for flow in flows:
         flow["slo_evaluation"] = _evaluate_flow_slo(model, flow)
-    # Нормальный прикладной поток с уже атрибутированного атакующего узла
-    # физически блокируется и остаётся видимым в flows, но не должен ухудшать
-    # SLA добросовестных абонентов. Иначе успешный карантин ошибочно выглядел
-    # бы как отказ сети. Исключение применяется только к явному действию
-    # quarantine_attack_source, а не к обычной потере маршрута.
-    sla_accounted_flows = [
-        flow
-        for flow in flows
-        if not flow.get("security_excluded_from_sla_accounting")
-    ]
-    security_excluded_flows = [
-        flow
-        for flow in flows
-        if flow.get("security_excluded_from_sla_accounting")
-    ]
+    sla_accounted_flows = flows
+    security_excluded_flows = []
     legitimate_packets = sum(int(flow["packet_count"]) for flow in sla_accounted_flows)
     legitimate_dropped = sum(
         int(flow["observed_dropped_packets"]) for flow in sla_accounted_flows
@@ -2234,9 +2265,8 @@ def apply_attack_effects(
     raw_attack_induced_dropped = (
         observed_attack_induced_dropped + prevented_attack_induced_dropped
     )
-    # Counterfactual total under the same routing/isolation state, but without
-    # preventive filtering of attack-induced loss.  This definition preserves
-    # raw = observed + prevented even when a route is isolated independently.
+    # Счётчики прежней схемы сохранены: без управления предотвращённых
+    # потерь нет, исходное и наблюдаемое число совпадают.
     raw_legitimate_dropped = non_attack_dropped + raw_attack_induced_dropped
     impacted = [flow for flow in sla_accounted_flows if flow.get("attack_impacted")]
     impacted_gold = [flow for flow in impacted if flow.get("sla_grade") == "gold"]
@@ -2257,25 +2287,21 @@ def apply_attack_effects(
         (float(event["target_resource_pressure"]) * float(event["intensity_ratio"]) for event in events),
         default=0.0,
     )
-    max_pressure = max(
-        (
-            float(event["target_resource_pressure"])
-            * float(event["intensity_ratio"])
-            * (1.0 - event_mitigation[event["attack_id"]])
-            for event in events
-        ),
-        default=0.0,
-    )
-    target_observations = [
-        _target_observation(model, event, mitigation_ratio=event_mitigation[event["attack_id"]])
-        for event in events
-    ]
+    max_pressure = raw_max_pressure
+    target_observations = [_target_observation(model, event) for event in events]
     authentication_observations = [
         observation
         for event, observation in zip(events, target_observations, strict=True)
         if event.get("kind") == AttackKind.BRUTE_FORCE.value
     ]
     precursor_summary = _precursor_summary(precursor_events)
+    for kind, signal in ((AttackKind.DNS_FLOOD, "dns_query_pressure_ratio"),
+                         (AttackKind.APPLICATION_FLOOD, "application_work_pressure_ratio")):
+        precursor_summary[signal] = max(
+            float(precursor_summary[signal]),
+            max((float(event["target_resource_pressure"]) * float(event["intensity_ratio"])
+                 for event in events if event["kind"] == kind.value), default=0.0),
+        )
     active_power = [
         (event, observation)
         for event, observation in zip(events, target_observations, strict=True)
@@ -2323,12 +2349,6 @@ def apply_attack_effects(
     ]
     intrusion_events = [event for event in events if not event.get("is_recovery_effect")]
     recovery_events = [event for event in events if event.get("is_recovery_effect")]
-    defense_summary = _preventive_defense_summary(
-        events,
-        defense_plan,
-        event_mitigation,
-        allocation_reports,
-    )
     return all_flows, {
         "scenario": scenario or ("mitre-demo" if events or precursor_events else "none"),
         "active": bool(events),
@@ -2342,7 +2362,6 @@ def apply_attack_effects(
         "precursor_count": len(precursor_events),
         "precursors": precursor_events,
         **precursor_summary,
-        "preventive_defense": defense_summary,
         "sla_restoration": _sla_restoration_summary(model, flows),
         "raw_attack_packet_count": raw_attack_packets,
         "attack_packet_count": attack_packets,
@@ -2456,6 +2475,8 @@ def _flow_is_affected(flow: dict[str, Any], event: dict[str, Any]) -> bool:
         # T1110.001 remains an authentication-log scenario.  It is not a
         # traffic generator and must never manufacture a data-plane loss.
         return False
+    if event.get("kind") == AttackKind.DNS_FLOOD.value:
+        return flow.get("server_node") == event["target_id"] and flow.get("traffic_kind") == "dns"
     target = event["target_id"]
     return target in flow.get("route", []) or target in {
         flow.get("client_node"), flow.get("server_node"), flow.get("service_node")
@@ -2948,12 +2969,10 @@ def _evaluate_flow_slo(model: NetworkModel, flow: dict[str, Any]) -> dict[str, A
 def _target_observation(
     model: NetworkModel,
     event: dict[str, Any],
-    *,
-    mitigation_ratio: float = 0.0,
 ) -> dict[str, Any]:
     attrs = model.graph.nodes[event["target_id"]]
     raw_pressure = float(event["target_resource_pressure"]) * float(event["intensity_ratio"])
-    pressure = raw_pressure * (1.0 - mitigation_ratio)
+    pressure = raw_pressure
     if attrs.get("role") == "service-server":
         baseline_cpu = float(attrs.get("runtime", {}).get("cpu_util_percent", 0.0))
     elif attrs.get("level") == "L2":
@@ -2965,7 +2984,7 @@ def _target_observation(
         100.0,
         float(event["effective_offered_rate_mbps"]) / ingress_capacity * 100.0,
     )
-    network_utilization = raw_network_utilization * (1.0 - mitigation_ratio)
+    network_utilization = raw_network_utilization
     power_reserve = _power_reserve_ratio(attrs)
     power_attack = event["kind"] == AttackKind.POWER_ATTACK.value
     brute_force = event["kind"] == AttackKind.BRUTE_FORCE.value
@@ -3012,7 +3031,6 @@ def _target_observation(
         estimated_queue_utilization = min(100.0, pressure * 100.0)
     authentication_attempt_rate = (
         float(event.get("effective_authentication_attempt_rate_per_second", 0.0))
-        * (1.0 - mitigation_ratio)
         if brute_force
         else 0.0
     )
@@ -3030,7 +3048,7 @@ def _target_observation(
         "target_id": event["target_id"],
         "target_type": event["target_type"],
         "raw_resource_pressure": round(raw_pressure, 6),
-        "preventive_mitigation_ratio": round(mitigation_ratio, 6),
+        "preventive_mitigation_ratio": 0.0,
         "estimated_resource_utilization_percent": round(estimated_resource_utilization, 4),
         "raw_network_utilization_percent": round(raw_network_utilization, 4),
         "estimated_network_utilization_percent": round(network_utilization, 4),
@@ -3092,8 +3110,6 @@ def _target_observation(
 def _build_attack_flows(
     event: dict[str, Any],
     *,
-    mitigation_ratio: float = 0.0,
-    quarantined_sources: set[str] | None = None,
     identities: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     if event["kind"] in {AttackKind.POWER_ATTACK.value, AttackKind.BRUTE_FORCE.value}:
@@ -3106,17 +3122,15 @@ def _build_attack_flows(
         "dos": "ATTACK_DOS",
         "ddos": "ATTACK_DDOS",
         "syn_flood": "ATTACK_SYN",
+        "dns_flood": "ATTACK_DNS",
+        "application_flood": "ATTACK_APPLICATION",
         "power_attack": "ATTACK_POWER",
     }[event["kind"]]
-    transport = "TCP" if event["kind"] == "syn_flood" else "UDP"
+    transport = "TCP" if event["kind"] in {"syn_flood", "application_flood"} else "UDP"
     raw_total_packets = int(event["effective_packet_rate_pps"] * event["interval_seconds"])
     raw_total_wire = int(event["effective_offered_rate_mbps"] * 1_000_000.0 / 8.0 * event["interval_seconds"])
-    total_packets = int(round(raw_total_packets * (1.0 - mitigation_ratio)))
-    total_wire = int(round(raw_total_wire * (1.0 - mitigation_ratio)))
-    quarantined_sources = quarantined_sources or set()
-    quarantined_initiators = sorted(
-        quarantined_sources & {str(node) for node in event.get("ingress_nodes", [])}
-    )
+    total_packets = raw_total_packets
+    total_wire = raw_total_wire
     flows: list[dict[str, Any]] = []
     for index, route in enumerate(routes):
         source_node = str(route[0]) if route else "unknown"
@@ -3136,23 +3150,16 @@ def _build_attack_flows(
             if isinstance(target_identity, Mapping)
             else getattr(target_identity, "ip", None)
         )
-        # У reflected DDoS источник внутри наблюдаемого графа — border ingress,
-        # а не L1-инициатор. Его карантин останавливает новые spoofed-запросы,
-        # но не обнуляет уже входящие ответы внешних reflectors.
-        quarantined = source_node in quarantined_sources and not is_reflection
         packet_count = total_packets // len(routes) + (1 if index < total_packets % len(routes) else 0)
         wire_bytes = total_wire // len(routes) + (1 if index < total_wire % len(routes) else 0)
         raw_packet_count = raw_total_packets // len(routes) + (1 if index < raw_total_packets % len(routes) else 0)
         raw_wire_bytes = raw_total_wire // len(routes) + (1 if index < raw_total_wire % len(routes) else 0)
-        if quarantined:
-            packet_count = 0
-            wire_bytes = 0
         pressure = float(event["target_resource_pressure"]) * float(event["intensity_ratio"])
         dropped = math.floor(packet_count * min(0.92, 0.20 + pressure * 0.65))
         technical = event["technical"]
         is_syn = event["kind"] == AttackKind.SYN_FLOOD.value
         payload_per_packet = 0 if is_syn else int(technical["packet_size_bytes"])
-        l3_packet_bytes = 40 if is_syn else payload_per_packet + 28
+        l3_packet_bytes = 40 if is_syn else payload_per_packet + (40 if transport == "TCP" else 28)
         flows.append({
             "flow_id": f"{event['attack_id']}-{event['step_index']}-{index + 1}",
             "step_index": event["step_index"], "time_seconds": event["time_seconds"],
@@ -3165,37 +3172,30 @@ def _build_attack_flows(
                 else source_ip or f"узел:{source_node}"
             ),
             "server_ip": target_ip or f"узел:{event['target_id']}",
-            "client_port": 0, "server_port": 0,
+            "client_port": 0,
+            "server_port": 53 if event["kind"] == "dns_flood" else 443 if event["kind"] == "application_flood" else 0,
             "packet_count": packet_count,
             "payload_bytes": packet_count * payload_per_packet,
             "wire_bytes": wire_bytes,
             "raw_packet_count": raw_packet_count, "raw_wire_bytes": raw_wire_bytes,
             "blocked_packet_count": max(0, raw_packet_count - packet_count),
             "blocked_wire_bytes": max(0, raw_wire_bytes - wire_bytes),
-            "preventive_mitigation_ratio": round(mitigation_ratio, 6),
+            "preventive_mitigation_ratio": 0.0,
             "mtu_bytes": 1_500,
             "attack_payload_bytes_per_packet": payload_per_packet,
             "attack_l3_packet_bytes": l3_packet_bytes,
             "on_wire_size_bytes": int(
                 technical.get("on_wire_size_bytes") or l3_packet_bytes
             ),
-            "route": [] if quarantined else route,
+            "route": route,
             "original_route": route,
-            "reverse_route": [] if quarantined else list(reversed(route)),
-            "hop_count": 0 if quarantined else max(0, len(route) - 1),
+            "reverse_route": list(reversed(route)),
+            "hop_count": max(0, len(route) - 1),
             "one_way_latency_ms": round(float(event["latency_penalty_ms"]) * 0.08, 4),
             "rtt_ms": None, "expected_loss_ratio": 0.0,
             "observed_dropped_packets": dropped, "observed_retransmissions": 0,
             "sla_grade": "attack", "traffic_kind": event["kind"], "sequence_base": 0,
             "is_attack_traffic": True, "attack_id": event["attack_id"],
-            "quarantined": quarantined,
-            "routing_action": (
-                "filter_amplified_response_at_transit_ingress"
-                if is_reflection
-                else "quarantine_attack_source"
-                if quarantined
-                else "attack_admitted_after_filtering"
-            ),
             "attack_traffic_leg": (
                 "amplified_external_reflector_response"
                 if is_reflection
@@ -3205,12 +3205,6 @@ def _build_attack_flows(
             "operator_ingress_node": source_node if is_reflection else None,
             "spoofed_request_initiator_ids": (
                 list(event.get("ingress_nodes", [])) if is_reflection else []
-            ),
-            "quarantined_request_initiator_ids": quarantined_initiators,
-            "quarantine_semantics": (
-                "blocks_new_trigger_requests_but_not_already_returning_reflector_responses"
-                if is_reflection
-                else "blocks_direct_source_route"
             ),
             "external_segment_modeled": bool(event.get("external_segment_modeled", True)),
             "external_source_address_semantics": (
@@ -3245,6 +3239,9 @@ def _precursor_signals(
     elif profile.kind == AttackKind.BRUTE_FORCE:
         confidence, acceleration, syn_growth, power_anomaly, concentration = (0.76, 0.0, 0.0, 0.0, 1.0)
         scan_rate = 0.0
+    elif profile.kind in TARGET_REQUEST_CPU_BUDGET_MS_PER_SECOND:
+        confidence, acceleration, syn_growth, power_anomaly, concentration = (0.82, 0.0, 0.0, 0.0, 0.97)
+        scan_rate = 0.0
     else:
         power_anomaly = 0.94 if profile.power_failure_mode == "cyber_shutdown" else 0.0
         confidence, acceleration, syn_growth, concentration = (0.90, 0.0, 0.0, 1.0)
@@ -3275,6 +3272,10 @@ def _precursor_signals(
     )
     return {
         "signal_confidence": round(confidence * (0.50 + 0.50 * ramp), 6),
+        "dns_query_pressure_ratio": round(min(1.0, _request_work_ratio(profile)) * visible_fraction, 6)
+        if profile.kind == AttackKind.DNS_FLOOD else 0.0,
+        "application_work_pressure_ratio": round(min(1.0, _request_work_ratio(profile)) * visible_fraction, 6)
+        if profile.kind == AttackKind.APPLICATION_FLOOD else 0.0,
         "suspicious_source_count": max(1, round(source_count * visible_fraction)),
         "source_entropy_ratio": round(source_entropy * visible_fraction, 6),
         "scan_rate_pps": round(scan_rate * visible_fraction, 3),
@@ -3294,6 +3295,8 @@ def _precursor_signals(
 def _precursor_summary(precursors: list[dict[str, Any]]) -> dict[str, Any]:
     signals = [item.get("signals", {}) for item in precursors]
     return {
+        "dns_query_pressure_ratio": max((float(item.get("dns_query_pressure_ratio", 0.0)) for item in signals), default=0.0),
+        "application_work_pressure_ratio": max((float(item.get("application_work_pressure_ratio", 0.0)) for item in signals), default=0.0),
         "precursor_confidence": max((float(item.get("signal_confidence", 0.0)) for item in precursors), default=0.0),
         "suspicious_source_count": sum(int(item.get("suspicious_source_count", 0)) for item in signals),
         "source_entropy_ratio": max((float(item.get("source_entropy_ratio", 0.0)) for item in signals), default=0.0),
@@ -3313,205 +3316,6 @@ def _precursor_summary(precursors: list[dict[str, Any]]) -> dict[str, Any]:
             (float(item.get("account_lockout_pressure", 0.0)) for item in signals), default=0.0
         ),
         "target_concentration_ratio": max((float(item.get("target_concentration_ratio", 0.0)) for item in signals), default=0.0),
-    }
-
-
-def _event_defense_mitigation(defense_plan: dict[str, Any] | None, event: dict[str, Any]) -> float:
-    if not defense_plan:
-        return 0.0
-    event_step = int(event.get("step_index", -2))
-    legacy_step = defense_plan.get("valid_for_step")
-    valid_from = defense_plan.get("valid_from_step", legacy_step)
-    valid_until = defense_plan.get("valid_until_step", legacy_step)
-    if valid_from is None or valid_until is None:
-        return 0.0
-    if not int(valid_from) <= event_step <= int(valid_until):
-        return 0.0
-    attack_ids = set(defense_plan.get("attack_ids", []))
-    targets = set(defense_plan.get("target_ids", []))
-    kinds = set(defense_plan.get("attack_kinds", []))
-    entity_records = defense_plan.get("entity_records", [])
-    paired_match = any(
-        isinstance(item, dict)
-        and item.get("target_id") == event.get("target_id")
-        and item.get("kind") == event.get("kind")
-        for item in entity_records
-    )
-    matched = event.get("attack_id") in attack_ids or paired_match
-    if not entity_records:
-        matched = matched or (event.get("target_id") in targets and event.get("kind") in kinds)
-    if not matched:
-        return 0.0
-    strength = min(1.0, max(0.0, float(defense_plan.get("mitigation_strength", 1.0))))
-    return float(PREVENTIVE_DEFENSE_EFFECTIVENESS.get(str(event.get("kind")), 0.55)) * strength
-
-
-def _active_quarantined_sources(
-    defense_plan: dict[str, Any] | None,
-    event: dict[str, Any],
-    *,
-    mitigation_ratio: float,
-) -> set[str]:
-    """Вернуть только реально наблюдённые L1-источники действующего плана."""
-    if not defense_plan or mitigation_ratio <= 0.0:
-        return set()
-    control = defense_plan.get("routing_control", {})
-    values = control.get("quarantine_sources", defense_plan.get("source_ids", []))
-    planned = {values} if isinstance(values, str) else {str(value) for value in values}
-    # План предиктивной подготовки не изолирует предположительный источник.
-    # Но когда то же воздействие уже наблюдается, заранее подготовленный
-    # ingress ACL/policer может немедленно применить карантин именно к его
-    # фактическим L1 ingress-источникам, не дожидаясь следующего такта.
-    if (
-        control.get("source_quarantine_policy")
-        == "active_event_or_explicit_confirmed_plan_only"
-        and set(control.get("mitigation_controls", []))
-        & {"ingress_acl_or_policer", "connection_rate_limit", "syn_proxy"}
-    ):
-        planned.update(str(value) for value in event.get("ingress_nodes", []))
-    return planned & {str(value) for value in event.get("ingress_nodes", [])}
-
-
-def _allocate_sla_defense_budget(
-    flows: list[dict[str, Any]],
-    events: list[dict[str, Any]],
-    event_mitigation: dict[str, float],
-) -> tuple[dict[tuple[str, str], float], list[dict[str, Any]]]:
-    """Распределить конечный ресурс защиты строго Gold → Silver → Bronze.
-
-    Бюджет измеряется числом потерь, которые защитный контур способен
-    предотвратить за интервал. Он вычисляется из фиксированной PPS-ёмкости
-    защищаемого оборудования, не растёт вместе с атакой и является общим для
-    всех одновременных воздействий на шаге.
-    """
-    allocations: dict[tuple[str, str], float] = {}
-    if not events:
-        return allocations, []
-    candidates: list[dict[str, Any]] = []
-    for event in events:
-        attack_id = str(event["attack_id"])
-        base_effectiveness = float(event_mitigation.get(attack_id, 0.0))
-        for flow in flows:
-            if not _flow_is_affected(flow, event):
-                continue
-            packet_count = int(flow.get("packet_count", 0))
-            raw_loss_ratio = min(
-                0.95,
-                float(event["legitimate_loss_ratio"])
-                * float(event["intensity_ratio"])
-                * float(event["target_resource_pressure"]),
-            )
-            raw_dropped = min(packet_count, math.ceil(packet_count * raw_loss_ratio))
-            grade = str(flow.get("sla_grade", "bronze"))
-            cap = min(
-                0.95,
-                base_effectiveness * SLA_PROTECTION_FACTOR.get(grade, 0.45),
-            )
-            candidates.append(
-                {
-                    "attack_id": attack_id,
-                    "flow_id": str(flow["flow_id"]),
-                    "sla_grade": grade,
-                    "priority": SLA_RESTORATION_PRIORITY.get(grade, 3),
-                    "raw_dropped": raw_dropped,
-                    "desired_prevented": raw_dropped * cap,
-                    "mitigation_cap": cap,
-                }
-            )
-
-    capacity_sources: dict[str, dict[str, Any]] = {}
-    for event in events:
-        attack_id = str(event["attack_id"])
-        if float(event_mitigation.get(attack_id, 0.0)) <= 0.0:
-            continue
-        target_id = str(event["target_id"])
-        if target_id in capacity_sources:
-            continue
-        target_type = str(event.get("target_type", "unknown"))
-        capacity_pps = int(DEFENSE_RECOVERY_CAPACITY_PPS.get(target_type, 500))
-        interval_seconds = int(event.get("interval_seconds", 1))
-        capacity_sources[target_id] = {
-            "target_id": target_id,
-            "target_type": target_type,
-            "capacity_pps": capacity_pps,
-            "interval_seconds": interval_seconds,
-            "capacity_packets": capacity_pps * interval_seconds,
-        }
-
-    desired_total = sum(float(item["desired_prevented"]) for item in candidates)
-    capacity_total = sum(int(item["capacity_packets"]) for item in capacity_sources.values())
-    protection_budget = min(desired_total, float(capacity_total))
-    remaining = protection_budget
-    by_sla = {
-        grade: {"desired_prevented_packets": 0.0, "allocated_prevented_packets": 0.0}
-        for grade in ("gold", "silver", "bronze")
-    }
-    for item in sorted(
-        candidates,
-        key=lambda value: (int(value["priority"]), str(value["attack_id"]), str(value["flow_id"])),
-    ):
-        desired = float(item["desired_prevented"])
-        allocated = min(desired, max(0.0, remaining))
-        raw_dropped = int(item["raw_dropped"])
-        ratio = min(
-            float(item["mitigation_cap"]),
-            allocated / raw_dropped if raw_dropped > 0 else 0.0,
-        )
-        allocations[(str(item["attack_id"]), str(item["flow_id"]))] = ratio
-        remaining -= allocated
-        grade = str(item["sla_grade"])
-        by_sla.setdefault(
-            grade,
-            {"desired_prevented_packets": 0.0, "allocated_prevented_packets": 0.0},
-        )
-        by_sla[grade]["desired_prevented_packets"] += desired
-        by_sla[grade]["allocated_prevented_packets"] += allocated
-
-    report = {
-        "policy": "finite_strict_priority_budget",
-        "order": ["gold", "silver", "bronze"],
-        "attack_ids": sorted(str(event["attack_id"]) for event in events),
-        "capacity_model": "fixed_target_recovery_pps",
-        "capacity_sources": list(capacity_sources.values()),
-        "desired_prevented_packets": round(desired_total, 3),
-        "protection_budget_packets": round(protection_budget, 3),
-        "allocated_prevented_packets": round(protection_budget - max(0.0, remaining), 3),
-        "unused_budget_packets": round(max(0.0, remaining), 3),
-        "by_sla": {
-            grade: {
-                key: round(float(value), 3)
-                for key, value in values.items()
-            }
-            for grade, values in by_sla.items()
-        },
-        "value_origin": "scenario_assumption",
-    }
-    return allocations, [report]
-
-
-def _preventive_defense_summary(
-    events: list[dict[str, Any]],
-    defense_plan: dict[str, Any] | None,
-    event_mitigation: dict[str, float],
-    allocation_reports: list[dict[str, Any]],
-) -> dict[str, Any]:
-    protected = [event["attack_id"] for event in events if event_mitigation.get(event["attack_id"], 0.0) > 0.0]
-    return {
-        "prepared": bool(defense_plan),
-        "effective": bool(protected),
-        "plan_id": None if not defense_plan else defense_plan.get("plan_id"),
-        "valid_for_step": None if not defense_plan else defense_plan.get("valid_for_step"),
-        "valid_from_step": None if not defense_plan else defense_plan.get("valid_from_step"),
-        "valid_until_step": None if not defense_plan else defense_plan.get("valid_until_step"),
-        "protected_attack_ids": protected,
-        "mitigation_controls": (
-            []
-            if not defense_plan
-            else list(defense_plan.get("routing_control", {}).get("mitigation_controls", []))
-        ),
-        "maximum_mitigation_ratio": max(event_mitigation.values(), default=0.0),
-        "sla_budget_allocations": allocation_reports,
-        "value_origin": "scenario_assumption_not_mitre_effectiveness_percentage",
     }
 
 

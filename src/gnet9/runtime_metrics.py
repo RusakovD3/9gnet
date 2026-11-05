@@ -23,7 +23,8 @@ EDGE_METRICS = (
 )
 EDGE_UNITS = ("Mbit/s", "ms", "ms", "ratio", "ratio", "ratio", "Mbit/s", "ratio", "ratio")
 ATTACK_PROFILES = {"normal": 0, "dos": 1, "ddos": 2, "syn_flood": 3,
-                   "brute_force": 4, "power_attack": 5, "mixed": 6}
+                   "brute_force": 4, "power_attack": 5, "mixed": 6,
+                   "dns_flood": 7, "application_flood": 8}
 
 
 def _tensor_value(attrs: dict[str, Any], name: str, default: float = 0.0) -> float:

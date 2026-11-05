@@ -27,7 +27,7 @@ EMBEDDING = {
     ("L3", "L4"), ("L3", "L8"), ("L4", "L8"),
     ("L5", "L2"), ("L5", "L3"), ("L6", "L4"),
 }
-CONTROLS = {("L7", level) for level in ("L1", "L2", "L3", "L5", "L6")}
+DIAGNOSTICS = {("L7", level) for level in ("L1", "L2", "L3", "L5", "L6")}
 
 
 def test_hypernetwork_preserves_directed_embedding_and_sla_feedback(model):
@@ -41,9 +41,9 @@ def test_hypernetwork_preserves_directed_embedding_and_sla_feedback(model):
             assert set(pair) <= levels
             by_kind.setdefault(relation["kind"], set()).add(pair)
     assert by_kind["sla_observation"] == {("L0", "L7")}
-    assert by_kind["control"] == CONTROLS
+    assert by_kind["diagnostic_dependency"] == DIAGNOSTICS
     actual_embedding = set().union(*(pairs for kind, pairs in by_kind.items()
-                                    if kind not in {"control", "sla_observation"}))
+                                    if kind not in {"diagnostic_dependency", "sla_observation"}))
     assert actual_embedding == EMBEDDING
     assert sum(r["kind"] == "service_dependency" for r in embedding["relations"]) == 480
     assert model.to_serializable() == baseline
@@ -54,7 +54,7 @@ def test_numeric_embedding_uses_target_rows_and_no_forbidden_control(model, use_
     reference = build_tensor_matrix_view(_tensor_state_snapshot(model))
     channel = TensorKroneckerKoopman.from_reference(reference, model=model if use_model else None)
     index = {level: row for row, level in enumerate(channel.level_names)}
-    allowed = EMBEDDING | CONTROLS | {("L0", "L7")}
+    allowed = EMBEDDING | DIAGNOSTICS | {("L0", "L7")}
     actual = {
         (source, target)
         for source, column in index.items()
@@ -62,7 +62,7 @@ def test_numeric_embedding_uses_target_rows_and_no_forbidden_control(model, use_
         if row != column and channel.level_operator[row, column] > 0
     }
     assert actual == allowed
-    # Импульс управления L7 достигает только разрешённых уровней.
+    # Диагностическое возмущение L7 достигает только разрешённых уровней.
     state = np.zeros((len(index), 4))
     state[index["L7"], 0] = 1
     operator = LazyKroneckerOperator(channel.level_operator, np.eye(4))

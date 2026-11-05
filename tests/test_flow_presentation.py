@@ -7,9 +7,10 @@ from matplotlib.backend_bases import KeyEvent, MouseEvent
 import pytest
 
 from src.gnet9.flow_details import _interactive_status_sections, _node_hover_text
-from src.gnet9.flow_visualizer import ServiceFlowWindow, _point_on_route, _spread_sample, aggregate_flow_edges
+from src.gnet9.flow_visualizer import ServiceFlowWindow, _point_on_route, _spread_sample, aggregate_flow_edges, draw_security_dashboard
 from src.gnet9.packet_simulator import simulate_packet_snapshot
 from src.gnet9.topology_builder import GNetBaselineBuilder
+from src.gnet9.routing import shortest_data_path
 
 
 @pytest.fixture(scope="module")
@@ -54,7 +55,7 @@ def test_cards_separate_prediction_from_observed_actions_and_all_sla_classes(mod
                                 {"sla_grade": "gold", "flow_count": 10, "sla_compliant_flow_count": 9},
                                 {"sla_grade": "silver", "flow_count": 10, "sla_compliant_flow_count": 4},
                                 {"sla_grade": "bronze", "flow_count": 0}]}},
-                "arbitrator": {"remap": {"action": "ISOLATE_CONFIRMED_SOURCES_AND_REMAP"}},
+                "arbitrator": {"recommendation": {"steps_ru": ["Проверьте источники"]}},
                 "koopman": {"forecast_is_early_warning": True, "forecast_risk_score": 0.85,
                             "forecast_window_start_seconds": 50, "forecast_window_end_seconds": 60,
                             "forecast_target_ids": ["C1"],
@@ -69,8 +70,8 @@ def test_cards_separate_prediction_from_observed_actions_and_all_sla_classes(mod
     assert "Бронзовый: нет данных" in quality
     assert "Учтено в SLA: 20 · исключено: 2" in quality
     actions = "\n".join(sections[3]["lines"])
-    assert "Смена маршрута: 0" in actions and "карантин: 0" in actions
-    assert "Решение на следующий шаг:" in actions
+    assert "Проверьте источники" in actions
+    assert "Структура сети и маршруты фиксированы." in actions
     assert "Обучение приостановлено" in sections[4]["lines"]
     # Будущее расписание из диагностического экспорта не меняет карточки.
     altered = deepcopy(snapshot)
@@ -168,6 +169,8 @@ def test_status_cards_and_legend_fit_their_panels(model, packet, tmp_path):
     snapshot["koopman"].update(forecast_is_early_warning=True, forecast_window_start_seconds=30,
                                forecast_window_end_seconds=40, forecast_target_ids=["C1", "SRV_MEDIA", "RAN_A1"])
     snapshot["koopman"]["nominal_training"] = {"transition_accepted": False, "observation_eligible": False}
+    snapshot["arbitrator"] = {"recommendation": {"steps_ru": ["Проверьте журнал", "Проверьте классы услуг",
+        "Проверьте журнал управления питанием, напряжение и запас энергии ИБП (источника бесперебойного питания)."]}}
     window = ServiceFlowWindow(model, [snapshot])
     try:
         window.animation.event_source.stop()
@@ -179,10 +182,119 @@ def test_status_cards_and_legend_fit_their_panels(model, packet, tmp_path):
                 extent = text.get_window_extent(renderer)
                 assert extent.x0 >= bounds.x0 and extent.x1 <= bounds.x1
                 assert extent.y0 >= bounds.y0 and extent.y1 <= bounds.y1
+        labels = " ".join(text.get_text() for text in window.legend_ax.get_legend().get_texts())
+        assert "Изолированный" not in labels and "Маршрут изменён" not in labels
+        assert "Резервный сервер" not in labels
         legend = window.legend_ax.get_legend().get_window_extent(renderer)
         assert legend.x1 <= window.fig.bbox.x1
         assert "выборка" in window.help_text.get_text()
         assert "точка — пакет" not in window.help_text.get_text()
         window.fig.savefig(tmp_path / "interactive_panels.png", dpi=70)
+    finally:
+        plt.close(window.fig)
+
+
+def _alarm_snapshots(model, packet):
+    snapshots = _snapshots(packet)
+    active = snapshots[1]
+    targets = ["C1", "C2", "C3", "SRV_DATA", "SRV_MEDIA", "C5", "C9"]
+    kinds = ["dos", "ddos", "syn_flood", "dns_flood", "application_flood", "brute_force", "power_attack"]
+    ingress = next(node for node, attrs in model.graph.nodes(data=True) if attrs.get("role") == "radio-access-node")
+    events = [{"attack_id": f"A{i}", "target_id": target, "kind": kind,
+               "ingress_nodes": [ingress], "routes": [shortest_data_path(model, ingress, target)],
+               "effective_packet_rate_pps": 1000, "effective_offered_rate_mbps": 10}
+              for i, (target, kind) in enumerate(zip(targets, kinds))]
+    active["attacks"].update(active=True, events=events, target_observations=[
+        {"target_id": target, "service_availability_ratio": .75} for target in targets])
+    active["arbitrator"] = {"recommendation": {"response_stage": "emergency", "requires_human_action": True,
+        "steps_ru": ["Проверьте журналы и текущую загрузку наблюдаемого узла. " * 3 for _ in range(5)] +
+                    ["Подтвердите источник до решения об ограничении доступа; решение принимает человек."]}}
+    snapshots[2]["arbitrator"] = {"recommendation": {"response_stage": "observe", "steps_ru": ["Наблюдайте."]}}
+    return snapshots
+
+
+def _mouse(window, ax, x, y, name="button_press_event", **extra):
+    px, py = ax.transData.transform((x, y))
+    event = MouseEvent(name, window.fig.canvas, px, py, **extra)
+    window.fig.canvas.callbacks.process(name, event)
+
+
+def test_alarm_selection_paging_and_recommendations_are_linked_to_map(model, packet, tmp_path):
+    snapshots = _alarm_snapshots(model, packet)
+    before = deepcopy(snapshots)
+    window = ServiceFlowWindow(model, snapshots)
+    try:
+        window.animation.event_source.stop()
+        window._select_step(1)
+        assert window.slider.val == 1
+        window.fig.canvas.draw()
+        panel = window.security_panel
+        assert panel.data["severity_counts"]["critical"] == 7
+        assert len(window.attack_routes.get_segments()) > 0
+        _mouse(window, panel.axes["alarms"], .4, .57)
+        assert panel.selected["target_id"] == "C2"
+        assert tuple(window.selected_target.get_offsets()[0]) == window.pos["C2"]
+        assert "C2" in window.attack_location.get_text()
+        _mouse(window, panel.axes["alarms"], .95, .92)
+        assert panel.page == 1
+        _mouse(window, panel.axes["alarms"], .4, .75)
+        assert panel.selected["target_id"] == panel.visible_alarms[0]["target_id"]
+        for _ in range(20):
+            _mouse(window, panel.axes["recommendations"], .5, .5, "scroll_event", button="down", step=-1)
+        assert any("Подтвердите источник" in text.get_text() for text in panel.axes["recommendations"].texts)
+        last_offset = panel.recommendation_offset
+        _mouse(window, panel.axes["recommendations"], .93, .10)
+        assert panel.recommendation_offset < last_offset
+        _mouse(window, panel.axes["recommendations"], .97, .10)
+        assert panel.recommendation_offset == last_offset
+        window.metrics_button._observers.process("clicked", None)
+        assert window.status_ax.get_visible() and not panel.axes["alarms"].get_visible()
+        window.security_button._observers.process("clicked", None)
+        assert not window.status_ax.get_visible() and panel.axes["alarms"].get_visible()
+        window.fig.savefig(tmp_path / "dashboard_overlap.png", dpi=80)
+        window._select_step(0)
+        assert panel.data["alarms"] == []
+        assert len(window.attack_routes.get_segments()) == 0
+        assert len(window.selected_target.get_offsets()) == 0
+        assert snapshots == before
+    finally:
+        plt.close(window.fig)
+
+
+def test_dashboard_export_clears_previous_run_without_packet_snapshots(tmp_path):
+    path = tmp_path / "security_dashboard.png"
+    path.write_bytes(b"previous experiment")
+    draw_security_dashboard(None, [], path)
+    assert not path.exists()
+    draw_security_dashboard(None, [], path)
+
+
+def test_security_text_fits_full_hd_and_new_attack_replaces_automatic_history_selection(model, packet, tmp_path):
+    snapshots = _alarm_snapshots(model, packet)
+    # Длинная подпись восстановления проверяется вместе с максимальной срочностью.
+    snapshots[1]["attacks"]["events"][-1]["is_recovery_effect"] = True
+    snapshots[2]["attacks"].update(active=True, events=[{
+        "attack_id": "new", "kind": "dns_flood", "target_id": "SRV_DATA", "routes": []}])
+    window = ServiceFlowWindow(model, snapshots)
+    try:
+        window.animation.event_source.stop()
+        window.fig.set_size_inches(19.2, 10.8)
+        window._select_step(1)
+        panel = window.security_panel
+        panel.selected_key = next(a["key"] for a in panel.data["alarms"] if a["kind"] == "power_attack")
+        panel.page = 1
+        panel.draw()
+        window.fig.canvas.draw()
+        renderer = window.fig.canvas.get_renderer()
+        for ax in panel.axes.values():
+            bounds = ax.get_window_extent(renderer)
+            for artist in ax.texts:
+                extent = artist.get_window_extent(renderer)
+                assert extent.x0 >= bounds.x0 and extent.x1 <= bounds.x1, artist.get_text()
+                assert extent.y0 >= bounds.y0 and extent.y1 <= bounds.y1, artist.get_text()
+        window.fig.savefig(tmp_path / "dashboard_full_hd.png", dpi=100)
+        window._select_step(2)
+        assert panel.selected["phase"] == "active"
+        assert panel.selected["kind"] == "dns_flood"
     finally:
         plt.close(window.fig)

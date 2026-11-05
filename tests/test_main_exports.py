@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from main import export_l1_monitoring, export_stationary_dynamics, parse_args
-from src.gnet9.attacks import predictive_demo_minimum_steps
+from main import export_attack_catalog, export_l1_monitoring, export_stationary_dynamics, parse_args
+from src.gnet9.attacks import attack_catalog, predictive_demo_minimum_steps
 from src.gnet9.constants import SUBSCRIBER_COUNT
 from src.gnet9.dynamics import DynamicsConfig
 from src.gnet9.topology_builder import GNetBaselineBuilder
@@ -30,6 +30,18 @@ def test_l1_monitoring_csv_exports_single_access_field(tmp_path: Path) -> None:
     assert gold_mobile["home_access"]
     assert any("policies/l1_policies.d0sl" in note for note in model.notes)
     assert all("D:\\programming\\9gnet" not in note for note in model.notes)
+
+
+@pytest.mark.parametrize("scenario", ["predictive-demo", "mitre-demo"])
+def test_exported_attack_catalog_matches_custom_simulation_schedule(tmp_path: Path, scenario: str) -> None:
+    model = GNetBaselineBuilder().build()
+    config = DynamicsConfig(step_count=100, step_seconds=2, attack_scenario=scenario,
+                            attack_start_step=50, attack_interval_steps=10)
+    path = tmp_path / "catalog.json"
+    export_attack_catalog(model, path, config)
+    exported = json.loads(path.read_text(encoding="utf-8"))
+    expected = json.loads(json.dumps(attack_catalog(model, scenario, config=config)))
+    assert exported["scenarios"][scenario] == expected
 
 
 def test_compact_dynamics_export_keeps_runtime_flows_without_serializing_them(
@@ -69,7 +81,7 @@ def test_compact_dynamics_export_keeps_runtime_flows_without_serializing_them(
     assert compact_state["edge_vectors"] == [list(e["metrics"].values()) for e in original_state["edges"]]
     assert exported["config"]["packet_detail"] == "summary"
     assert exported["config"]["runtime_packet_detail"] == "flows"
-    assert exported["export_metadata"]["schema_version"] == 2
+    assert exported["export_metadata"]["schema_version"] == 3
     summary = json.loads((tmp_path / "run_summary.json").read_text(encoding="utf-8"))
     assert summary["training"]["accepted_transitions_total"] == 1
     assert summary["prediction"]["evaluated"] is False

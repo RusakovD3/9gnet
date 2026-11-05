@@ -55,9 +55,8 @@ def test_arbitrator_exports_kvu_game_and_safe_sdn_intent() -> None:
     game = snapshot["arbitrator"]["game_theory"]
     assert game["model"] == "finite_defender_attacker_normal_form_game"
     assert game["recommended_action"]
-    sdn = snapshot["arbitrator"]["remap"]["sdn_intent"]
-    assert sdn["execution_mode"] == "simulation_only_no_network_io"
-    assert sdn["southbound_transport"] == "none"
+    assert snapshot["arbitrator"]["recommendation"]["execution_mode"] == "human_only"
+    assert "remap" not in snapshot["arbitrator"]
 
 
 def test_attack_catalog_binds_vvh_tth_to_target_capacity_profile() -> None:

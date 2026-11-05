@@ -2,7 +2,7 @@
 
 The builder creates a reproducible t0 state: no attacks, no overload, stable
 queues and normal SLA/SLO values. This baseline is the point of comparison for
-future experiments with failures, attacks, remapping and forecasting.
+future experiments with failures, attacks and forecasting.
 """
 
 from __future__ import annotations
@@ -164,7 +164,7 @@ class GNetBaselineBuilder:
             "Кодеки и протокольные профили L0 описаны единым каталогом CodecProfile и привязаны к сервисам, абонентам и потокам.",
             "Каждый узел имеет детерминированный private IPv4 и локально-администрируемый MAC-адрес для безопасной пакетной модели.",
             "Логические сервисы L0 размещены на отдельных физических серверах Dell PowerEdge R660.",
-            "Каждый сервис имеет три standby-реплики на остальных R660; active/standby переключается временным routing overlay.",
+            "Каталог сохраняет три standby-реплики каждого сервиса; потоки закреплены за исходным сервером, переключения нет.",
             "Каждый агрегирующий коммутатор имеет три uplink к ядру; связность backbone L2 равна 3, степень backbone не выше 6.",
             "У каждого абонента одна линия последней мили; резервирование предусмотрено в L2 и на сервисных серверах.",
             "Тензоры L3/L4 закреплены за транспортными связями; L5/L6 — за оборудованием и абонентами, где это применимо.",
@@ -729,11 +729,8 @@ class GNetBaselineBuilder:
             "SVC_TELEMOST": (2.0, 7.7),
             "SVC_LIVE": (6.0, 7.7),
         }
-        # Контейнерные standby-реплики каждого сервиса размещаются на трёх
-        # остальных R660. Два сетевых порта защищают только линию, тогда как
-        # N+3 placement сохраняет Gold при перекрывающихся отказах primary и
-        # одного/двух standby в ускоренном сценарии. Серверы находятся в
-        # независимых локальных power domains, а capacity проверяется remapper.
+        # Каталог резервных размещений сохранён как описание инфраструктуры.
+        # Во время наблюдений потоки всегда используют исходные серверы.
         standby_hosts = {
             "SVC_VOICE": ("SRV_RTC", "SRV_LIVE", "SRV_DATA"),
             "SVC_VLC": ("SRV_LIVE", "SRV_RTC", "SRV_DATA"),

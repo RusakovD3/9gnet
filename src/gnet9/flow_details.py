@@ -15,6 +15,8 @@ FLOW_SHORT_LABELS = {
     "ATTACK_DOS": "АТАКА · DoS",
     "ATTACK_DDOS": "АТАКА · DDoS",
     "ATTACK_SYN": "АТАКА · SYN-флуд",
+    "ATTACK_DNS": "АТАКА · DNS-запросы",
+    "ATTACK_APPLICATION": "АТАКА · тяжёлые запросы",
 }
 TRAFFIC_LABELS = {
     "voice": "голос", "vlc_av": "VLC: голос и видео",
@@ -78,9 +80,6 @@ def _flow_summary(flows: list[dict[str, Any]]) -> str:
     megabytes = wire_bytes / 1_000_000
     offered_rate_mbps = wire_bytes * 8.0 / max(interval, 1) / 1_000_000
     carried_rate_mbps = routed_wire_bytes * 8.0 / max(interval, 1) / 1_000_000
-    rerouted = sum(bool(flow.get("rerouted")) for flow in flows if not flow.get("is_attack_traffic"))
-    failover = sum(bool(flow.get("failover_active")) for flow in flows if not flow.get("is_attack_traffic"))
-    isolated = sum(bool(flow.get("isolated")) for flow in flows if not flow.get("is_attack_traffic"))
     lines = [
         f"Обычные потоки: {legitimate_count}",
         "По одному потоку на абонента",
@@ -89,7 +88,6 @@ def _flow_summary(flows: list[dict[str, Any]]) -> str:
         f"Доставлено пакетов: {delivered_packets:,}",
         f"Предложено: {megabytes:,.1f} МБ · {offered_rate_mbps:,.1f} Мбит/с",
         f"Передано по маршрутам: {routed_wire_bytes / 1_000_000:,.1f} МБ · {carried_rate_mbps:,.1f} Мбит/с",
-        f"Переназначено / резерв / изолировано: {rerouted} / {failover} / {isolated}",
         "Приложения:",
     ]
     lines.extend(f"  {FLOW_SHORT_LABELS.get(name, name)}: {count}" for name, count in sorted(apps.items()))
@@ -108,7 +106,6 @@ def _interactive_status_sections(snapshot, flows, loads, paused: bool, model):
     """Готовые наблюдения и решения; интерфейс не пересчитывает пороги."""
     attacks = snapshot.get("attacks", {})
     koopman = snapshot.get("koopman", {})
-    routing = attacks.get("routing", {})
     step = int(snapshot.get("step_index", 0))
     now = float(snapshot.get("time_seconds", 0.0))
     warning = bool(koopman.get("forecast_is_early_warning"))
@@ -136,6 +133,7 @@ def _interactive_status_sections(snapshot, flows, loads, paused: bool, model):
         kinds = list(dict.fromkeys(str(e.get("kind", "")) for e in events))
         names = {"dos": "DoS (перегрузка)", "ddos": "DDoS (распределённая перегрузка)",
                  "syn_flood": "SYN-флуд (неполные соединения)", "brute_force": "попытки входа",
+                 "dns_flood": "перегрузка DNS-запросами", "application_flood": "тяжёлые запросы приложения",
                  "power_attack": "нарушение питания"}
         observed.append("Воздействие: " + ", ".join(names.get(kind, kind) for kind in kinds[:2]))
     elif step == 0:
@@ -170,21 +168,11 @@ def _interactive_status_sections(snapshot, flows, loads, paused: bool, model):
     limited = sum(int(t.get("slo_limited_coverage_flow_count", 0)) for t in tiers.values())
     quality.append(f"Неполная оценка требований: {limited} потоков" if limited else "Показаны сохранённые оценки требований")
 
-    rerouted = routing.get("rerouted_flow_count", sum(bool(f.get("rerouted")) for f in ordinary))
-    failover = routing.get("failover_flow_count", sum(bool(f.get("failover_active")) for f in ordinary))
-    isolated = routing.get("isolated_flow_count", sum(bool(f.get("isolated")) for f in ordinary))
-    quarantined = {f.get("client_node") for f in flows if f.get("quarantined") or f.get("routing_action") == "quarantine_attack_source"}
-    blocked = int(attacks.get("blocked_attack_packet_count", 0))
-    actions = [f"Смена маршрута: {rerouted} · резерв сервера: {failover}",
-               f"Изолировано потоков: {isolated} · карантин: {len(quarantined)}",
-               f"Отфильтровано атакующих пакетов: {blocked:,}"]
-    remap = snapshot.get("arbitrator", {}).get("remap", {}).get("action")
-    if remap:
-        actions.append("Решение на следующий шаг: " + {
-            "NO_REMAP": "сохранить маршруты", "OBSERVE_PRECURSOR": "наблюдать",
-            "PLAN_REMAP": "подготовить маршруты",
-            "ISOLATE_CONFIRMED_SOURCES_AND_REMAP": "изоляция и смена маршрутов",
-        }.get(remap, ACTION_DISPLAY_NAMES.get(remap, remap)))
+    recommendation = snapshot.get("arbitrator", {}).get("recommendation", {})
+    steps = recommendation.get("steps_ru", [])
+    actions = [steps[2] if len(steps) > 2 else steps[0] if steps else "Продолжайте наблюдение.",
+               "Полный список: run_summary.md",
+               "Структура сети и маршруты фиксированы."]
 
     training = snapshot.get("training", {})
     nominal = koopman.get("nominal_training", {})
@@ -205,7 +193,7 @@ def _interactive_status_sections(snapshot, flows, loads, paused: bool, model):
         {"title": f"СЕЙЧАС · ШАГ {step} · {now:g} с", "lines": observed, "color": color},
         {"title": "ПРОГНОЗ КУПМАНА", "lines": forecast, "color": "#c4b5fd"},
         {"title": "КАЧЕСТВО УСЛУГ · SLA", "lines": quality, "color": "#bae6fd"},
-        {"title": "ВЫПОЛНЕНО НА ЭТОМ ШАГЕ", "lines": actions, "color": "#86efac"},
+        {"title": "РЕКОМЕНДАЦИИ ЧЕЛОВЕКУ", "lines": actions, "color": "#86efac"},
         {"title": "ОБУЧЕНИЕ И ФИЛЬТР", "lines": learning, "color": "#cbd5e1"},
     ]
 
@@ -292,7 +280,7 @@ def _node_hover_text(model, node_id: str, snapshot=None) -> str:
             f"Ограничения модели: {limitations}"
         )
     if role == "arbitrator":
-        return "АРБ · Арбитратор L7\nНаблюдает метрики всех уровней\nПринимает решение о переназначении"
+        return "АРБ · Арбитратор L7\nНаблюдает метрики всех уровней\nВыдаёт рекомендации человеку; маршруты фиксированы"
     if attrs.get("level") == "L8":
         x, y = attrs.get("pos", ("—", "—"))
         return (
@@ -456,7 +444,6 @@ def _protection_hover(attrs: dict[str, Any]) -> str:
             if protection.get("kvu_rank") is not None
             else ""
         )
-        + f"\nПредел загрузки при переназначении: {protection.get('maximum_safe_utilization_percent', 80.0):.0f}%"
     )
 
 

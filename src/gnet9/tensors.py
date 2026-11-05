@@ -156,7 +156,7 @@ STATE_TENSOR_SPECS: dict[str, StateTensorSpec] = {
             "percolation_threshold": "ratio",
             "reconfiguration_time_s": "s",
         },
-        "L5 protocol, socket identity, routing and remapping state.",
+        "L5 protocol, socket identity and fixed routing; legacy remap code is reserved.",
     ),
     "L6": StateTensorSpec(
         "L6",
@@ -195,7 +195,7 @@ STATE_TENSOR_SPECS: dict[str, StateTensorSpec] = {
             "decision_confidence": "ratio",
             "action_cost": "normalized",
         },
-        "L7 arbitrator vector for Koopman, Lyapunov and remapping decisions.",
+        "L7 diagnostic vector for Koopman, Lyapunov and human recommendations.",
     ),
     "L8": StateTensorSpec(
         "L8",

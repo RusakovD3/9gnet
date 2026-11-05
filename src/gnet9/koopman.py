@@ -21,11 +21,12 @@ from .local_observation import LocalObservationFilter, is_smoothable_metric
 from .attacks import MITRE_T1110_001_ATTEMPTS_PER_SECOND
 from .arbitrator import build_trigger_card, evaluate_defense_game
 from .metrics import gold_threat_proximity_view
-from .sdn_controller import compile_sdn_intent
 from .tensor_matrix import TensorKroneckerKoopman, TensorMatrixView, TensorLevelMatrix
 
 
 THREAT_METRICS = {
+    "OBS.dns_query_pressure_ratio",
+    "OBS.application_work_pressure_ratio",
     "OBS.attack_active_count",
     "OBS.attack_intensity_ratio",
     "OBS.attack_rate_mbps",
@@ -313,8 +314,8 @@ class KoopmanOnlineAnalyzer:
             model,
             _sanitized_geometry_observation(attack_state),
         )
-        route_hausdorff = attack_state.get("routing", {}).get(
-            "gold_route_hausdorff",
+        route_hausdorff = attack_state.get(
+            "route_observation",
             {
                 "metric": "maximum_per_flow_gold_route_hausdorff_latency",
                 "distance_ms": 0.0,
@@ -493,11 +494,7 @@ class KoopmanOnlineAnalyzer:
             forecast_risk,
             predicted_attack,
             attack_state=attack_state,
-            step_index=step_index,
-            step_seconds=self.step_seconds,
-            valid_from_step=forecast_window_start_step,
-            valid_until_step=forecast_window_end_step,
-            defense_authorized=early_warning or bool(attack_state.get("events", [])),
+            warning_confirmed=early_warning or bool(attack_state.get("events", [])),
             lyapunov_remap_pressure=lyapunov_remap_pressure,
         )
 
@@ -810,8 +807,8 @@ def apply_koopman_to_arbitrator(
     koopman: dict[str, Any],
     *,
     model=None,
-) -> dict[str, Any] | None:
-    """Передать прогноз в L7 и вернуть защитный план для следующего шага."""
+) -> None:
+    """Сохранить прогноз и рекомендации; не создавать управляющих планов."""
     snapshot["koopman"] = koopman
     arbitrator = snapshot.get("arbitrator", {})
     analysis = arbitrator.setdefault("analysis", {})
@@ -880,147 +877,39 @@ def apply_koopman_to_arbitrator(
     stability_pressure = float(koopman.get("lyapunov_remap_pressure", 0.0))
     current_pressure = float(analysis.get("remap_pressure", 0.0))
     new_pressure = max(current_pressure, predictive_pressure, stability_pressure)
-    # ``remap_pressure`` is a continuous diagnostic score.  Actioning it is
-    # separately gated below at 0.20, which keeps the Lyapunov contribution
-    # visible and preserves the aggregation invariant exactly.
+    # Историческое имя оси сохранено; значение описывает только диагностику.
     new_pressure = round(new_pressure, 6)
     analysis["remap_pressure"] = new_pressure
-    remap = arbitrator.setdefault("remap", {})
-    attack_active = bool(snapshot.get("attacks", {}).get("active"))
-    early_warning = bool(koopman.get("forecast_is_early_warning"))
-    control_triggered = attack_active or early_warning
-    attack_kind = str(koopman.get("forecast_attack_kind", "none"))
-    source_confirmed = any(event.get("ingress_nodes") for event in snapshot.get("attacks", {}).get("events", []))
-    trigger_card = build_trigger_card(
+    attacks = snapshot.get("attacks", {})
+    confirmed = bool(attacks.get("active") or koopman.get("forecast_is_early_warning"))
+    source_confirmed = any(event.get("ingress_nodes") for event in attacks.get("events", []))
+    card = build_trigger_card(
         hausdorff=float(analysis.get("state_hausdorff", {}).get("normalized_distance", 0.0)),
         risk=float(koopman["forecast_risk_score"]), lyapunov_pressure=stability_pressure,
-        decision_pressure=new_pressure, confirmed=control_triggered,
-        attack_kind=attack_kind, source_confirmed=source_confirmed,
+        decision_pressure=new_pressure, confirmed=confirmed,
+        attack_kind=str(koopman.get("forecast_attack_kind", "none")),
+        source_confirmed=source_confirmed,
     )
-    arbitrator["trigger_card"] = trigger_card
-    remap["needed"] = trigger_card["action"] == "PLAN_REMAP"
-    remap["action"] = trigger_card["action"]
-    remap["response_stage"] = trigger_card["response_stage"]
-    if remap["needed"]:
-        if early_warning and attack_active:
-            remap["reason"] = "active_attack_and_koopman_next_attack_warning"
-        elif early_warning:
-            remap["reason"] = "koopman_early_warning_before_attack"
-        elif attack_active:
-            remap["reason"] = "mitre_attack_observed_with_koopman_confirmation"
-        else:
-            remap["reason"] = "koopman_predictive_attack_warning"
-        candidates = set(remap.get("candidate_actions", []))
-        candidates.update(koopman["arbitrator_recommendation"]["candidate_actions"])
-        remap["candidate_actions"] = sorted(candidates)
-    elif trigger_card["action"] == "OBSERVE_PRECURSOR":
-        # Первый отсчёт predictive-demo остаётся режимом наблюдения. Это
-        # защищает маршрутизацию от реакции на единичный сенсорный выброс.
-        remap["reason"] = "unconfirmed_precursor_requires_second_sample"
-        remap["candidate_actions"] = []
-    else:
-        remap["reason"] = "healthy_stationary_baseline"
-        remap["candidate_actions"] = []
-    remap["candidate_actions"] = sorted(set(remap["candidate_actions"]) | set(trigger_card["controls"]))
+    arbitrator["trigger_card"] = card
+    recommendation = dict(koopman["arbitrator_recommendation"])
+    recommendation.update(
+        action=card["action"], response_stage=card["response_stage"],
+        attack_kind=card["attack_kind"],
+        reason_ru=card["reason_ru"],
+        target_ids=list(koopman.get("forecast_target_ids", [])),
+        forecast_window_start_seconds=koopman.get("forecast_window_start_seconds"),
+        forecast_window_end_seconds=koopman.get("forecast_window_end_seconds"),
+        early_warning=bool(koopman.get("forecast_is_early_warning")),
+        risk_score=float(koopman["forecast_risk_score"]),
+        probability_is_calibrated=False,
+    )
+    arbitrator["recommendation"] = recommendation
     if model is not None:
-        target_ids = list(koopman.get("forecast_target_ids", [])) or list(
-            koopman.get("current_attack_target_ids", [])
-        )
-        game = evaluate_defense_game(
-            model,
-            target_ids=target_ids,
-            threat_pressure=max(
-                float(koopman.get("forecast_risk_score", 0.0)),
-                new_pressure,
-            ),
+        arbitrator["game_theory"] = evaluate_defense_game(
+            model, target_ids=list(koopman.get("forecast_target_ids", [])) or list(koopman.get("current_attack_target_ids", [])),
+            threat_pressure=max(float(koopman["forecast_risk_score"]), new_pressure),
             matrix_koopman_pressure=matrix_pressure,
         )
-        arbitrator["game_theory"] = game
-        remap["game_recommended_action"] = game["recommended_action"]
-        remap["game_selection_mode"] = game["selection_mode"]
-        if remap.get("needed") and source_confirmed and game["recommended_action"] == "ISOLATE_CONFIRMED_SOURCES_AND_REMAP":
-            remap["candidate_actions"] = sorted(
-                set(remap.get("candidate_actions", [])) | {"isolate_confirmed_attack_sources"}
-            )
-    else:
-        game = {
-            "model": "finite_defender_attacker_normal_form_game",
-            "available": False,
-            "semantics_ru": "Для игровой оценки нужен граф модели.",
-        }
-    remap["koopman_forecast"] = {
-        "alert_level": koopman["alert_level"],
-        "risk_score_next_step": koopman.get("horizon_forecasts", [{}])[0].get(
-            "risk_score", koopman["forecast_risk_score"]
-        ),
-        "maximum_risk_score": koopman["forecast_risk_score"],
-        "probability_is_calibrated": False,
-        # Совместимый alias для старых JSON-потребителей; это не вероятность.
-        "attack_probability_next_step": koopman["forecast_attack_probability"],
-        "attack_kind": (
-            koopman["forecast_next_attack_kind"]
-            if koopman.get("forecast_is_early_warning")
-            else koopman["forecast_attack_kind"]
-        ),
-        "horizon_seconds": koopman.get(
-            "maximum_forecast_horizon_seconds", koopman["forecast_horizon_seconds"]
-        ),
-        "lead_time_seconds": koopman["forecast_lead_time_seconds"],
-        "window_start_step": koopman.get("forecast_window_start_step"),
-        "window_end_step": koopman.get("forecast_window_end_step"),
-        "target_ids": koopman["forecast_target_ids"],
-    }
-    remap["lyapunov_feedback"] = {
-        "pressure": stability_pressure,
-        "derivative_per_second": float(koopman.get("lyapunov_derivative_per_second", 0.0)),
-        "response_scale_per_second": float(
-            koopman.get(
-                "lyapunov_remap_response_scale_per_second",
-                LYAPUNOV_REMAP_RESPONSE_SCALE_PER_SECOND,
-            )
-        ),
-        "policy": "positive_dV_dt_strengthens_remap_pressure",
-    }
-    recommendation = koopman.get("arbitrator_recommendation", {})
-    defense_plan = recommendation.get("defense_plan")
-    if not remap["needed"]:
-        defense_plan = None
-    if defense_plan is not None:
-        defense_plan["trigger_card"] = trigger_card
-        defense_plan["mitigation_strength"] = {"prepare": 0.90, "protect": 0.95, "emergency": 1.0}[trigger_card["response_stage"]]
-    sdn_intent = compile_sdn_intent(
-        step_index=int(snapshot.get("step_index", 0)),
-        remap=remap,
-        defense_plan=defense_plan,
-        game=game,
-    )
-    remap["sdn_intent"] = sdn_intent
-    if defense_plan is not None:
-        defense_plan["sdn_intent"] = sdn_intent
-    attacks = snapshot.get("attacks", {})
-    armed_status = (
-        "ARMED_FOR_NEXT_STEP"
-        if attacks.get("scenario") == "mitre-demo"
-        else "ARMED_FOR_FORECAST_WINDOW"
-    )
-    arbitrator["prevention"] = {
-        "status": armed_status if defense_plan else "STANDBY",
-        "defense_plan": defense_plan,
-        "applied_defense": attacks.get("preventive_defense", {}),
-        "raw_attack_rate_mbps": float(attacks.get("raw_attack_rate_mbps", 0.0)),
-        "admitted_attack_rate_mbps": float(attacks.get("attack_rate_mbps", 0.0)),
-        "blocked_attack_rate_mbps": float(attacks.get("blocked_attack_rate_mbps", 0.0)),
-        "prevented_legitimate_dropped_packets": int(attacks.get("prevented_legitimate_dropped_packets", 0)),
-    }
-    remap["sla_restoration_plan"] = recommendation.get(
-        "sla_restoration_plan",
-        {
-            "policy": "strict_priority",
-            "order": ["gold", "silver", "bronze"],
-            "tiers": attacks.get("sla_restoration", {}).get("tiers", []),
-        },
-    )
-    return defense_plan
 
 
 def _operator_from_covariances(
@@ -1457,6 +1346,8 @@ def _precursor_score(metric_names: list[str], vector: np.ndarray) -> float:
     values = {name: float(vector[index]) for index, name in enumerate(metric_names)}
     confidence = min(1.0, values.get("OBS.precursor_confidence", 0.0))
     return max(
+        min(1.0, values.get("OBS.dns_query_pressure_ratio", 0.0)),
+        min(1.0, values.get("OBS.application_work_pressure_ratio", 0.0)),
         confidence,
         min(1.0, values.get("OBS.precursor_count", 0.0) / 5.0),
         min(1.0, values.get("OBS.suspicious_source_count", 0.0) / 1_600.0),
@@ -1514,6 +1405,10 @@ def _classify_precursor_signals(signals: dict[str, Any]) -> str:
     анализатор проверяет два последовательных отсчёта, поэтому одиночный
     выброс не авторизует превентивную защиту.
     """
+    if float(signals.get("dns_query_pressure_ratio", 0.0)) >= 0.30:
+        return "dns_flood"
+    if float(signals.get("application_work_pressure_ratio", 0.0)) >= 0.30:
+        return "application_flood"
     if (
         float(signals.get("authentication_failure_rate_per_second", 0.0)) >= 0.025
         and float(signals.get("authentication_failure_ratio", 0.0)) >= 0.8
@@ -1595,73 +1490,38 @@ def _recommendation(
     predicted_attack: str,
     *,
     attack_state: dict[str, Any],
-    step_index: int,
-    step_seconds: int,
-    valid_from_step: int,
-    valid_until_step: int,
-    defense_authorized: bool,
+    warning_confirmed: bool,
     lyapunov_remap_pressure: float,
 ) -> dict[str, Any]:
-    restoration = _sla_restoration_plan(attack_state)
-    decision_pressure = max(risk, lyapunov_remap_pressure)
-    if decision_pressure < 0.25:
-        return {
-            "decision": "observe",
-            "decision_pressure": round(decision_pressure, 6),
-            "candidate_actions": [],
-            "defense_plan": None,
-            "sla_restoration_plan": restoration,
-        }
-    actions = [
-        "raise_l7_watch",
-        "prepare_nearest_horizon_defense",
-        "prepare_multi_horizon_defense",
-        "protect_gold_paths",
-    ]
+    """Описать человеку проверку и возможные меры без исполнения в модели."""
+    steps = ["Проверьте показатели и журналы наблюдаемого узла; сопоставьте соседние отсчёты."]
+    if warning_confirmed:
+        steps.append("Оцените влияние на услуги: сначала золотой, затем серебряный и бронзовый классы.")
+        if any(kind in predicted_attack.split("+") for kind in ("dos", "ddos")):
+            steps.append("Проверьте источники и рост входящего трафика; подготовьте согласованное ограничение вредоносного потока.")
+        if "ddos" in predicted_attack:
+            steps.append("Согласуйте с оператором вышестоящей сети очистку атакующего трафика.")
+        if "syn_flood" in predicted_attack:
+            steps.append("Проверьте очередь незавершённых соединений и настройки защиты SYN.")
+        if "dns_flood" in predicted_attack:
+            steps.append("Проверьте частоту DNS-запросов и журнал службы; рассмотрите ограничения запросов после подтверждения источника.")
+        if "application_flood" in predicted_attack:
+            steps.append("Проверьте тяжёлые запросы медиаприложения и загрузку процессора; рассмотрите лимиты дорогих операций после подтверждения источника.")
+        if "brute_force" in predicted_attack:
+            steps.append("Проверьте ошибки входа; рассмотрите многофакторную аутентификацию и правила блокировки учётных записей.")
+        if "power_attack" in predicted_attack:
+            steps.append("Проверьте журнал управления питанием, напряжение и запас энергии ИБП (источника бесперебойного питания).")
+        steps.append("Подтвердите источник по журналам до решения об ограничении доступа; решение и выполнение остаются за человеком.")
     if lyapunov_remap_pressure > 0.0:
-        actions.append("monitor_positive_lyapunov_drift_after_remap")
-    if "power_attack" in predicted_attack:
-        actions.extend(["check_power_domain", "prefer_nodes_with_energy_reserve"])
-    if "ddos" in predicted_attack or "dos" in predicted_attack:
-        actions.extend(["rate_limit_attack_traffic", "isolate_flood_ingress"])
-    if "ddos" in predicted_attack:
-        actions.extend(
-            [
-                "request_upstream_flowspec_or_scrubbing",
-                "prepare_rtbh_only_as_last_resort",
-            ]
-        )
-    if "syn_flood" in predicted_attack:
-        actions.extend(["enable_syn_protection", "protect_endpoint_queue"])
-    if "brute_force" in predicted_attack:
-        actions.extend(
-            [
-                "enforce_account_lockout_policy",
-                "require_multi_factor_authentication",
-                "review_failed_authentication_events",
-            ]
-        )
-    entities = _forecast_entities(attack_state)
-    defense_plan = None
-    # В predictive-demo одно измерение ещё не исполняет сетевое действие:
-    # план разрешается только после подтверждения сенсора двумя отсчётами.
-    # Уже активное воздействие, напротив, требует немедленной реакции.
-    if defense_authorized and (entities["attack_ids"] or entities["target_ids"]):
-        defense_plan = _defense_plan(
-            step_index=step_index,
-            step_seconds=step_seconds,
-            entities=entities,
-            actions=actions,
-            risk=decision_pressure,
-            valid_from_step=valid_from_step,
-            valid_until_step=valid_until_step,
-        )
+        steps.append("Проверьте рост отклонения состояния по Ляпунову на следующих наблюдениях.")
     return {
-        "decision": "prepare_or_remap",
-        "decision_pressure": round(decision_pressure, 6),
-        "candidate_actions": sorted(set(actions)),
-        "defense_plan": defense_plan,
-        "sla_restoration_plan": restoration,
+        "decision": "review_threat" if warning_confirmed else "observe",
+        "decision_pressure": round(max(risk, lyapunov_remap_pressure), 6),
+        "execution_mode": "human_only",
+        "requires_human_action": warning_confirmed,
+        "steps_ru": steps,
+        "sla_priority_order": ["gold", "silver", "bronze"],
+        "sla_observation": _sla_restoration_plan(attack_state),
     }
 
 
@@ -1730,101 +1590,6 @@ def _forecast_entities(attack_state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _defense_plan(
-    *,
-    step_index: int,
-    step_seconds: int,
-    entities: dict[str, Any],
-    actions: list[str],
-    risk: float,
-    valid_from_step: int,
-    valid_until_step: int,
-) -> dict[str, Any]:
-    identity = "|".join([
-        *entities["attack_ids"], *entities["target_ids"],
-        *entities["attack_kinds"], *entities.get("source_ids", []),
-    ])
-    digest = hashlib.sha1(identity.encode("utf-8")).hexdigest()[:10]
-    kinds = set(entities["attack_kinds"])
-    mitigation_controls: list[str] = []
-    attack_confirmed = bool(entities["attack_ids"])
-    if kinds & {"dos", "ddos"}:
-        mitigation_controls.append("ingress_acl_or_policer")
-        mitigation_controls.append(
-            "source_quarantine" if attack_confirmed else "observe_source_before_quarantine"
-        )
-    if "ddos" in kinds:
-        mitigation_controls.extend(["upstream_flowspec", "scrubbing_center", "rtbh_last_resort"])
-    if "syn_flood" in kinds:
-        mitigation_controls.extend(["syn_proxy", "syn_cookies", "connection_rate_limit"])
-    if "power_attack" in kinds:
-        mitigation_controls.extend(["revoke_management_session", "transfer_to_independent_power_domain"])
-    if "brute_force" in kinds:
-        mitigation_controls.extend(
-            [
-                "account_lockout_policy",
-                "multi_factor_authentication",
-                "conditional_access",
-            ]
-        )
-    routing_control = {
-        "valid_from_step": valid_from_step,
-        "valid_until_step": max(valid_from_step, valid_until_step),
-        "target_ids": list(entities["target_ids"]),
-        "attack_kinds": list(entities["attack_kinds"]),
-        "source_ids": list(entities.get("source_ids", [])),
-        "quarantine_sources": (
-            list(entities.get("source_ids", []))
-            if attack_confirmed and kinds & {"dos", "ddos", "syn_flood"}
-            else []
-        ),
-        "protection_stage": (
-            "confirmed_active_mitigation" if attack_confirmed else "predictive_prestage"
-        ),
-        "source_quarantine_policy": (
-            "active_event_or_explicit_confirmed_plan_only"
-        ),
-        "entity_records": list(entities.get("entity_records", [])),
-        "maximum_projected_utilization_percent": 80.0,
-        "sla_order": ["gold", "silver", "bronze"],
-        "actions": [
-            "reroute_around_network_target",
-            "failover_service_to_standby",
-            "protect_endpoint_with_acl_or_syn_proxy",
-            *(
-                ["quarantine_observed_attack_sources"]
-                if kinds & {"dos", "ddos", "syn_flood"}
-                else []
-            ),
-        ],
-        "mitigation_controls": mitigation_controls,
-        "ddos_routing_semantics": (
-            "local_reroute_handles_failed_node_or_server; upstream_controls_handle_external_link_saturation"
-        ),
-    }
-    return {
-        "plan_id": f"KOOPMAN-{valid_from_step}-{digest}",
-        "created_at_step": step_index,
-        # Старый ключ оставлен: потребитель, понимающий только один шаг,
-        # применит защиту в начале нового прогнозного окна.
-        "valid_for_step": valid_from_step,
-        "valid_from_step": valid_from_step,
-        "valid_until_step": max(valid_from_step, valid_until_step),
-        "horizon_seconds": max(1, valid_until_step - step_index) * step_seconds,
-        "forecast_risk_score": round(risk, 6),
-        "probability_is_calibrated": False,
-        # Совместимый alias, оставленный для старой схемы артефактов.
-        "forecast_probability": round(risk, 6),
-        **entities,
-        "actions": sorted(set(actions)),
-        "sla_priority_order": ["gold", "silver", "bronze"],
-        "critical_node_max_utilization_percent": 80.0,
-        "admission_policy": "protect_gold_then_restore_silver_then_bronze",
-        "routing_control": routing_control,
-        "effectiveness_origin": "scenario_assumption",
-    }
-
-
 def _sla_restoration_plan(attack_state: dict[str, Any]) -> dict[str, Any]:
     current_tiers = {
         item.get("sla_grade"): item
@@ -1832,9 +1597,9 @@ def _sla_restoration_plan(attack_state: dict[str, Any]) -> dict[str, Any]:
     }
     tiers = []
     actions = {
-        "gold": "reserve_capacity_and_restore_first",
-        "silver": "restore_after_gold_is_stable",
-        "bronze": "best_effort_after_higher_priorities",
+        "gold": "review_gold_first",
+        "silver": "review_silver_after_gold",
+        "bronze": "review_bronze_after_higher_priorities",
     }
     for priority, grade in enumerate(("gold", "silver", "bronze"), start=1):
         current = current_tiers.get(grade, {})
@@ -1848,7 +1613,7 @@ def _sla_restoration_plan(attack_state: dict[str, Any]) -> dict[str, Any]:
             }
         )
     return {
-        "policy": "strict_priority_non_preemptive_with_gold_reservation",
+        "policy": "human_review_in_sla_priority_order",
         "order": ["gold", "silver", "bronze"],
         "tiers": tiers,
     }

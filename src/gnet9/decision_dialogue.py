@@ -16,7 +16,7 @@ def build_algorithm_dialogue(dynamics: dict[str, Any]) -> dict[str, Any]:
     for snapshot in dynamics.get("snapshots", []):
         analysis = snapshot.get("arbitrator", {}).get("analysis", {})
         koopman = snapshot.get("koopman", {})
-        remap = snapshot.get("arbitrator", {}).get("remap", {})
+        recommendation = snapshot.get("arbitrator", {}).get("recommendation", {})
         game = snapshot.get("arbitrator", {}).get("game_theory", {})
         hierarchy = snapshot.get("arbitrator", {}).get("critical_node_hierarchy", [])
         state_hausdorff = analysis.get("state_hausdorff", {})
@@ -28,8 +28,6 @@ def build_algorithm_dialogue(dynamics: dict[str, Any]) -> dict[str, Any]:
         card = snapshot.get("arbitrator", {}).get("trigger_card", {})
         training = snapshot.get("training", {})
         kalman = koopman.get("kalman_filter", {})
-        routing = snapshot.get("attacks", {}).get("routing", {})
-        executed = routing.get("actions", [])
         tiers = snapshot.get("attacks", {}).get("sla_restoration", {}).get("tiers", [])
         turns = [
             {
@@ -51,7 +49,7 @@ def build_algorithm_dialogue(dynamics: dict[str, Any]) -> dict[str, Any]:
                     "normalized_distance": normalized_hausdorff,
                 },
                 "message_ru": (
-                    "Отклонение от исходного состояния небольшое; менять маршруты по этой причине не требуется."
+                    "Отклонение от исходного состояния небольшое; продолжайте наблюдение."
                     if normalized_hausdorff < TRIGGER_BANDS["hausdorff"][0]
                     else "Отклонение от исходного состояния выросло; при выборе защиты учитываются и остальные наблюдения."
                 ),
@@ -105,26 +103,14 @@ def build_algorithm_dialogue(dynamics: dict[str, Any]) -> dict[str, Any]:
                     "attacker_payoff": selected.get("attacker_payoff"),
                 },
                 "message_ru": (
-                    f"Предложение арбитра: {ACTION_DISPLAY_NAMES.get(remap.get('action', 'NO_REMAP'), 'неизвестное действие')}; "
-                    f"сравнение вариантов рекомендует: {ACTION_DISPLAY_NAMES.get(game.get('recommended_action', 'NO_REMAP'), 'неизвестное действие')}."
+                    f"Рекомендация человеку: {ACTION_DISPLAY_NAMES.get(recommendation.get('action', 'OBSERVE'), 'неизвестное действие')}; "
+                    f"сравнение вариантов рекомендует: {ACTION_DISPLAY_NAMES.get(game.get('recommended_action', 'OBSERVE'), 'неизвестное действие')}."
                 ),
             },
             {
-                "algorithm": "Фактическое исполнение и качество услуг",
-                "evidence": {"actions": executed, "sla_tiers": tiers,
-                    "maximum_admitted_route_utilization_percent": routing.get("maximum_admitted_route_utilization_percent")},
-                "message_ru": (
-                    f"В текущем снимке записано действий над потоками: {len(executed)}. "
-                    "Качество услуг проверено по сохранённым результатам каждого класса."
-                    if tiers else "Данных о выполнении SLA в текущем снимке нет."
-                ),
-            },
-            {
-                "algorithm": "План управления сетью",
-                "evidence": remap.get("sdn_intent", {}),
-                "message_ru": (
-                    "План описывает временные изменения внутри модели. Команды реальному оборудованию не отправляются."
-                ),
+                "algorithm": "Рекомендации человеку и качество услуг",
+                "evidence": {"recommendation": recommendation, "sla_tiers": tiers},
+                "message_ru": " ".join(recommendation.get("steps_ru", [])) or "Рекомендаций нет.",
             },
         ]
         records.append(
@@ -150,7 +136,7 @@ def export_algorithm_dialogue(dynamics: dict[str, Any], json_path: Path, markdow
     """Сохранить пояснения как данные и как текст для чтения."""
     dialogue = build_algorithm_dialogue(dynamics)
     json_path.write_text(json.dumps(dialogue, ensure_ascii=False, indent=2), encoding="utf-8")
-    lines = ["# Как GNet9 выбирает защиту", "", dialogue["semantics_ru"], ""]
+    lines = ["# Как GNet9 прогнозирует угрозу и рекомендует меры", "", dialogue["semantics_ru"], ""]
     for record in dialogue["records"]:
         lines.extend(
             [

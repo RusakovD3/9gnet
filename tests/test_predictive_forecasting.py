@@ -30,7 +30,6 @@ from src.gnet9.metrics import (
     state_tensor_hausdorff_view,
 )
 from src.gnet9.packet_simulator import simulate_packet_snapshot
-from src.gnet9.remapping import apply_gold_first_remap
 from src.gnet9.routing import path_uses_only_data_plane_transit
 from src.gnet9.topology_builder import GNetBaselineBuilder
 
@@ -74,18 +73,21 @@ def test_predictive_catalog_is_weighted_reproducible_and_uses_l1_sources() -> No
     second = attack_catalog(MODEL, "predictive-demo", **kwargs)
     assert first == second
     # Вейбулловский renewal-процесс имеет переменное число приходов в конечном
-    # окне. Для seed=42 первые четыре позиции специально покрывают все виды.
+    # окне. Для seed=42 первые семь позиций покрывают все виды.
     assert 1 <= len(first) <= 9
     assert Counter(item["kind"] for item in first) == {
-        "dos": 1, "ddos": 2, "syn_flood": 2, "power_attack": 1, "brute_force": 1,
+        "dos": 1, "ddos": 1, "syn_flood": 1, "power_attack": 1, "brute_force": 1,
+        "dns_flood": 1, "application_flood": 1,
     }
     assert {item["scenario_weight_origin"] for item in first} == {"scenario_assumption"}
     assert sum(item["scenario_weight"] for item in first) == pytest.approx(1.0)
     assert {item["scenario_weight_semantics"] for item in first} == {"realized_event_mass"}
     assert {item["kind"]: item["kind_weight"] for item in first} == {
         "dos": 3 / 9,
-        "ddos": 2 / 9,
-        "syn_flood": 2 / 9,
+        "ddos": 1 / 9,
+        "syn_flood": 1 / 9,
+        "dns_flood": 1 / 9,
+        "application_flood": 1 / 9,
         "power_attack": 1 / 9,
         "brute_force": 1 / 9,
     }
@@ -110,6 +112,8 @@ def test_predictive_catalog_is_weighted_reproducible_and_uses_l1_sources() -> No
         "dos": "T1498.001",
         "ddos": "T1498.002",
         "syn_flood": "T1499.001",
+        "dns_flood": "T1499.002",
+        "application_flood": "T1499.003",
         "power_attack": "T0831",
         "brute_force": "T1110.001",
     }
@@ -243,7 +247,6 @@ def test_predictive_demo_warns_before_attack_without_false_warning() -> None:
     assert evaluation["minimum_observed_lead_seconds"] >= 18
     assert evaluation["maximum_observed_lead_seconds"] <= 20
     assert evaluation["false_positive_warning_count"] == 0
-    assert evaluation["preventive_defense_applied_count"] == expected_attack_count
     assert evaluation["forecast_horizon_seconds"] == 20
     assert evaluation["prediction_precision"] == 1.0
     assert evaluation["prediction_recall"] == 1.0
@@ -262,21 +265,11 @@ def test_predictive_demo_warns_before_attack_without_false_warning() -> None:
     assert dynamics["snapshots"][0]["koopman"]["prediction_slo_seconds"] == 10
     assert dynamics["snapshots"][0]["koopman"]["prediction_slo_forecast_seconds"] == 10
     resilience = dynamics["resilience_evaluation"]
-    assert resilience["status"] == "RESILIENT_GOLD_CONTINUITY_AND_RECOVERY"
-    assert resilience["final_state_recovered"] is True
-    assert resilience["minimum_sla_compliance_ratio"]["gold"] == 1.0
-    assert resilience["episodes"][0]["recovered_step"] is not None
-    assert resilience["episodes"][0]["recovery_status"] == (
-        "recovered_before_next_attack_or_end"
-    )
-    assert resilience["episodes"][1]["recovery_status"] == (
-        "recovered_before_next_attack_or_end"
-    )
+    assert resilience["minimum_sla_compliance_ratio"]["gold"] < 1.0
+    # Без автоматической защиты ущерб наблюдается на исходных маршрутах.
     final_koopman = dynamics["snapshots"][-1]["koopman"]
     final_attacks = dynamics["snapshots"][-1]["attacks"]
     assert final_attacks["legitimate_delivery_ratio"] == 1.0
-    assert final_attacks["routing"]["plan_active"] is False
-    assert final_attacks["routing"]["isolated_flow_count"] == 0
     assert final_koopman["forecast_is_early_warning"] is False
     # При меньшем числе приходов в окне у контура остаётся время завершить
     # cooldown; это более сильная проверка полного восстановления.
@@ -336,19 +329,6 @@ def test_predictive_simulation_rejects_a_window_shorter_than_its_precursor() -> 
                 attack_scenario="predictive-demo",
             ),
         )
-
-
-def test_representative_overlapping_failures_preserve_gold_and_release_overlay() -> None:
-    # seed=41 stresses overlapping server failures; seed=48 simultaneously
-    # affects the access segment of one mobile Gold group.
-    for seed in (41, 48):
-        dynamics = _seeded_predictive_dynamics(seed)
-        resilience = dynamics["resilience_evaluation"]
-        assert resilience["minimum_sla_compliance_ratio"]["gold"] >= 0.95
-        assert resilience["final_state_recovered"] is True
-        final_attacks = dynamics["snapshots"][-1]["attacks"]
-        assert final_attacks["legitimate_delivery_ratio"] == 1.0
-        assert final_attacks["routing"]["plan_active"] is False
 
 
 def test_observed_tensor_overlay_reacts_without_mutating_t0_graph() -> None:
@@ -538,90 +518,6 @@ def test_koopman_snapshot_uses_one_frozen_operator_revision() -> None:
     assert next_step["lyapunov_basis_rebased_after_operator_update"] is True
 
 
-def test_gold_first_overlay_reroutes_fails_over_and_respects_capacity() -> None:
-    dynamics = _predictive_dynamics()
-    active = [snapshot for snapshot in dynamics["snapshots"] if snapshot["attacks"]["active"]]
-    assert active
-    assert all(
-        snapshot["attacks"]["routing"]["maximum_projected_utilization_percent"] <= 80.0
-        for snapshot in active
-    )
-    assert any(snapshot["attacks"]["routing"]["rerouted_flow_count"] > 0 for snapshot in active)
-    assert any(snapshot["attacks"]["routing"]["failover_flow_count"] > 0 for snapshot in active)
-    assert any(
-        snapshot["attacks"]["routing"]["gold_route_hausdorff"]["normalized_distance"] > 0.0
-        for snapshot in active
-    )
-
-    for snapshot in active:
-        routing = snapshot["attacks"]["routing"]
-        for flow in snapshot["traffic"]["flows"]:
-            if flow.get("is_attack_traffic") or flow.get("isolated"):
-                continue
-            assert path_uses_only_data_plane_transit(MODEL, flow.get("route", []))
-            assert path_uses_only_data_plane_transit(MODEL, flow.get("reverse_route", []))
-        for event in snapshot["attacks"]["events"]:
-            assert all(
-                path_uses_only_data_plane_transit(MODEL, route)
-                for route in event.get("request_routes", [])
-                + event.get("response_routes", [])
-            )
-            target = event["target_id"]
-            role = MODEL.graph.nodes[target].get("role")
-            if role not in {"core-router", "aggregation-switch"}:
-                continue
-            if event.get("power_runtime", {}).get("ride_through_active"):
-                # Просадка, удержанная ИБП, наблюдается, но узел не считается
-                # отказавшим и не обязан исчезать из активного маршрута.
-                continue
-            rerouted = [
-                flow for flow in snapshot["traffic"]["flows"]
-                if not flow.get("is_attack_traffic")
-                and target in flow.get("original_route", [])
-                and flow.get("rerouted")
-            ]
-            assert all(target not in flow["route"] for flow in rerouted)
-
-
-def test_predictive_prestage_never_quarantines_unconfirmed_subscriber_source() -> None:
-    dynamics = _predictive_dynamics()
-    prestaged = [
-        snapshot
-        for snapshot in dynamics["snapshots"]
-        if snapshot["attacks"]["routing"].get("plan_active")
-        and snapshot["attacks"]["routing"].get("protection_stage") == "predictive_prestage"
-        and snapshot["koopman"].get("forecast_is_early_warning")
-        and not snapshot["attacks"].get("active")
-    ]
-    assert prestaged
-    assert all(
-        not snapshot["attacks"]["routing"]["quarantine_sources"]
-        for snapshot in prestaged
-    )
-    assert all(
-        snapshot["attacks"]["routing"]["protection_stage"] == "predictive_prestage"
-        for snapshot in prestaged
-    )
-    assert all(
-        not any(
-            flow.get("routing_action") == "quarantine_attack_source"
-            for flow in snapshot["traffic"]["flows"]
-        )
-        for snapshot in prestaged
-    )
-
-
-def test_observed_attack_marks_active_mitigation_even_for_prepared_plan() -> None:
-    dynamics = _predictive_dynamics()
-    active = [snapshot for snapshot in dynamics["snapshots"] if snapshot["attacks"]["active"]]
-    assert active
-    assert all(
-        snapshot["attacks"]["routing"]["protection_stage"]
-        == "confirmed_active_mitigation"
-        for snapshot in active
-    )
-
-
 def test_power_brownout_ride_through_does_not_manufacture_an_outage() -> None:
     dynamics = _predictive_dynamics()
     snapshot = next(
@@ -638,10 +534,6 @@ def test_power_brownout_ride_through_does_not_manufacture_an_outage() -> None:
         and MODEL.graph.nodes[event["target_id"]].get("role") == "aggregation-switch"
     )
     target = event["target_id"]
-    routing = snapshot["attacks"]["routing"]
-    assert routing["by_sla"]["gold"]["availability_ratio"] == 1.0
-    assert target in routing["service_transparent_power_targets"]
-    assert target not in routing["avoid_nodes"]
     runtime = next(
         item for item in snapshot["attacks"]["power_runtime_state"]
         if item["target_id"] == target
@@ -654,44 +546,6 @@ def test_power_brownout_ride_through_does_not_manufacture_an_outage() -> None:
     )
     assert observation["estimated_availability_ratio"] == 1.0
     assert observation["estimated_power_availability_ratio"] == 1.0
-
-
-def test_endpoint_syn_victim_stays_online_while_attackers_are_quarantined() -> None:
-    dynamics = _predictive_dynamics()
-    snapshot = next(
-        item for item in dynamics["snapshots"]
-        if any(
-            event["kind"] == "syn_flood"
-            and MODEL.graph.nodes[event["target_id"]].get("level") == "L1"
-            for event in item["attacks"]["events"]
-        )
-    )
-    event = next(
-        event for event in snapshot["attacks"]["events"]
-        if event["kind"] == "syn_flood" and MODEL.graph.nodes[event["target_id"]].get("level") == "L1"
-    )
-    victim = next(
-        flow for flow in snapshot["traffic"]["flows"]
-        if flow.get("client_node") == event["target_id"] and not flow.get("is_attack_traffic")
-    )
-    assert victim["endpoint_protected"] is True
-    assert victim["isolated"] is False
-    assert set(event["ingress_nodes"]).issubset(snapshot["attacks"]["routing"]["quarantine_sources"])
-    quarantined_normal_flows = [
-        flow
-        for flow in snapshot["traffic"]["flows"]
-        if not flow.get("is_attack_traffic")
-        and flow.get("client_node") in event["ingress_nodes"]
-    ]
-    assert quarantined_normal_flows
-    assert all(flow["isolated"] for flow in quarantined_normal_flows)
-    assert all(
-        flow["security_excluded_from_sla_accounting"]
-        for flow in quarantined_normal_flows
-    )
-    assert snapshot["attacks"]["security_excluded_flow_count"] >= len(
-        quarantined_normal_flows
-    )
 
 
 def test_transport_connectivity_and_single_subscriber_access_are_explicit() -> None:
@@ -748,132 +602,6 @@ def test_transport_connectivity_and_single_subscriber_access_are_explicit() -> N
     assert ideal["minimum_access_uplink_count"] >= 2
 
 
-def test_t0_uses_home_access_and_access_failure_isolated_without_subscriber_reserve() -> None:
-    baseline_flows = [
-        flow for flow in _predictive_dynamics()["snapshots"][0]["traffic"]["flows"]
-        if flow.get("sla_grade") == "gold" and not flow.get("is_attack_traffic")
-    ]
-    assert baseline_flows
-    for flow in baseline_flows:
-        client = flow["client_node"]
-        route = flow["route"]
-        access = route[1] if route[0] == client else route[-2]
-        assert access == MODEL.graph.nodes[client]["home_access"]
-
-    original = next(flow for flow in baseline_flows if flow["client_node"] == "M3_01")
-    remapped, summary = apply_gold_first_remap(
-        MODEL,
-        [original],
-        [],
-        {
-            "valid_for_step": 1,
-            "routing_control": {
-                "valid_for_step": 1,
-                    "avoid_nodes": ["RAN5"],
-                "maximum_projected_utilization_percent": 80.0,
-            },
-        },
-        step_index=1,
-    )
-    recovered = remapped[0]
-    assert summary["isolated_flow_count"] == 1
-    assert recovered["active_access_node"] == "RAN5"
-    assert recovered["active_access_role"] == "primary"
-    assert recovered["routing_action"] == "isolate_no_safe_route"
-
-
-def test_server_failover_admission_checks_cpu_ram_sessions_without_mutating_t0() -> None:
-    original = next(
-        flow
-        for flow in _predictive_dynamics()["snapshots"][0]["traffic"]["flows"]
-        if flow.get("sla_grade") == "gold"
-        and not flow.get("is_attack_traffic")
-        and MODEL.graph.nodes[flow["service_node"]].get("standby_hosts")
-    )
-    model = deepcopy(MODEL)
-    service = original["service_node"]
-    primary = original["server_node"]
-    first_standby, second_standby, *_ = model.graph.nodes[service]["standby_hosts"]
-
-    # Первый кандидат имеет меньше одного процента safe-headroom. Перенос даже
-    # одной сессии должен пересечь все три 80-процентные границы, после чего
-    # remapper обязан проверить следующий standby.
-    overloaded_runtime = model.graph.nodes[first_standby]["runtime"]
-    overloaded_runtime.update({
-        "cpu_util_percent": 79.95,
-        "ram_util_percent": 79.95,
-        "network_util_percent": 79.95,
-    })
-    runtime_before = deepcopy(overloaded_runtime)
-    remapped, summary = apply_gold_first_remap(
-        model,
-        [original],
-        [],
-        {
-            "target_ids": [primary],
-            "attack_kinds": ["power_attack"],
-            "valid_for_step": 1,
-            "routing_control": {
-                "target_ids": [primary],
-                "attack_kinds": ["power_attack"],
-                "valid_for_step": 1,
-            },
-        },
-        step_index=1,
-    )
-
-    assert remapped[0]["server_node"] == second_standby
-    assert remapped[0]["failover_active"] is True
-    assert summary["server_resource_rejected_candidate_count"] == 1
-    assert summary["server_resource_rejection_reasons"] == {
-        "cpu_above_80_percent": 1,
-        "ram_above_80_percent": 1,
-        "sessions_above_80_percent": 1,
-    }
-    assert summary["maximum_projected_server_resource_utilization_percent"] <= 80.0
-    resources = {
-        item["server_id"]: item for item in summary["projected_server_resources"]
-    }
-    assert resources[first_standby]["transferred_flow_count"] == 0
-    assert resources[second_standby]["transferred_flow_count"] == 1
-    assert summary["server_resource_admission_semantics"]["mutation"].startswith(
-        "local_overlay_only"
-    )
-    assert model.graph.nodes[first_standby]["runtime"] == runtime_before
-
-
-def test_server_resource_summary_exports_baseline_headroom_when_plan_is_inactive() -> None:
-    _, summary = apply_gold_first_remap(
-        MODEL,
-        [],
-        [],
-        None,
-        step_index=0,
-    )
-    assert len(summary["projected_server_resources"]) == 4
-    assert summary["server_resource_rejected_candidate_count"] == 0
-    assert summary["network_capacity_rejected_candidate_count"] == 0
-    assert summary["maximum_projected_server_cpu_utilization_percent"] == 22.0
-    assert summary["maximum_projected_server_ram_utilization_percent"] == 38.0
-    assert 0.0 < summary["maximum_projected_server_session_utilization_percent"] < 80.0
-    assert summary["maximum_projected_utilization_percent"] == 38.0
-
-    traffic = simulate_packet_snapshot(
-        MODEL,
-        step_index=0,
-        time_seconds=0,
-        step_seconds=2,
-        detail="summary",
-    )
-    exported = traffic["attack_state"]["routing"]
-    assert exported["maximum_projected_server_resource_utilization_percent"] == 38.0
-    assert exported["maximum_projected_utilization_percent"] == 38.0
-    assert exported["maximum_projected_network_utilization_percent"] == max(
-        exported["maximum_projected_edge_utilization_percent"],
-        exported["maximum_projected_node_utilization_percent"],
-    )
-
-
 def test_lyapunov_and_koopman_react_to_controlled_configuration() -> None:
     dynamics = _predictive_dynamics()
     snapshots = dynamics["snapshots"]
@@ -886,15 +614,8 @@ def test_lyapunov_and_koopman_react_to_controlled_configuration() -> None:
         >= snapshot["koopman"]["lyapunov_remap_pressure"]
         for snapshot in snapshots
     )
-    assert any(
-        snapshot["attacks"]["routing"]["route_change_ratio"] > 0.0
-        and snapshot["koopman"]["reference_distance"] > 0.0
-        for snapshot in snapshots[1:]
-    )
-    assert snapshots[0]["koopman"]["lyapunov_solver"]["residual_frobenius"] < 1e-6
-    assert snapshots[0]["koopman"]["lyapunov_solver"]["iterations"] <= 32
-    assert snapshots[0]["attacks"]["routing"]["gold_route_hausdorff"]["normalized_distance"] == 0.0
-    route_metric = snapshots[0]["attacks"]["routing"]["gold_route_hausdorff"]
+    assert all(snapshot["attacks"]["route_observation"]["normalized_distance"] == 0.0 for snapshot in snapshots)
+    route_metric = snapshots[0]["attacks"]["route_observation"]
     assert route_metric["maximum_edge_jaccard_distance"] == 0.0
     assert route_metric["maximum_latency_stretch_ratio"] == 1.0
     assert route_metric["normalization_scale_ms"] > 0.0

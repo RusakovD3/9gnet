@@ -266,7 +266,7 @@ def test_stationary_dynamics_snapshots_every_five_seconds() -> None:
     assert dynamics["ideal_t0"]["metrics"]["service_standby_cross_power_domain_count"] == 18
     assert dynamics["ideal_t0"]["metrics"]["local_power_fault_domain_count"] == L2_NODE_COUNT + 4
     assert dynamics["ideal_t0"]["metrics"]["minimum_link_stability_margin"] >= 0.88
-    assert dynamics["ideal_t0"]["metrics"]["l7_decision"] == "NO_REMAP"
+    assert dynamics["ideal_t0"]["metrics"]["l7_decision"] == "OBSERVE"
     assert [snapshot["time_seconds"] for snapshot in snapshots] == list(range(0, 51, 5))
     assert len(snapshots[0]["nodes"]) == MODEL.graph.number_of_nodes()
     assert len(snapshots[0]["edges"]) == MODEL.graph.number_of_edges()
@@ -348,8 +348,8 @@ def test_arbitrator_observes_tensor_state_and_keeps_no_remap_baseline() -> None:
     assert "stability_margin" in arbitrator["level_metric_aggregates"]["EDGE"]["metrics"]
     assert arbitrator["state_vector"] == snapshot["state_vector"]
     assert arbitrator["analysis"]["remap_pressure"] == 0.0
-    assert arbitrator["remap"]["needed"] is False
-    assert arbitrator["remap"]["action"] == "NO_REMAP"
+    assert arbitrator["recommendation"]["requires_human_action"] is False
+    assert arbitrator["recommendation"]["action"] == "OBSERVE"
 
 
 def test_packet_sample_limit_is_configurable() -> None:
