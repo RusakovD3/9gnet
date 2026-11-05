@@ -118,7 +118,7 @@ def test_tensor_filter_preserves_damage_and_ignores_future_metadata():
         tensor_filter = analyzer.tensor_filters["L2"]
         assert tensor_filter.state[0] < 1.
         assert tensor_filter.state[1] == .2
-    assert first.state_history == pytest.approx(second.state_history)
+    assert np.asarray(first.state_history) == pytest.approx(np.asarray(second.state_history))
     before = first.tensor_filters["L2"].state.copy()
     report = first.analyze_step(model, state, tensor_matrices=changed,
         attack_state={"events": [{"kind": "dos"}]}, step_index=2, time_seconds=4)
