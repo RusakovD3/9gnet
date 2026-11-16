@@ -9,6 +9,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from .attacks import MITRE_TACTICS_BY_TECHNIQUE
 from .constants import ATTACK_KIND_DISPLAY_NAMES
 
 
@@ -16,6 +17,7 @@ ATTACK_COLORS = {
     "dos": "#ef4444", "ddos": "#fb7185", "syn_flood": "#f472b6",
     "dns_flood": "#a78bfa", "application_flood": "#fb923c",
     "brute_force": "#22d3ee", "power_attack": "#facc15",
+    "dhcp_flood": "#2dd4bf",
 }
 KIND_LABELS = {
     "dos": "DoS · перегрузка", "ddos": "DDoS · распределённая перегрузка",
@@ -77,6 +79,17 @@ def build_security_dashboard(snapshots: list[dict[str, Any]], step_index: int) -
                 precursor["first_seen_seconds"] if precursor else now
             )
             alarm["last_seen_seconds"] = now
+            related = previous or precursor or {}
+            history = list(related.get("observation_history", []))
+            if not history or history[-1]["phase"] != alarm["phase"]:
+                history.append({"phase": alarm["phase"], "time_seconds": now})
+            alarm["observation_history"] = history
+            alarm["mitre_technique_candidates"] = sorted(set(alarm["mitre_technique_candidates"])
+                                                        | set(related.get("mitre_technique_candidates", [])))
+            techniques = alarm["mitre_technique_ids"] or alarm["mitre_technique_candidates"]
+            alarm["mitre_tactic_ids"] = sorted({MITRE_TACTICS_BY_TECHNIQUE[item]
+                                               for item in techniques
+                                               if item in MITRE_TACTICS_BY_TECHNIQUE})
             alarm["_precursor_seen"] = bool(
                 alarm["phase"] == "precursor" or precursor or
                 previous and previous.get("_precursor_seen")
@@ -149,6 +162,8 @@ def _base_alarm(key, target, kind, phase, severity, sources, routes, evidence, i
         "color": ATTACK_COLORS.get(kind, "#cbd5e1"), "severity": severity,
         "phase": phase, "source_ids": sorted(set(map(str, sources))),
         "routes": [list(route) for route in routes if len(route) >= 2],
+        "mitre_technique_ids": [],
+        "mitre_technique_candidates": [],
         "evidence_lines": evidence, "_impact_lines": impact, "_delivery_seen": False,
     }
 
@@ -158,6 +173,8 @@ def _snapshot_alarms(snapshot):
     koopman = snapshot.get("koopman", {})
     severity = _severity(snapshot)
     observations = attacks.get("target_observations", [])
+    matches = {(item.get("target_id"), item.get("kind")): item
+               for item in koopman.get("signature_entity_records", [])}
     result = []
     event_pairs = set()
     for index, event in enumerate(attacks.get("events", [])):
@@ -172,6 +189,10 @@ def _snapshot_alarms(snapshot):
         if observation.get("target_id") != target:
             observation = {}
         evidence, impact = _event_evidence(event, observation)
+        numeric_record = matches.get((target, kind), {})
+        match = numeric_record.get("feature_match")
+        if match:
+            evidence.append(f"Совпадение с числовой строкой стенда: {match['margin_ratio']:g} от порога.")
         sources = event.get("ingress_nodes", [])
         if kind == "ddos" and event.get("external_response_ingress_nodes"):
             # У отражения инициаторы запросов и входящие ответы — разные
@@ -185,11 +206,16 @@ def _snapshot_alarms(snapshot):
             event.get("routes", []) if kind in FLOOD_KINDS and phase == "active" else [],
             evidence, impact,
         )
+        if event.get("attack_label_ru"):
+            alarm["kind_label"] = event["attack_label_ru"]
         alarm["_delivery_seen"] = bool(
             phase == "active" and kind in FLOOD_KINDS and alarm["routes"] and
             (float(event.get("effective_packet_rate_pps", 0)) > 0 or
              float(event.get("effective_offered_rate_mbps", 0)) > 0)
         )
+        if event.get("mitre_technique_id"):
+            alarm["mitre_technique_ids"] = [event["mitre_technique_id"]]
+        alarm["mitre_technique_candidates"] = numeric_record.get("mitre_technique_candidates", [])
         result.append(alarm)
     classified = {}
     for record in koopman.get("forecast_entity_records", []):
@@ -217,10 +243,14 @@ def _snapshot_alarms(snapshot):
                 evidence.append("Сохранено раннее предупреждение; исходные показания отсутствуют.")
             else:
                 evidence.extend(_precursor_evidence(items))
-            result.append(_base_alarm(
+            alarm = _base_alarm(
                 _sensor_key(target, kind), target, kind, "precursor", severity,
                 sources, [], evidence, [],
-            ))
+            )
+            alarm["mitre_technique_candidates"] = record.get("mitre_technique_candidates", [])
+            if record.get("attack_label_ru"):
+                alarm["kind_label"] = record["attack_label_ru"]
+            result.append(alarm)
     return result
 
 
@@ -244,6 +274,19 @@ def _precursor_evidence(items):
 
 def _event_evidence(event, observation):
     evidence, impact = [], []
+    signals = event.get("sensor_signals", {})
+    for field, label, units in (
+        ("dhcp_service_pressure_ratio", "Нагрузка службы DHCP", "доля"),
+        ("invalid_prefix_origin_count", "Несоответствия происхождения префикса", "событ."),
+        ("unexpected_privilege_transition_count", "Неожиданные переходы привилегий", "событ."),
+        ("distinct_probed_services_count", "Разные службы в журнале обращений", "служб"),
+        ("user_launched_process_count", "Запуски по действию пользователя", "событ."),
+        ("endpoint_cpu_rise_ratio", "Рост загрузки CPU", "доля"),
+        ("unusual_egress_bytes_per_second", "Аномальная исходящая передача", "байт/с"),
+        ("mobile_link_failure_ratio", "Сбой доступности мобильной линии", "доля"),
+    ):
+        if field in signals:
+            evidence.append(f"{label}: {signals[field]:g} {units}")
     if event.get("kind") == "ddos" and event.get("external_response_ingress_nodes"):
         evidence.append("Вход отражённых ответов: " + ", ".join(event["external_response_ingress_nodes"]))
         evidence.append("Инициаторы исходящих запросов: " + (", ".join(event.get("ingress_nodes", [])) or "не сохранены"))
@@ -291,7 +334,8 @@ def _local_chain(alarm):
             "current" if alarm["_impact_lines"] and not historical else "observed" if impact else "unknown"
         ), "detail": "Есть расчёт снижения доступности цели" if impact else "Отдельный ущерб не подтверждён"},
         {"key": "verification", "label": "Проверка", "status": "unknown",
-         "detail": "Устранение требует подтверждения человеком"},
+         "detail": ("Восстановление наблюдается; устранение требует проверки"
+                    if alarm["phase"] == "recovery" else "Устранение требует подтверждения человеком")},
     ]
 
 

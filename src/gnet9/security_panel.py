@@ -139,7 +139,11 @@ class SecurityPanel:
         if len(alarm["source_ids"]) > 4:
             source += f" и ещё {len(alarm['source_ids']) - 4}"
         ax.text(.03, .82, f"{source} → {alarm['target_id']}", color=color, fontsize=10, va="top")
-        ax.text(.03, .73, f"Наблюдения: {alarm['first_seen_seconds']:g}…{alarm['last_seen_seconds']:g} с",
+        techniques = alarm.get("mitre_technique_ids") or alarm.get("mitre_technique_candidates", [])
+        identifiers = " / ".join([*techniques, *alarm.get("mitre_tactic_ids", [])])
+        prefix = "гипотеза " if not alarm.get("mitre_technique_ids") else ""
+        identifiers = f" · {prefix}{identifiers}" if identifiers else ""
+        ax.text(.03, .73, f"Наблюдения: {alarm['first_seen_seconds']:g}…{alarm['last_seen_seconds']:g} с{identifiers}",
                 color=MUTED, fontsize=9, va="top")
         for i, stage in enumerate(alarm["chain"]):
             x = .035 + i * .243

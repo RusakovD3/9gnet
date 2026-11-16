@@ -9,6 +9,7 @@ from importlib import metadata
 from pathlib import Path
 
 from .constants import ATTACK_KIND_DISPLAY_NAMES
+from .dynamics_charts import DYNAMICS_CHART_FILES
 
 
 def _number(value):
@@ -44,7 +45,7 @@ def _sla_by_class(snapshots):
 def _prediction_summary(evaluation):
     result = {key: evaluation.get(key) for key in (
         "attack_onset_count", "predicted_before_onset_count", "prediction_recall",
-        "prediction_precision", "false_positive_warning_count", "minimum_observed_lead_seconds",
+        "prediction_precision", "false_positive_warning_count", "right_censored_warning_count", "minimum_observed_lead_seconds",
         "maximum_observed_lead_seconds", "prediction_slo_seconds", "prediction_slo_status")}
     result["evaluated"] = bool(evaluation.get("attack_onset_count"))
     if not result["evaluated"]:
@@ -106,7 +107,8 @@ def build_run_summary(dynamics):
         ],
         "operation_mode": "forecast_and_human_recommendations_only",
         "events": [{key: record.get(key) for key in (
-            "attack_id", "kind", "target_id", "first_step", "last_step", "actions", "response_stages")}
+            "attack_id", "kind", "attack_family", "attack_mechanism", "attack_label_ru",
+            "target_id", "first_step", "last_step", "actions", "response_stages")}
             for record in dynamics.get("attack_response_evaluation", [])],
         "interpretation_ru": [
             "Риск — расчётная оценка, не калиброванная вероятность атаки.",
@@ -117,8 +119,8 @@ def build_run_summary(dynamics):
             "SLA относится к проверяемым требованиям; полнота их моделирования указана отдельно в assessment_coverage_ratio_at_worst_step.",
         ],
         "files": {"step_log": "step_log.csv", "complete_result": "network_dynamics.json",
-                  "decisions": "algorithm_dialogue.md", "overview": "charts/dynamics_overview.png",
-                  "capacity": "charts/capacity_bottlenecks.png"},
+                  "decisions": "algorithm_dialogue.md",
+                  **{key: f"charts/{name}" for key, name in DYNAMICS_CHART_FILES.items()}},
     }
 
 
@@ -149,6 +151,9 @@ def export_run_summary(dynamics, directory: Path):
             f"минимальное упреждение — {_display(prediction['minimum_observed_lead_seconds'])} с.")
     else:
         lines.append("Наблюдённых начал атак нет: точность предупреждений по этому прогону не оценивается.")
+    if prediction.get("right_censored_warning_count"):
+        lines.append(f"Непроверенные предупреждения с окном за концом прогона — "
+                     f"{prediction['right_censored_warning_count']}.")
     lines += ["", f"Средняя взвешенная доля выполнения SLA: {_display(summary['sla']['weighted_time_mean_ratio'], percent=True)}.",
               "", "| Класс | Худшее выполнение SLA | Шаг | Выполнили / учтены |", "|---|---:|---:|---:|"]
     for grade, label in (("gold", "Золотой"), ("silver", "Серебряный"), ("bronze", "Бронзовый")):
@@ -168,14 +173,20 @@ def export_run_summary(dynamics, directory: Path):
         lines.append("Сигналов, требующих защитных действий человека, не было.")
     lines += ["", "## Наблюдённые события", ""]
     for event in summary["events"]:
-        lines.append(f"- `{event['attack_id']}`: {ATTACK_KIND_DISPLAY_NAMES.get(event['kind'], event['kind'])}; "
+        label = event["attack_label_ru"] or ATTACK_KIND_DISPLAY_NAMES.get(event["kind"], event["kind"])
+        lines.append(f"- `{event['attack_id']}` · {label}. "
             f"цель `{event['target_id']}`, шаги {_display(event['first_step'])}–{_display(event['last_step'])}.")
     if not summary["events"]:
         lines.append("События не наблюдались.")
     lines += ["", "## Как читать результат", ""]
     lines += [f"- {text}" for text in summary["interpretation_ru"]]
-    lines += ["", "Детали: [журнал шагов](step_log.csv), [расчёты JSON](network_dynamics.json), "
-        "[пояснения решений](algorithm_dialogue.md), [обзор](charts/dynamics_overview.png), "
-        "[ресурсы](charts/capacity_bottlenecks.png).", ""]
+    lines += ["", "Подробности в [журнале шагов](step_log.csv), [расчётах JSON](network_dynamics.json) "
+              "и [пояснениях решений](algorithm_dialogue.md).", "",
+              "[Купман](charts/koopman_risk.png) · [Ляпунов](charts/lyapunov_growth.png) · "
+              "[Хронология](charts/event_timeline.png) · [Арбитр](charts/arbitrator_signals.png)", "",
+              "[Обычный трафик](charts/native_traffic.png) · [Трафик атак](charts/attack_traffic.png) · "
+              "[SLA сети](charts/sla_by_class.png) · [SLA атакованных узлов](charts/attacked_node_sla.png)", "",
+              "[Пики линий](charts/capacity_bottlenecks.png) · [Нагрузка линий](charts/link_utilization.png) · "
+              "[Ресурсы](charts/resource_utilization.png).", ""]
     text_path.write_text("\n".join(lines), encoding="utf-8")
     return summary

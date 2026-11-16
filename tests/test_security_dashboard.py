@@ -133,6 +133,24 @@ def test_classic_chain_does_not_invent_exploitation_or_successful_login():
     assert {stage["key"] for stage in chain if stage["status"] == "observed"} == {"delivery", "objective"}
 
 
+def test_exfiltration_retains_observation_time_and_candidate_without_claiming_success():
+    current = snapshot(4, events=[event(
+        "exfiltration", target="F1_01", mitre_technique_id="T1041",
+        sensor_signals={"unusual_egress_bytes_per_second": 50_000},
+        routes=[], effective_packet_rate_pps=0, effective_offered_rate_mbps=0,
+    )])
+    current["koopman"]["signature_entity_records"] = [{
+        "target_id": "F1_01", "kind": "exfiltration", "mitre_technique_candidates": ["T1041"],
+        "feature_match": {"margin_ratio": 1.1},
+    }]
+    alarm = build_security_dashboard([snapshot(2), current, snapshot(6)], 2)["alarms"][0]
+    assert alarm["mitre_technique_ids"] == alarm["mitre_technique_candidates"] == ["T1041"]
+    assert alarm["mitre_tactic_ids"] == ["TA0010"]
+    assert alarm["observation_history"] == [{"phase": "active", "time_seconds": 4}]
+    assert alarm["classic_chain"][-1]["status"] == "unknown"
+    assert any("50000 байт/с" in line for line in alarm["evidence_lines"])
+
+
 @pytest.mark.parametrize("kind", ["power_attack", "brute_force"])
 def test_non_packet_events_do_not_create_flood_paths(kind):
     # Общий конструктор событий сохраняет routes и для управляющих сигналов,

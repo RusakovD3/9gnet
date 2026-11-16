@@ -472,16 +472,18 @@ def test_chart_export_keeps_only_the_compact_current_chart_set(
         "dynamics_attacks.png",
         "dynamics_remapping.png",
         "attack_arrival_weibull.png",
+        "dynamics_overview.png",
     )
     for stale_name in stale_names:
         (tmp_path / stale_name).write_bytes(b"obsolete chart")
-    for name in ("_plot_dynamics_overview", "_plot_capacity_bottlenecks"):
-        monkeypatch.setattr(dynamics_charts, name, lambda *args, **kwargs: None)
+    monkeypatch.setattr(dynamics_charts, "save_figure",
+                        lambda fig, path: dynamics_charts.plt.close(fig))
 
     paths = dynamics_charts.export_dynamics_charts(
         {"snapshots": []},
         tmp_path,
     )
 
-    assert set(paths) == {"overview", "capacity"}
+    assert set(paths) == {"koopman", "lyapunov", "native_traffic", "attack_traffic", "sla",
+                          "target_sla", "timeline", "arbitrator", "capacity", "links", "resources"}
     assert all(not (tmp_path / stale_name).exists() for stale_name in stale_names)
