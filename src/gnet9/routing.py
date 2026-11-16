@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from functools import cached_property
 
 import networkx as nx
 
@@ -26,6 +27,47 @@ DATA_PLANE_TRANSIT_ROLES = frozenset(
     }
 )
 LOGICAL_SERVICE_MEDIUM = "logical-service-binding"
+
+
+class FixedTopologyRoutes:
+    """Пути и задержки для одного прогона с фиксированным графом."""
+
+    def __init__(self, model: NetworkModel):
+        self._model = model
+        self._paths: dict[tuple[str, str], tuple[str, ...]] = {}
+        self._distances: dict[tuple[str, str], float | None] = {}
+
+    def path(self, source: str, target: str) -> list[str]:
+        key = (source, target)
+        if key not in self._paths:
+            self._paths[key] = tuple(shortest_data_path(self._model, source, target))
+        return list(self._paths[key])
+
+    def distance(self, source: str, target: str) -> float | None:
+        key = (source, target)
+        if key not in self._distances:
+            try:
+                self._distances[key] = shortest_data_path_length(self._model, source, target)
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                self._distances[key] = None
+        return self._distances[key]
+
+    @cached_property
+    def latency_scale_ms(self) -> float:
+        """Диаметр транзитных узлов и два максимальных плеча доступа, мс."""
+        transit = data_plane_routing_view(self._model)
+        diameter = 1.0
+        for _, lengths in nx.all_pairs_dijkstra_path_length(transit, weight="latency_ms"):
+            diameter = max(diameter, max(lengths.values(), default=0.0))
+
+        graph = self._model.graph
+        attachment = max((
+            float(attrs.get("latency_ms", 0.0))
+            for source, target, attrs in graph.edges(data=True)
+            if attrs.get("medium") != LOGICAL_SERVICE_MEDIUM
+            and (source in transit) != (target in transit)
+        ), default=0.0)
+        return diameter + 2.0 * attachment
 
 
 def data_plane_routing_view(

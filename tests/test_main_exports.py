@@ -4,11 +4,27 @@ from pathlib import Path
 
 import pytest
 
-from main import export_attack_catalog, export_l1_monitoring, export_stationary_dynamics, parse_args
+from main import _write_dynamics_json, export_attack_catalog, export_l1_monitoring, export_stationary_dynamics, parse_args
 from src.gnet9.attacks import attack_catalog, predictive_demo_minimum_steps
 from src.gnet9.constants import SUBSCRIBER_COUNT
 from src.gnet9.dynamics import DynamicsConfig
 from src.gnet9.topology_builder import GNetBaselineBuilder
+
+
+def test_dynamics_json_replaces_only_a_complete_export(tmp_path: Path) -> None:
+    path = tmp_path / "network_dynamics.json"
+    payload = {"export_metadata": {"schema_version": 3}, "snapshots": [
+        {"step_index": 0, "label": "эталон"}, {"step_index": 1, "missing": None},
+    ]}
+    _write_dynamics_json(path, payload)
+    original = path.read_bytes()
+    assert json.loads(original) == payload
+    assert len([line for line in original.splitlines() if b'"step_index"' in line]) == 2
+    corrupt = {**payload, "snapshots": [*payload["snapshots"], {"step_index": 2, "risk": float("nan")}]}
+    with pytest.raises(ValueError):
+        _write_dynamics_json(path, corrupt)
+    assert path.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [path]
 
 
 def test_l1_monitoring_csv_exports_single_access_field(tmp_path: Path) -> None:

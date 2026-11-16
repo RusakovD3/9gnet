@@ -21,6 +21,7 @@ from .local_observation import LocalObservationFilter, is_smoothable_metric
 from .attacks import MITRE_T1110_001_ATTEMPTS_PER_SECOND
 from .arbitrator import build_trigger_card, evaluate_defense_game
 from .metrics import gold_threat_proximity_view
+from .routing import FixedTopologyRoutes
 from .tensor_matrix import TensorKroneckerKoopman, TensorMatrixView, TensorLevelMatrix
 
 
@@ -250,6 +251,7 @@ class KoopmanOnlineAnalyzer:
         step_index: int,
         time_seconds: int,
         runtime_state: dict[str, Any] | None = None,
+        routing: FixedTopologyRoutes | None = None,
     ) -> dict[str, Any]:
         self.analysis_revision += 1
         # Текущий снимок является атомарным: residual, rollout, спектр и
@@ -313,6 +315,7 @@ class KoopmanOnlineAnalyzer:
         threat_proximity = gold_threat_proximity_view(
             model,
             _sanitized_geometry_observation(attack_state),
+            routing=routing,
         )
         route_hausdorff = attack_state.get(
             "route_observation",

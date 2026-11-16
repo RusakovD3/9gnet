@@ -18,7 +18,7 @@ from .models import NetworkModel, StateTensor
 from .normal_traffic import poisson_arrivals
 from .runtime_metrics import network_runtime_metrics
 from .metrics import gold_route_hausdorff_view
-from .routing import shortest_data_path
+from .routing import FixedTopologyRoutes
 
 
 ETHERNET_HEADER_BYTES = 14
@@ -120,6 +120,7 @@ class FlowContext:
     step_seconds: int
     payload_bps: float
     flow_id: str
+    route: list[str]
 
 
 def simulate_packet_snapshot(
@@ -134,6 +135,7 @@ def simulate_packet_snapshot(
     attack_precursors: list[dict[str, Any]] | None = None,
     attack_scenario: str | None = None,
     power_runtime_state: dict[str, dict[str, Any]] | None = None,
+    routing: FixedTopologyRoutes | None = None,
 ) -> dict[str, Any]:
     """Build simulated traffic for one step.
 
@@ -144,6 +146,7 @@ def simulate_packet_snapshot(
         raise ValueError("Packet detail must be one of: summary, flows, sample")
 
     identities = build_network_identities(model)
+    routing = routing if routing is not None else FixedTopologyRoutes(model)
     flows: list[dict[str, Any]] = []
 
     subscribers = [
@@ -153,12 +156,13 @@ def simulate_packet_snapshot(
     ]
 
     for flow_index, (subscriber_id, attrs) in enumerate(subscribers, start=1):
-        flow = _build_flow(model, identities, subscriber_id, attrs, flow_index, step_index, time_seconds, step_seconds)
+        flow = _build_flow(model, identities, subscriber_id, attrs, flow_index, step_index, time_seconds,
+                           step_seconds, routing=routing)
         flows.append(flow)
 
     # Все шаги используют исходные пути; прогноз не влияет на трафик.
     current_attack_flows = build_current_attack_flows(attack_events or [], identities=identities)
-    route_observation = gold_route_hausdorff_view(model, flows)
+    route_observation = gold_route_hausdorff_view(model, flows, routing=routing)
 
     flows, attack_state = apply_attack_effects(
         model,
@@ -202,6 +206,8 @@ def _build_flow(
     step_index: int,
     time_seconds: int,
     step_seconds: int,
+    *,
+    routing: FixedTopologyRoutes,
 ) -> dict[str, Any]:
     traffic_kind = attrs.get("traffic_kind")
     app = TRAFFIC_APPS[traffic_kind]
@@ -210,6 +216,8 @@ def _build_flow(
     client_port = _client_port(subscriber_id, flow_index)
     payload_bps = _payload_bps(attrs, time_seconds)
     flow_id = f"{subscriber_id}-{app['application']}-{step_index}"
+    route = (routing.path(subscriber_id, server_node) if traffic_kind == "dns"
+             else routing.path(server_node, subscriber_id))
     context = FlowContext(
         model=model,
         identities=identities,
@@ -224,6 +232,7 @@ def _build_flow(
         step_seconds=step_seconds,
         payload_bps=payload_bps,
         flow_id=flow_id,
+        route=route,
     )
 
     if app["transport"] == "TCP":
@@ -240,7 +249,7 @@ def _build_flow(
 
 def _build_voice_flow(context: FlowContext) -> dict[str, Any]:
     """Build a mono Opus/RTP stream with one packet every 20 milliseconds."""
-    route = _route(context.model, context.server_node, context.subscriber_id)
+    route = context.route
     policy = context.attrs.get("d0sl_policy", {})
     packetization_ms = int(policy.get("packetization_ms") or 20)
     rtp_clock_rate_hz = int(policy.get("rtp_clock_rate_hz") or 48_000)
@@ -292,7 +301,7 @@ def _build_voice_flow(context: FlowContext) -> dict[str, Any]:
 
 def _build_tcp_flow(context: FlowContext) -> dict[str, Any]:
     policy = context.attrs.get("d0sl_policy", {})
-    data_route = _route(context.model, context.server_node, context.subscriber_id)
+    data_route = context.route
     ack_route = list(reversed(data_route))
     payload_bytes = _payload_bytes(context.payload_bps, context.step_seconds, TCP_MSS_BYTES)
     expected_segments = payload_bytes / TCP_MSS_BYTES
@@ -345,7 +354,7 @@ def _build_tcp_flow(context: FlowContext) -> dict[str, Any]:
 
 
 def _build_udp_media_flow(context: FlowContext) -> dict[str, Any]:
-    route = _route(context.model, context.server_node, context.subscriber_id)
+    route = context.route
     payload_unit = context.app["payload_unit_bytes"]
     payload_bytes = _payload_bytes(context.payload_bps, context.step_seconds, payload_unit)
     datagrams = math.ceil(payload_bytes / payload_unit) if context.step_index == 0 else poisson_arrivals(payload_bytes / payload_unit, node_id=context.subscriber_id, step=context.step_index)
@@ -404,7 +413,7 @@ def _build_udp_media_flow(context: FlowContext) -> dict[str, Any]:
 
 
 def _build_dns_flow(context: FlowContext) -> dict[str, Any]:
-    query_route = _route(context.model, context.subscriber_id, context.server_node)
+    query_route = context.route
     response_route = list(reversed(query_route))
     policy = context.attrs.get("d0sl_policy", {})
     request_rate = float(
@@ -1193,10 +1202,6 @@ def _traffic_summary(flows: list[dict[str, Any]], model: NetworkModel) -> dict[s
         ),
         "applications": applications,
     }
-
-
-def _route(model: NetworkModel, source: str, target: str) -> list[str]:
-    return shortest_data_path(model, source, target)
 
 
 def _path_latency_ms(model: NetworkModel, route: list[str], packet_bytes: int) -> float:

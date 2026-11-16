@@ -1,15 +1,54 @@
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+
+import networkx as nx
 
 from src.gnet9.baseline import l0_service_tensor
 from src.gnet9.constants import L2_NODE_COUNT, SUBSCRIBER_COUNT
 from src.gnet9.dynamics import DynamicsConfig, simulate_stationary_dynamics, validate_healthy_baseline
 from src.gnet9 import dynamics_charts
 from src.gnet9.dynamics_charts import extract_application_series, extract_dynamics_chart_series
+from src.gnet9 import routing
+from src.gnet9.metrics import gold_route_hausdorff_view
 from src.gnet9.topology_builder import GNetBaselineBuilder
 
 
 MODEL = GNetBaselineBuilder().build()
+
+
+def test_fixed_topology_routes_reuse_paths_without_exposing_cache(monkeypatch):
+    graph = nx.Graph()
+    graph.add_nodes_from(("A", "B", "D"), role="core-router")
+    graph.add_nodes_from(("S", "T", "endpoint"), role="service-server")
+    graph.add_weighted_edges_from((
+        ("S", "A", 1), ("A", "B", 3), ("B", "T", 1), ("A", "D", 2), ("D", "B", 2),
+        ("A", "endpoint", 0.1), ("endpoint", "B", 0.1),
+    ), weight="latency_ms")
+    model = SimpleNamespace(graph=graph)
+    original = routing.shortest_data_path
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(args[1:])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(routing, "shortest_data_path", counted)
+    cache = routing.FixedTopologyRoutes(model)
+    first = cache.path("S", "T")
+    assert first == ["S", "A", "B", "T"]
+    first[1] = "endpoint"
+    assert cache.path("S", "T") == ["S", "A", "B", "T"]
+    assert calls == [("S", "T")]
+    assert cache.distance("S", "T") == 5.0
+    assert cache.latency_scale_ms == 5.0
+    same_route = {"sla_grade": "gold", "route": cache.path("S", "T")}
+    report = gold_route_hausdorff_view(model, [same_route], routing=cache)
+    assert report["distance_ms"] == 0.0 and report["maximum_latency_stretch_ratio"] == 1.0
+    detour = {**same_route, "original_route": same_route["route"], "route": ["S", "A", "D", "B", "T"]}
+    report = gold_route_hausdorff_view(model, [detour], routing=cache)
+    assert report["directed_original_to_active_ms"] == 0.0
+    assert report["directed_active_to_original_ms"] == 2.0
 
 
 def test_l2_count() -> None:

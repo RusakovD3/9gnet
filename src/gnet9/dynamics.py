@@ -42,6 +42,7 @@ from .models import NetworkModel, StateTensor
 from .kalman import DEFAULT_PROCESS_VARIANCE, DEFAULT_MEASUREMENT_VARIANCE, validate_noise_variances
 from .hypernetwork import hypernetwork_embedding
 from .packet_simulator import TRAFFIC_APPS, simulate_packet_snapshot
+from .routing import FixedTopologyRoutes
 from .tensor_matrix import (
     build_tensor_matrix_view,
     tensor_matrix_export,
@@ -99,6 +100,7 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
     start_step = 0 if config.include_t0 else 1
     snapshots: list[dict[str, Any]] = []
     power_runtime_state: dict[str, dict[str, Any]] = {}
+    routing = FixedTopologyRoutes(model)
     catalog = attack_catalog(model, config.attack_scenario, config=config)
     first_precursor_step = min(
         (item["temporal"]["start_step"] - item["temporal"]["precursor_steps"] for item in catalog),
@@ -110,6 +112,7 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
         0,
         0,
         power_runtime_state=power_runtime_state,
+        routing=routing,
     )
     reference_tensor_state = reference_snapshot.pop("_analysis_tensor_state")
     reference_tensor_matrices = build_tensor_matrix_view(reference_tensor_state)
@@ -160,6 +163,7 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
                 power_runtime_state=power_runtime_state,
                 reference_tensor_state=reference_tensor_state,
                 state_hausdorff_reference=state_hausdorff_reference,
+                routing=routing,
             )
         )
         if step_index == 0:
@@ -180,6 +184,7 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
             step_index=step_index,
             time_seconds=step_index * config.step_seconds,
             runtime_state=snapshot.get("traffic", {}).get("network_state"),
+            routing=routing,
         )
         apply_koopman_to_arbitrator(
             snapshot,
@@ -743,6 +748,7 @@ def _snapshot(
     power_runtime_state: dict[str, dict[str, Any]] | None = None,
     reference_tensor_state: dict[str, Any] | None = None,
     state_hausdorff_reference: StateTensorHausdorffReference | None = None,
+    routing: FixedTopologyRoutes | None = None,
 ) -> dict[str, Any]:
     scheduled_attack_events = active_attack_events(
         model,
@@ -785,6 +791,7 @@ def _snapshot(
             attack_precursors=attack_precursors,
             attack_scenario=config.attack_scenario,
             power_runtime_state=power_runtime,
+            routing=routing,
         )
 
     tensor_state = _tensor_state_snapshot(model)

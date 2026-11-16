@@ -7,6 +7,7 @@ import math
 import shutil
 from dataclasses import asdict
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 from src.gnet9.address_visualizer import draw_ip_address_map, export_ip_address_plan
@@ -262,7 +263,7 @@ def _dynamics_export_view(dynamics: dict[str, Any], packet_detail: str) -> dict[
     The visualizers need flow records in memory, but writing all detailed
     flow dictionaries for every step makes a normal 60-step export unnecessarily
     large.  Only snapshot/traffic containers are copied; the immutable aggregate
-    values are shared until ``json.dumps`` serializes the view.
+    values are shared until the view is serialized.
     """
     if packet_detail not in {"summary", "flows", "sample"}:
         raise ValueError("packet_detail must be one of: summary, flows, sample")
@@ -303,6 +304,35 @@ def _dynamics_export_view(dynamics: dict[str, Any], packet_detail: str) -> dict[
             "result_summary": build_run_summary(dynamics), **exported}
 
 
+def _write_dynamics_json(path: Path, payload: dict[str, Any]) -> None:
+    """Записывать снимки по одному, заменяя прежний отчёт целиком."""
+    encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    staged = None
+    try:
+        with NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", dir=path.parent,
+                                prefix=".gnet9-dynamics-", delete=False) as stream:
+            staged = Path(stream.name)
+            stream.write("{\n")
+            for index, (name, value) in enumerate(payload.items()):
+                if index:
+                    stream.write(",\n")
+                stream.write(f"  {encoder.encode(name)}: ")
+                if name == "snapshots":
+                    stream.write("[\n")
+                    for step, snapshot in enumerate(value):
+                        if step:
+                            stream.write(",\n")
+                        stream.write(f"    {encoder.encode(snapshot)}")
+                    stream.write("\n  ]")
+                else:
+                    stream.write(encoder.encode(value))
+            stream.write("\n}\n")
+        staged.replace(path)
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
+
+
 def export_stationary_dynamics(
     model,
     path: Path,
@@ -314,7 +344,7 @@ def export_stationary_dynamics(
     dynamics = simulate_stationary_dynamics(model, config)
     export_detail = packet_detail or str(dynamics.get("config", {}).get("packet_detail", "sample"))
     export_view = _dynamics_export_view(dynamics, export_detail)
-    path.write_text(json.dumps(export_view, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+    _write_dynamics_json(path, export_view)
     export_step_log(dynamics, path.with_name("step_log.csv"))
     export_run_summary(dynamics, path.parent)
     return dynamics
