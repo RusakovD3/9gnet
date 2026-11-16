@@ -522,6 +522,7 @@ def _flow_record(
         "sequence_base": _sequence_base(context.flow_id),
     }
     record.update(extra)
+    record["protocol_stack"] = ["IPv4", transport] + (["RTP"] if record.get("rtp_header_bytes") else [])
     return record
 
 
@@ -700,6 +701,7 @@ def _attack_packet_samples(
     event["attack"] = {
         "attack_id": flow.get("attack_id"),
         "mitre_technique_id": flow.get("mitre_technique_id"),
+        **{key: flow[key] for key in ("attack_family", "attack_mechanism", "attack_label_ru") if key in flow},
         "source_count": int(flow.get("source_count", 1)),
         "raw_packet_count": int(flow.get("raw_packet_count", flow.get("packet_count", 0))),
         "admitted_packet_count": int(flow.get("packet_count", 0)),
@@ -1161,6 +1163,7 @@ def _traffic_summary(flows: list[dict[str, Any]], model: NetworkModel) -> dict[s
         "attack_flow_count": len(attack_flows),
         "tcp_flow_count": tcp_flows,
         "udp_flow_count": udp_flows,
+        "rtp_flow_count": sum(bool(flow.get("rtp_header_bytes")) for flow in legitimate),
         "packet_count": packet_count,
         "payload_bytes": payload_bytes,
         "wire_bytes": wire_bytes,

@@ -17,6 +17,7 @@ import math
 import random
 from typing import Any
 
+from .attack_signatures import SIGNATURE_LIMITS, flood_fields
 from .models import NetworkModel
 from .routing import has_data_path, shortest_data_path
 from .transport_queue import apply_transport_queues
@@ -32,16 +33,35 @@ MITRE_T1110_001_APT28_MIN_ATTEMPTS_PER_HOUR = 300
 MITRE_T1110_001_ATTEMPTS_PER_SECOND = (
     MITRE_T1110_001_APT28_MIN_ATTEMPTS_PER_HOUR / 3_600
 )
+MITRE_TACTICS_BY_TECHNIQUE = {
+    **dict.fromkeys(("T1498.001", "T1498.002", "T1499.001", "T1499.002", "T1499.003", "T1529"), "TA0040"),
+    "T1110.001": "TA0006", "T0831": "TA0105", "T1068": "TA0004", "T1046": "TA0007",
+    "T1204": "TA0002", "T1041": "TA0010", "T1464": "TA0034",
+}
+BGP_ORIGIN_VALIDATION_REFERENCE = "https://www.rfc-editor.org/rfc/rfc6811.html"
 
 
 class AttackKind(str, Enum):
     DOS = "dos"
     DDOS = "ddos"
     SYN_FLOOD = "syn_flood"
+    DHCP_FLOOD = "dhcp_flood"
     DNS_FLOOD = "dns_flood"
     APPLICATION_FLOOD = "application_flood"
     BRUTE_FORCE = "brute_force"
     POWER_ATTACK = "power_attack"
+    BGP_HIJACK = "bgp_hijack"
+    PRIVILEGE_ESCALATION = "privilege_escalation"
+    NETWORK_DISCOVERY = "network_discovery"
+    USER_EXECUTION = "user_execution"
+    EXFILTRATION = "exfiltration"
+    MOBILE_NETWORK_DOS = "mobile_network_dos"
+
+
+LOG_ONLY_ATTACKS = {
+    AttackKind.BGP_HIJACK, AttackKind.PRIVILEGE_ESCALATION,
+    AttackKind.NETWORK_DISCOVERY, AttackKind.EXFILTRATION, AttackKind.DHCP_FLOOD,
+}
 
 
 @dataclass(frozen=True)
@@ -79,6 +99,7 @@ class AttackTechnicalCharacteristics:
     authentication_attempt_rate_reference_url: str | None = None
     request_rate_per_second: float = 0.0
     request_cpu_cost_ms: float = 0.0
+    sensor_peaks: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -137,8 +158,8 @@ class AttackProfile:
     attack_id: str
     name_ru: str
     kind: AttackKind
-    mitre_technique_id: str
-    mitre_technique_name: str
+    mitre_technique_id: str | None
+    mitre_technique_name: str | None
     related_technique_ids: tuple[str, ...]
     target_id: str
     target_type: str
@@ -150,15 +171,24 @@ class AttackProfile:
     target_resource_pressure: float
     description_ru: str
     power_failure_mode: str | None = None
+    technique_reference_url: str | None = None
 
     @property
-    def mitre_url(self) -> str:
+    def mitre_url(self) -> str | None:
+        if self.mitre_technique_id is None:
+            return None
         return f"{MITRE_ATTACK_SOURCE}{self.mitre_technique_id.replace('.', '/')}/"
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["kind"] = self.kind.value
+        initiators = self.technical.initiator_count
+        data.update(flood_fields(self.kind.value, len(self.ingress_nodes) if initiators is None else initiators))
         data["mitre_url"] = self.mitre_url
+        tactic = MITRE_TACTICS_BY_TECHNIQUE.get(self.mitre_technique_id)
+        data["mitre_tactic_ids"] = [tactic] if tactic else []
+        data["technique_reference_url"] = self.mitre_url or self.technique_reference_url
+        data["temporal"]["value_origin"] = "gnet9_scenario_assumption"
         data["related_mitre_urls"] = [
             f"{MITRE_ATTACK_SOURCE}{technique_id.replace('.', '/')}/"
             for technique_id in self.related_technique_ids
@@ -196,6 +226,8 @@ class MitreTensorMapping:
         data = asdict(self)
         data["attack_kind"] = self.attack_kind.value
         data["mitre_url"] = self.mitre_url
+        tactic = MITRE_TACTICS_BY_TECHNIQUE.get(self.technique_id)
+        data["mitre_tactic_ids"] = [tactic] if tactic else []
         data["mapping_semantics"] = (
             "expert_declared_observable_mapping; not a claim that all ATT&CK techniques are covered"
         )
@@ -261,6 +293,23 @@ MITRE_TENSOR_MAPPINGS = (
         (), ("revoke_management_session", "failover_service_to_standby"),
     ),
 )
+MITRE_TENSOR_MAPPINGS += tuple(
+    MitreTensorMapping(technique, name, kind, levels, (), tuple(SIGNATURE_LIMITS[kind.value]), (), (action,))
+    for technique, name, kind, levels, action in (
+        ("T1499.002", "Service Exhaustion Flood", AttackKind.DHCP_FLOOD,
+         ("L2", "L5", "L7"), "review_address_assignment_service_telemetry"),
+        ("T1068", "Exploitation for Privilege Escalation", AttackKind.PRIVILEGE_ESCALATION,
+         ("L1", "L7"), "review_endpoint_privilege_audit"),
+        ("T1046", "Network Service Discovery", AttackKind.NETWORK_DISCOVERY,
+         ("L1", "L2", "L7"), "review_service_connection_logs"),
+        ("T1204", "User Execution", AttackKind.USER_EXECUTION,
+         ("L1", "L7"), "correlate_user_and_process_events"),
+        ("T1041", "Exfiltration Over C2 Channel", AttackKind.EXFILTRATION,
+         ("L1", "L2", "L7"), "review_egress_and_channel_evidence"),
+        ("T1464", "Network Denial of Service", AttackKind.MOBILE_NETWORK_DOS,
+         ("L1", "L3", "L7"), "compare_mobile_connectivity_and_coverage"),
+    )
+)
 
 
 def mitre_tensor_mapping_catalog() -> list[dict[str, Any]]:
@@ -302,7 +351,7 @@ MITRE_DEMO_ATTACKS = (
         "Распределённые отражённые ответы превышают суммарную ёмкость двух 10-гигабитных подключений SRV_MEDIA.",
     ),
     AttackProfile(
-        "SYN_GOLD_ENDPOINT", "SYN-флуд на оконечное устройство Gold", AttackKind.SYN_FLOOD,
+        "SYN_GOLD_ENDPOINT", "DDoS (SYN flood)", AttackKind.SYN_FLOOD,
         "T1499.001", "OS Exhaustion Flood", ("T1498.001",), "M1_01", "mobile-subscriber",
         ("M3_39", "F3_39"),
         AttackTemporalCharacteristics(8, 2, 1, "distributed-ramp-then-peak"),
@@ -405,8 +454,95 @@ SERVICE_REQUEST_ATTACKS = (
         "Малый входящий поток ухудшает размещённые на нём услуги без насыщения канала.",
     ),
 )
-MITRE_DEMO_ATTACKS += SERVICE_REQUEST_ATTACKS
-MITRE_DEMO_STEP_COUNT = 16
+def _sensor_attack(attack_id, name_ru, kind, technique_id, technique_name, target, target_type,
+                   start, signals, description, *, pressure=0.0, latency_ms=0.0, loss=0.0,
+                   reference_url=None, initiator_count=None):
+    return AttackProfile(
+        attack_id, name_ru, kind, technique_id, technique_name, (), target, target_type, (),
+        AttackTemporalCharacteristics(start, 2, 1, "sensor-ramp-then-peak", precursor_steps=0),
+        AttackTechnicalCharacteristics(
+            "synthetic sensor telemetry", 0, 0.0, 0, initiator_count or 0, 1.0, 0.0,
+            packet_size_semantics="no_modeled_attack_packets",
+            resource_axis="logged_sensor_or_endpoint_service_state",
+            traffic_origin_semantics="synthetic_observation_no_network_commands_or_payload",
+            initiator_count=initiator_count,
+            sensor_peaks=tuple(signals.items()),
+        ),
+        latency_ms, loss, pressure, description, technique_reference_url=reference_url,
+    )
+
+
+EXTENDED_DEMO_ATTACKS = (
+    AttackProfile(
+        "UDP_ACCESS_FLOOD", "Прямой UDP-флуд на абонентский доступ", AttackKind.DOS,
+        "T1498.001", "Direct Network Flood", (), "F1_02", "fixed-subscriber", ("F3_40",),
+        AttackTemporalCharacteristics(17, 2, 1, "ramp-then-peak"),
+        AttackTechnicalCharacteristics("UDP", 512, 138.72, 30_000, 1, 1.0, 0.0, on_wire_size_bytes=578),
+        0.0, 0.0, 0.60, "Модельный поток UDP конкурирует за полосу абонентского доступа.",
+    ),
+    _sensor_attack(
+        "BGP_ORIGIN_ANOMALY", "Перехват маршрута BGP", AttackKind.BGP_HIJACK,
+        None, None, "C1", "core-router", 20, {"invalid_prefix_origin_count": 2},
+        "Датчик регистрирует несоответствие источника объявления префикса. Маршрут и граф фиксированы.",
+        reference_url=BGP_ORIGIN_VALIDATION_REFERENCE,
+    ),
+    _sensor_attack(
+        "NETWORK_SERVICE_DISCOVERY", "Разведка сетевых служб", AttackKind.NETWORK_DISCOVERY,
+        "T1046", "Network Service Discovery", "SRV_DATA", "service-server", 23,
+        {"distinct_probed_services_count": 12}, "Журнал датчика показывает обращения к разным службам.",
+    ),
+    _sensor_attack(
+        "USER_EXECUTION_CLIENT", "Пользовательский запуск и рост CPU", AttackKind.USER_EXECUTION,
+        "T1204", "User Execution", "F1_01", "fixed-subscriber", 26,
+        {"user_launched_process_count": 2, "endpoint_cpu_rise_ratio": 0.45},
+        "Синтетическое событие запуска у абонента сопровождается ростом нагрузки процессора.",
+        pressure=0.45, latency_ms=45.0,
+    ),
+    _sensor_attack(
+        "PRIVILEGE_TRANSITION", "Повышение привилегий", AttackKind.PRIVILEGE_ESCALATION,
+        "T1068", "Exploitation for Privilege Escalation", "F1_01", "fixed-subscriber", 29,
+        {"unexpected_privilege_transition_count": 2},
+        "Синтетический журнал показывает неожиданный переход контекста привилегий.",
+    ),
+    _sensor_attack(
+        "C2_EGRESS_ANOMALY", "Вынос данных по наблюдаемому каналу", AttackKind.EXFILTRATION,
+        "T1041", "Exfiltration Over C2 Channel", "F1_01", "fixed-subscriber", 32,
+        {"unusual_egress_bytes_per_second": 75_000, "established_channel_transfer_ratio": 0.95},
+        "Счётчики показывают аномальный объём исходящих данных по известному каналу. Данные не передаются.",
+    ),
+    _sensor_attack(
+        "MOBILE_CONNECTIVITY_LOSS", "Нарушение доступности мобильной сети", AttackKind.MOBILE_NETWORK_DOS,
+        "T1464", "Network Denial of Service", "M1_01", "mobile-subscriber", 35,
+        {"mobile_link_failure_ratio": 0.60}, "Моделируется потеря доступности линии мобильного абонента.",
+        pressure=0.75, latency_ms=90.0, loss=0.30,
+    ),
+)
+
+_DISTRIBUTED_SYN = next(profile for profile in MITRE_DEMO_ATTACKS if profile.kind == AttackKind.SYN_FLOOD)
+FLOOD_VARIANTS = (
+    replace(
+        _DISTRIBUTED_SYN, attack_id="DOS_SYN_ENDPOINT", name_ru="DoS (SYN flood)", ingress_nodes=("F3_39",),
+        temporal=AttackTemporalCharacteristics(38, 2, 1, "ramp-then-peak"),
+        technical=replace(_DISTRIBUTED_SYN.technical, source_count=1, initiator_count=1,
+                          traffic_origin_semantics="direct_from_listed_ingress_nodes"),
+        description_ru="Модельная перегрузка очереди неполных соединений одним источником.",
+    ),
+    _sensor_attack(
+        "DOS_DHCP_SERVICE", "DoS (DHCP flood)", AttackKind.DHCP_FLOOD,
+        "T1499.002", "Service Exhaustion Flood", "SRV_DATA", "service-server", 41,
+        {"dhcp_service_pressure_ratio": 0.85}, "Рост нагрузки службы выдачи адресов в телеметрии стенда.",
+        initiator_count=1,
+    ),
+    _sensor_attack(
+        "DDOS_DHCP_SERVICE", "DDoS (DHCP flood)", AttackKind.DHCP_FLOOD,
+        "T1499.002", "Service Exhaustion Flood", "SRV_DATA", "service-server", 44,
+        {"dhcp_service_pressure_ratio": 0.85}, "Рост нагрузки службы выдачи адресов от нескольких модельных источников.",
+        initiator_count=3,
+    ),
+)
+
+MITRE_DEMO_ATTACKS += SERVICE_REQUEST_ATTACKS + EXTENDED_DEMO_ATTACKS + FLOOD_VARIANTS
+MITRE_DEMO_STEP_COUNT = max(p.temporal.start_step + p.temporal.duration_steps - 1 for p in MITRE_DEMO_ATTACKS)
 
 # Новый демонстрационный профиль рассчитан на 160 переходов по 2 секунды.
 # Девять — это верхняя граница числа атак в одном прогоне, а не гарантия:
@@ -1525,6 +1661,10 @@ def _attack_capacity_context(
         processing_ratio = 0.0
         peak_pressure = float(profile.target_resource_pressure)
         pressure_basis = "slow_authentication_attempts_below_data_plane_saturation"
+    elif profile.technical.sensor_peaks:
+        processing_ratio = 0.0
+        peak_pressure = float(profile.target_resource_pressure)
+        pressure_basis = "modeled_endpoint_or_link_pressure_from_sensor_scenario"
     elif profile.kind == AttackKind.SYN_FLOOD:
         budget = float(TARGET_SYN_STATE_BUDGET_PPS[target_type])
         processing_ratio = packet_rate / budget
@@ -1717,6 +1857,21 @@ def active_attack_events(
             "effective_offered_rate_mbps": round(profile.technical.offered_rate_mbps * intensity, 4),
             "effective_packet_rate_pps": int(profile.technical.packet_rate_pps * intensity),
         }
+        if profile.technical.sensor_peaks:
+            sensor = {name: round(value * intensity, 6) for name, value in profile.technical.sensor_peaks}
+            for name, value in sensor.items():
+                if name.endswith("_count"):
+                    sensor[name] = int(round(value))
+            if profile.kind == AttackKind.MOBILE_NETWORK_DOS:
+                sensor["mobile_endpoint_flag"] = int(
+                    model.graph.nodes[profile.target_id].get("role") == "mobile-subscriber"
+                )
+            if profile.technical.initiator_count is not None:
+                sensor["observed_ingress_count"] = profile.technical.initiator_count
+        else:
+            sensor = _precursor_signals(profile, maturity=intensity)
+            sensor.pop("signal_confidence")
+        event["sensor_signals"] = sensor
         if profile.kind == AttackKind.BRUTE_FORCE:
             event["effective_authentication_attempt_rate_per_second"] = round(
                 float(profile.technical.authentication_attempt_rate_per_second or 0.0)
@@ -2358,6 +2513,11 @@ def apply_attack_effects(
         "recovery_after_effect_active": bool(recovery_events),
         "recovery_after_effect_count": len(recovery_events),
         "events": events,
+        "signature_observations": [
+            {"sensor_node_id": event["target_id"], "signals": event["sensor_signals"],
+             "value_origin": "synthetic_current_sensor_observation"}
+            for event in intrusion_events if event.get("sensor_signals")
+        ],
         "precursor_active": bool(precursor_events),
         "precursor_count": len(precursor_events),
         "precursors": precursor_events,
@@ -2471,9 +2631,8 @@ def apply_attack_effects(
 
 
 def _flow_is_affected(flow: dict[str, Any], event: dict[str, Any]) -> bool:
-    if event.get("kind") == AttackKind.BRUTE_FORCE.value:
-        # T1110.001 remains an authentication-log scenario.  It is not a
-        # traffic generator and must never manufacture a data-plane loss.
+    if event.get("kind") == AttackKind.BRUTE_FORCE or event.get("kind") in LOG_ONLY_ATTACKS:
+        # События журнала сами по себе не ухудшают качество штатных потоков.
         return False
     if event.get("kind") == AttackKind.DNS_FLOOD.value:
         return flow.get("server_node") == event["target_id"] and flow.get("traffic_kind") == "dns"
@@ -3010,7 +3169,7 @@ def _target_observation(
         )
         estimated_resource_utilization = baseline_cpu * service_availability
         estimated_queue_utilization = 0.0
-    elif brute_force:
+    elif brute_force or event["kind"] in LOG_ONLY_ATTACKS:
         # T1110.001 is represented as low-rate authentication telemetry, not
         # as a data-plane flood.  A failed login must not manufacture packet
         # loss or an outage in an unrelated subscriber service.
@@ -3019,6 +3178,12 @@ def _target_observation(
         input_voltage_ratio = 1.0
         energy_reserve = power_reserve
         estimated_resource_utilization = baseline_cpu
+        estimated_queue_utilization = 0.0
+    elif event["kind"] in {AttackKind.USER_EXECUTION, AttackKind.MOBILE_NETWORK_DOS}:
+        sensor = event["sensor_signals"]
+        service_availability = 1.0 - sensor.get("mobile_link_failure_ratio", 0.0)
+        output_availability, input_voltage_ratio, energy_reserve = 1.0, 1.0, power_reserve
+        estimated_resource_utilization = min(100.0, baseline_cpu + 100 * sensor.get("endpoint_cpu_rise_ratio", 0.0))
         estimated_queue_utilization = 0.0
     else:
         service_availability = max(0.0, 1.0 - pressure * 0.92)
@@ -3112,7 +3277,7 @@ def _build_attack_flows(
     *,
     identities: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    if event["kind"] in {AttackKind.POWER_ATTACK.value, AttackKind.BRUTE_FORCE.value}:
+    if event["effective_packet_rate_pps"] <= 0:
         return []
     is_reflection = event["kind"] == AttackKind.DDOS.value
     routes = event.get("response_routes" if is_reflection else "routes", [])
@@ -3164,7 +3329,8 @@ def _build_attack_flows(
             "flow_id": f"{event['attack_id']}-{event['step_index']}-{index + 1}",
             "step_index": event["step_index"], "time_seconds": event["time_seconds"],
             "interval_seconds": event["interval_seconds"], "application": app,
-            "transport": transport, "client_node": source_node, "service_node": event["target_id"],
+            "transport": transport, "protocol_stack": ["IPv4", transport],
+            "client_node": source_node, "service_node": event["target_id"],
             "server_node": event["target_id"],
             "client_ip": (
                 f"198.51.100.{10 + index}"
@@ -3196,6 +3362,7 @@ def _build_attack_flows(
             "observed_dropped_packets": dropped, "observed_retransmissions": 0,
             "sla_grade": "attack", "traffic_kind": event["kind"], "sequence_base": 0,
             "is_attack_traffic": True, "attack_id": event["attack_id"],
+            **{key: event[key] for key in ("attack_family", "attack_mechanism", "attack_label_ru") if key in event},
             "attack_traffic_leg": (
                 "amplified_external_reflector_response"
                 if is_reflection
@@ -3277,6 +3444,8 @@ def _precursor_signals(
         "application_work_pressure_ratio": round(min(1.0, _request_work_ratio(profile)) * visible_fraction, 6)
         if profile.kind == AttackKind.APPLICATION_FLOOD else 0.0,
         "suspicious_source_count": max(1, round(source_count * visible_fraction)),
+        "observed_ingress_count": max(1, round(len(profile.ingress_nodes) * visible_fraction)) if profile.ingress_nodes else 0,
+        "observed_reflection_ratio": round(visible_fraction, 6) if profile.kind == AttackKind.DDOS else 0.0,
         "source_entropy_ratio": round(source_entropy * visible_fraction, 6),
         "scan_rate_pps": round(scan_rate * visible_fraction, 3),
         "traffic_acceleration_ratio": round(acceleration * visible_fraction, 6),

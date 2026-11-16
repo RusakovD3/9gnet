@@ -11,6 +11,7 @@ from tempfile import NamedTemporaryFile
 from typing import Any
 
 from src.gnet9.address_visualizer import draw_ip_address_map, export_ip_address_plan
+from src.gnet9.attack_signatures import signature_catalog
 from src.gnet9.attacks import (
     MITRE_DEMO_STEP_COUNT,
     PREDICTIVE_DEMO_DEFAULT_SEED,
@@ -23,6 +24,7 @@ from src.gnet9.attacks import (
 )
 from src.gnet9.debug_visualizer import DebugFlowWindow, RuntimeCallTracer, export_debug_artifacts
 from src.gnet9.decision_dialogue import export_algorithm_dialogue
+from src.gnet9.detection_rules import export_detection_rules
 from src.gnet9.constants import ATTACK_KIND_DISPLAY_NAMES, RESPONSE_STAGE_DISPLAY_NAMES
 from src.gnet9.dynamics import DynamicsConfig, simulate_stationary_dynamics
 from src.gnet9.dynamics_charts import export_dynamics_charts
@@ -189,6 +191,7 @@ def export_attack_catalog(
         # `attacks` оставлен совместимым alias для прежнего mitre-demo.
         "attacks": mitre_catalog,
         "tensor_mappings": mitre_tensor_mapping_catalog(),
+        "observation_signature_matrix": signature_catalog(),
         "scenarios": {
             "mitre-demo": mitre_catalog,
             "predictive-demo": attack_catalog(
@@ -347,6 +350,7 @@ def export_stationary_dynamics(
     _write_dynamics_json(path, export_view)
     export_step_log(dynamics, path.with_name("step_log.csv"))
     export_run_summary(dynamics, path.parent)
+    export_detection_rules(model, dynamics["snapshots"], path.parent / "detection_rules")
     return dynamics
 
 
@@ -356,7 +360,7 @@ def export_step_log(dynamics: dict[str, Any], path: Path) -> None:
         "фильтр_применён", "переход_принят_в_обучение", "раннее_предупреждение",
         "окно_прогноза_начало_с", "окно_прогноза_конец_с",
         "SLA_gold", "SLA_silver", "SLA_bronze", "наблюдаемые_события", "цели_атак",
-        "рекомендации_человеку"]
+        "рекомендации_человеку", "семейство_и_механизм_событий"]
     phases = {"reference": "эталон", "nominal_training": "начальный участок наблюдения", "observation_and_recommendations": "наблюдение и рекомендации"}
     sla_by_step = {point["step_index"]: point["score"]
                    for point in dynamics.get("sla_resilience", {}).get("points", [])}
@@ -399,6 +403,7 @@ def export_step_log(dynamics: dict[str, Any], path: Path) -> None:
                 "; ".join(str(e.get("attack_id", "")) for e in attacks.get("events", [])),
                 "; ".join(sorted({str(e["target_id"]) for e in attacks.get("events", []) if e.get("target_id")})),
                 "; ".join(snapshot["arbitrator"]["recommendation"]["steps_ru"]),
+                "; ".join(e["attack_label_ru"] for e in attacks.get("events", []) if e.get("attack_label_ru")),
             ])
 
 

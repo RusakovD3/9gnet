@@ -236,6 +236,39 @@ def test_predictive_precursor_contains_only_current_sensor_telemetry() -> None:
     assert first_event["arrival_realization"]["observability"] == "available_only_after_attack_onset"
 
 
+def test_early_warning_uses_only_classified_confirmed_sensors() -> None:
+    reference = {"metric_names": ["OBS.precursor_confidence"], "vector": [0.0]}
+    analyzer = KoopmanOnlineAnalyzer.from_t0(MODEL, reference, step_seconds=2, warning_risk_threshold=0.0)
+    state = {**reference, "vector": [0.9]}
+    unknown = {"sensor_node_id": "C1", "signals": {"scan_rate_pps": 1}}
+    syn = {"sensor_node_id": "C2", "signals": {"syn_backlog_growth_ratio": 0.9}}
+    dns = {"sensor_node_id": "C3", "signals": {"dns_query_pressure_ratio": 0.9}}
+
+    def analyze(step, precursors):
+        return analyzer.analyze_step(
+            MODEL, state, attack_state={"scenario": "predictive-demo", "precursors": precursors},
+            step_index=step, time_seconds=step * 2,
+        )
+
+    analyze(0, [unknown])
+    unconfirmed = analyze(1, [unknown, syn])
+    assert unconfirmed["forecast_is_early_warning"] is False
+    assert not any(item["is_warning"] for item in unconfirmed["horizon_forecasts"])
+
+    confirmed = analyze(2, [syn, dns])
+    assert confirmed["forecast_is_early_warning"] is True
+    assert confirmed["forecast_target_ids"] == ["C2"]
+    assert confirmed["forecast_next_attack_kind"] == "syn_flood"
+    assert [(record["target_id"], record["kind"]) for record in confirmed["forecast_entity_records"]] == [
+        ("C2", "syn_flood"),
+    ]
+    assert all(item["target_ids"] == ["C2"] and item["attack_kind"] == "syn_flood"
+               for item in confirmed["horizon_forecasts"] if item["is_warning"])
+
+    after_gap = analyze(4, [syn])
+    assert after_gap["forecast_is_early_warning"] is False
+
+
 def test_predictive_demo_warns_before_attack_without_false_warning() -> None:
     dynamics = _predictive_dynamics()
     evaluation = dynamics["koopman_evaluation"]

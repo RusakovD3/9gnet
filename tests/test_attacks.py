@@ -5,7 +5,7 @@ from src.gnet9.attacks import (
     mitre_tensor_mapping_catalog,
 )
 from src.gnet9.constants import SUBSCRIBER_COUNT
-from src.gnet9.dynamics import DynamicsConfig, simulate_stationary_dynamics
+from src.gnet9.dynamics import DynamicsConfig, _koopman_evaluation, simulate_stationary_dynamics
 from src.gnet9.routing import path_uses_only_data_plane_transit
 from src.gnet9.topology_builder import GNetBaselineBuilder
 
@@ -13,10 +13,30 @@ from src.gnet9.topology_builder import GNetBaselineBuilder
 MODEL = GNetBaselineBuilder().build()
 
 
+def test_false_warning_requires_coverage_of_its_whole_window():
+    warning = {
+        "step_index": 1, "time_seconds": 5,
+        "koopman": {
+            "forecast_is_early_warning": True, "forecast_window_start_step": 2,
+            "forecast_window_end_step": 3,
+            "forecast_entity_records": [{"target_id": "C1", "kind": "dos"}],
+        },
+    }
+    partial = [warning, {"step_index": 2, "time_seconds": 10}]
+    complete = [*partial, {"step_index": 3, "time_seconds": 15}]
+    unresolved = _koopman_evaluation(partial, step_seconds=5, required_lead_seconds=5)
+    resolved = _koopman_evaluation(complete, step_seconds=5, required_lead_seconds=5)
+    assert unresolved["right_censored_warning_count"] == 1
+    assert unresolved["false_positive_warning_count"] == 0
+    assert resolved["right_censored_warning_count"] == 0
+    assert resolved["false_positive_warning_count"] == 1
+
+
 def test_attack_catalog_uses_official_mitre_techniques_and_explicit_assumptions() -> None:
     catalog = attack_catalog()
     assert {item["mitre_technique_id"] for item in catalog} == {
-        "T1498.001", "T1498.002", "T1499.001", "T1499.002", "T1499.003", "T1110.001", "T0831", "T1529"
+        "T1498.001", "T1498.002", "T1499.001", "T1499.002", "T1499.003", "T1110.001", "T0831", "T1529",
+        "T1068", "T1046", "T1204", "T1041", "T1464", None,
     }
     power = [item for item in catalog if item["kind"] == "power_attack"]
     assert {item["power_failure_mode"] for item in power} == {
@@ -30,9 +50,13 @@ def test_attack_catalog_uses_official_mitre_techniques_and_explicit_assumptions(
         "mitre_technique_id"
     ] == "T1529"
     assert {item["kind"] for item in catalog} == {
-        "dos", "ddos", "syn_flood", "brute_force", "power_attack", "dns_flood", "application_flood"
+        "dos", "ddos", "syn_flood", "brute_force", "power_attack", "dns_flood", "application_flood",
+        "bgp_hijack", "network_discovery", "privilege_escalation", "user_execution", "exfiltration", "mobile_network_dos",
+        "dhcp_flood",
     }
-    assert all(item["mitre_url"].startswith("https://attack.mitre.org/techniques/") for item in catalog)
+    assert all(item["mitre_url"].startswith("https://attack.mitre.org/techniques/")
+               for item in catalog if item["mitre_technique_id"])
+    assert next(item for item in catalog if item["kind"] == "bgp_hijack")["mitre_url"] is None
     assert all(
         item["technical"]["value_origin"] == "scenario_assumption"
         for item in catalog
@@ -146,7 +170,7 @@ def test_attack_flows_are_visible_and_separate_from_legitimate_flows() -> None:
     assert len(legitimate_flows) == SUBSCRIBER_COUNT
     assert {flow["application"] for flow in attack_flows} == {"ATTACK_DOS"}
     assert all(flow["mitre_technique_id"] == "T1498.001" for flow in attack_flows)
-    assert len(MITRE_DEMO_ATTACKS) == 8
+    assert len({profile.attack_id for profile in MITRE_DEMO_ATTACKS}) == len(MITRE_DEMO_ATTACKS) == 18
 
 
 def test_koopman_predictor_exports_causal_forecast_and_residual() -> None:
@@ -179,7 +203,7 @@ def test_koopman_predictor_exports_causal_forecast_and_residual() -> None:
     assert attack["threat_proximity"]["is_hausdorff_metric"] is False
 
 
-def test_koopman_warns_five_seconds_before_every_attack_onset() -> None:
+def test_koopman_warns_five_seconds_before_onsets_with_precursors() -> None:
     dynamics = simulate_stationary_dynamics(
         MODEL,
         DynamicsConfig(step_count=16, snapshot_detail="summary", packet_detail="flows", attack_scenario="mitre-demo"),
@@ -189,6 +213,7 @@ def test_koopman_warns_five_seconds_before_every_attack_onset() -> None:
     assert evaluation["predicted_before_onset_count"] == 8
     assert evaluation["minimum_observed_lead_seconds"] >= 5
     assert evaluation["false_positive_attack_id_count"] == 0
+    assert evaluation["right_censored_warning_count"] == 1
     assert evaluation["all_attacks_predicted_at_least_one_step_ahead"] is True
 
     for record in evaluation["records"]:

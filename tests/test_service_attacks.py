@@ -117,7 +117,7 @@ def test_service_precursor_classification_has_no_schedule_dependency(model, kind
     assert {"OBS.dns_query_pressure_ratio", "OBS.application_work_pressure_ratio"} <= THREAT_METRICS
 
 
-def test_default_mitre_demo_includes_both_new_events():
-    assert _simulation_timing(parse_args(["--attack-scenario", "mitre-demo"])) == (16, 5)
+def test_default_mitre_demo_includes_all_events():
+    assert _simulation_timing(parse_args(["--attack-scenario", "mitre-demo"])) == (45, 5)
     assert _simulation_timing(parse_args([])) == (10, 5)
     assert _simulation_timing(parse_args(["--attack-scenario", "mitre-demo", "--dynamics-steps", "0"])) == (0, 5)

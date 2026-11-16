@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 import math
 
+from .l1_d0sl import weighted_sla_compliance
 from .models import NetworkModel, StateTensor
 
 
@@ -58,9 +59,16 @@ THREAT_CONTROLS = {
     "ddos": ["rate_limit_attack_traffic", "review_gold_service_impact", "review_upstream_protection"],
     "syn_flood": ["enable_syn_protection", "protect_endpoint_queue"],
     "dns_flood": ["review_dns_request_limits", "review_dns_service_logs"],
+    "dhcp_flood": ["review_address_assignment_service_telemetry"],
     "application_flood": ["review_expensive_request_limits", "review_application_cpu_budget"],
     "brute_force": ["enforce_account_lockout_policy", "review_failed_authentication_events"],
     "power_attack": ["check_power_domain", "check_energy_reserve"],
+    "bgp_hijack": ["review_prefix_origin_validation"],
+    "privilege_escalation": ["review_endpoint_privilege_audit"],
+    "network_discovery": ["review_service_connection_logs"],
+    "user_execution": ["correlate_user_and_process_events"],
+    "exfiltration": ["review_egress_and_channel_evidence"],
+    "mobile_network_dos": ["compare_mobile_connectivity_and_coverage"],
 }
 
 
@@ -200,6 +208,7 @@ def evaluate_defense_game(
     target_ids: list[str],
     threat_pressure: float,
     matrix_koopman_pressure: float,
+    sla_tiers: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Evaluate a small defender--attacker normal-form game for L7.
 
@@ -236,9 +245,11 @@ def evaluate_defense_game(
         default=(0.25 if hierarchy else 0.0),
     )
     target_criticality = min(1.0, max(0.0, target_criticality))
+    compliance = weighted_sla_compliance(sla_tiers or [])
+    sla_risk = 1.0 - compliance if compliance is not None else None
     effective_threat = min(
         1.0,
-        max(float(threat_pressure), 0.35 * float(matrix_koopman_pressure)),
+        max(float(threat_pressure), 0.35 * float(matrix_koopman_pressure), sla_risk or 0.0),
     )
     defender_actions = (
         ("OBSERVE", 0.00, 0.00),
@@ -277,19 +288,17 @@ def evaluate_defense_game(
         )
         if cell["defender_payoff"] >= defender_best - 1e-12 and cell["attacker_payoff"] >= attacker_best - 1e-12:
             pure_equilibria.append(cell)
+    worst_case = {
+        action: min(item["defender_payoff"] for item in matrix if item["defender_action"] == action)
+        for action, _, _ in defender_actions
+    }
+    wald_action = max(worst_case, key=worst_case.get)
     if pure_equilibria:
         selected = max(pure_equilibria, key=lambda cell: cell["defender_payoff"])
         selection_mode = "pure_strategy_nash_equilibrium"
     else:
-        worst_case = {
-            action: min(
-                item["defender_payoff"] for item in matrix if item["defender_action"] == action
-            )
-            for action, _, _ in defender_actions
-        }
-        selected_action = max(worst_case, key=worst_case.get)
         selected = max(
-            (item for item in matrix if item["defender_action"] == selected_action),
+            (item for item in matrix if item["defender_action"] == wald_action),
             key=lambda item: item["attacker_payoff"],
         )
         selection_mode = "maximin_fallback_no_pure_nash_equilibrium"
@@ -302,9 +311,11 @@ def evaluate_defense_game(
         "target_rows": target_rows,
         "target_criticality": round(target_criticality, 6),
         "threat_pressure": round(effective_threat, 6),
+        "observed_sla_risk": round(sla_risk, 6) if sla_risk is not None else None,
         "matrix_koopman_pressure": round(float(matrix_koopman_pressure), 6),
         "payoff_matrix": matrix,
         "pure_nash_equilibria": pure_equilibria,
+        "wald_maximin": {"action": wald_action, "worst_payoff_by_action": worst_case},
         "equilibrium_found": bool(pure_equilibria),
         "selection_mode": selection_mode,
         "selected": selected,

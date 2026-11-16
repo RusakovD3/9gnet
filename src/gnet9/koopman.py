@@ -18,7 +18,8 @@ import numpy as np
 
 from .kalman import DiagonalKalmanFilter, DEFAULT_PROCESS_VARIANCE, DEFAULT_MEASUREMENT_VARIANCE
 from .local_observation import LocalObservationFilter, is_smoothable_metric
-from .attacks import MITRE_T1110_001_ATTEMPTS_PER_SECOND
+from .attack_signatures import LAG_WEIGHTS, match_attack_signature
+from .attacks import MITRE_T1110_001_ATTEMPTS_PER_SECOND, MITRE_TENSOR_MAPPINGS
 from .arbitrator import build_trigger_card, evaluate_defense_game
 from .metrics import gold_threat_proximity_view
 from .routing import FixedTopologyRoutes
@@ -142,6 +143,8 @@ class KoopmanOnlineAnalyzer:
     lyapunov_solver_residual: float
     state_history: list[np.ndarray] = field(default_factory=list)
     sensor_streaks: dict[str, int] = field(default_factory=dict)
+    last_sensor_step: int | None = None
+    signature_history: dict[tuple[str, str], dict[int, dict | None]] = field(default_factory=dict)
     delay_embedding_depth: int = 4
     maximum_forecast_horizon_steps: int = 5
     required_prediction_lead_seconds: int = 10
@@ -270,7 +273,8 @@ class KoopmanOnlineAnalyzer:
         active_attack_score = _attack_score(self.metric_names, current)
         precursor_score = _precursor_score(self.metric_names, current)
         observable_precursor_now = _observable_precursor_present(attack_state, precursor_score)
-        observable_attack_now = bool(attack_state.get("events", []))
+        observed_events = attack_state.get("events", [])
+        observable_attack_now = bool(observed_events)
         healthy_quality = _healthy_quality_observation(self.metric_names, current, attack_state)
         if self.kalman_filter is None:
             self.kalman_filter = DiagonalKalmanFilter(len(self.metric_names))
@@ -281,7 +285,12 @@ class KoopmanOnlineAnalyzer:
         filter_applied = (healthy_quality and not observable_attack_now and not observable_precursor_now
                           and max(active_attack_score, precursor_score) < NOMINAL_THREAT_SCORE_LIMIT)
         local_observation = (
-            self.local_filter.analyze(runtime_state, nominal=filter_applied)
+            self.local_filter.analyze(
+                runtime_state, nominal=filter_applied, step_index=step_index,
+                event_active=observable_attack_now, precursor_active=observable_precursor_now,
+                observed_events=tuple((str(event.get("target_id", "")), str(event.get("kind", "")),
+                                       bool(event.get("is_recovery_effect"))) for event in observed_events),
+            )
             if self.local_filter is not None and runtime_state is not None else None
         )
         tensor_input = self._filter_tensor_observation(tensor_matrices) if filter_applied else tensor_matrices
@@ -332,6 +341,19 @@ class KoopmanOnlineAnalyzer:
         # начала атаки, ни её скрытый идентификатор здесь не используются.
         delay_history = [*self.state_history, z_current.copy()][-self.delay_embedding_depth :]
         observed_trend = _delay_trend(delay_history, self.metric_names)
+        forecast_entities = _forecast_entities(attack_state, self.signature_history, step_index)
+        observed_sensors = {
+            str(item["sensor_node_id"]) for item in attack_state.get("precursors", [])
+            if item.get("sensor_node_id") and isinstance(item.get("signals"), dict) and item["signals"]
+        }
+        previous_streaks = self.sensor_streaks if self.last_sensor_step == step_index - 1 else {}
+        self.sensor_streaks = {sensor: previous_streaks.get(sensor, 0) + 1 for sensor in observed_sensors}
+        self.last_sensor_step = step_index
+        required_confirmation_samples = 1 if attack_state.get("scenario") == "mitre-demo" else 2
+        confirmed_records = [record for record in forecast_entities["next_entity_records"]
+                             if self.sensor_streaks[record["target_id"]] >= required_confirmation_samples]
+        confirmed_sensors = {record["target_id"] for record in confirmed_records}
+        predicted_next_attack = _predicted_precursor_kind(attack_state, confirmed_records)
         horizon_forecasts, predicted_vectors = _multi_horizon_forecasts(
             metric_names=self.metric_names,
             reference_vector=self.reference_vector,
@@ -340,6 +362,9 @@ class KoopmanOnlineAnalyzer:
             z_current=z_current,
             observed_trend=observed_trend,
             attack_state=attack_state,
+            target_ids=sorted(confirmed_sensors) or forecast_entities["current_target_ids"],
+            precursor_confirmed=bool(confirmed_records),
+            precursor_kind=predicted_next_attack,
             precursor_score=precursor_score,
             active_attack_score=active_attack_score,
             residual=residual,
@@ -411,8 +436,7 @@ class KoopmanOnlineAnalyzer:
             lyapunov_value,
             self.step_seconds,
         )
-        predicted_attack = _predicted_attack_kind(attack_state, forecast_risk)
-        predicted_next_attack = _predicted_precursor_kind(attack_state)
+        predicted_attack = _predicted_attack_kind(attack_state, forecast_risk, predicted_next_attack)
         current_attack = _current_attack_kind(attack_state)
         cooldown_age_steps = (
             None
@@ -444,34 +468,8 @@ class KoopmanOnlineAnalyzer:
             if post_incident_cooldown
             else _alert_level(forecast_risk)
         )
-        forecast_entities = _forecast_entities(attack_state)
-        observed_sensors = {
-            str(item.get("sensor_node_id"))
-            for item in attack_state.get("precursors", [])
-            if item.get("sensor_node_id") and isinstance(item.get("signals"), dict)
-        }
-        self.sensor_streaks = {
-            sensor: self.sensor_streaks.get(sensor, 0) + 1
-            for sensor in observed_sensors
-        }
-        required_confirmation_samples = (
-            1 if attack_state.get("scenario") == "mitre-demo" else 2
-        )
-        confirmed_sensors = {
-            sensor for sensor, count in self.sensor_streaks.items()
-            if count >= required_confirmation_samples
-        }
-        if confirmed_sensors:
-            forecast_entities["next_target_ids"] = sorted(
-                set(forecast_entities["next_target_ids"]) & confirmed_sensors
-            )
         warning_forecasts = [item for item in horizon_forecasts if bool(item["is_warning"])]
-        early_warning = bool(
-            _observable_precursor_present(attack_state, precursor_score)
-            and bool(confirmed_sensors)
-            and predicted_next_attack not in {"none", "unknown_degradation_or_attack"}
-            and warning_forecasts
-        )
+        early_warning = bool(warning_forecasts)
         first_warning = warning_forecasts[0] if early_warning else horizon_forecasts[0]
         last_warning = warning_forecasts[-1] if early_warning else horizon_forecasts[-1]
         forecast_target_step = int(first_warning["target_step"])
@@ -673,12 +671,13 @@ class KoopmanOnlineAnalyzer:
             "current_attack_ids": forecast_entities["attack_ids"],
             "forecast_correlation_ids": forecast_entities["correlation_ids"],
             "forecast_entity_records": (
-                forecast_entities["next_entity_records"]
+                confirmed_records
                 if early_warning else forecast_entities["current_entity_records"]
             ),
+            "signature_entity_records": forecast_entities["signature_entity_records"],
             "current_attack_entity_records": forecast_entities["current_entity_records"],
             "forecast_target_ids": (
-                forecast_entities["next_target_ids"] if early_warning else forecast_entities["target_ids"]
+                sorted(confirmed_sensors) if early_warning else forecast_entities["target_ids"]
             ),
             "current_attack_target_ids": forecast_entities["current_target_ids"],
             "forecast_window": f"{forecast_window_start_seconds}-{forecast_window_end_seconds}s",
@@ -885,13 +884,13 @@ def apply_koopman_to_arbitrator(
     analysis["remap_pressure"] = new_pressure
     attacks = snapshot.get("attacks", {})
     confirmed = bool(attacks.get("active") or koopman.get("forecast_is_early_warning"))
-    source_confirmed = any(event.get("ingress_nodes") for event in attacks.get("events", []))
     card = build_trigger_card(
         hausdorff=float(analysis.get("state_hausdorff", {}).get("normalized_distance", 0.0)),
         risk=float(koopman["forecast_risk_score"]), lyapunov_pressure=stability_pressure,
         decision_pressure=new_pressure, confirmed=confirmed,
         attack_kind=str(koopman.get("forecast_attack_kind", "none")),
-        source_confirmed=source_confirmed,
+        # Точка входа в модель, особенно у отражённого трафика, не подтверждает источник.
+        source_confirmed=False,
     )
     arbitrator["trigger_card"] = card
     recommendation = dict(koopman["arbitrator_recommendation"])
@@ -912,6 +911,7 @@ def apply_koopman_to_arbitrator(
             model, target_ids=list(koopman.get("forecast_target_ids", [])) or list(koopman.get("current_attack_target_ids", [])),
             threat_pressure=max(float(koopman["forecast_risk_score"]), new_pressure),
             matrix_koopman_pressure=matrix_pressure,
+            sla_tiers=attacks.get("sla_restoration", {}).get("tiers"),
         )
 
 
@@ -1022,6 +1022,9 @@ def _multi_horizon_forecasts(
     z_current: np.ndarray,
     observed_trend: np.ndarray,
     attack_state: dict[str, Any],
+    target_ids: list[str],
+    precursor_confirmed: bool,
+    precursor_kind: str,
     precursor_score: float,
     active_attack_score: float,
     residual: float,
@@ -1039,11 +1042,8 @@ def _multi_horizon_forecasts(
     z_iterated = z_current.copy()
     z_dmd_only = z_current.copy()
     threat_indices = [index for index, name in enumerate(metric_names) if name in THREAT_METRICS]
-    precursor_kind = _predicted_precursor_kind(attack_state)
     current_kind = _current_attack_kind(attack_state)
-    predicted_kind = precursor_kind if precursor_kind != "none" else current_kind
-    entities = _forecast_entities(attack_state)
-    target_ids = entities["next_target_ids"] or entities["current_target_ids"]
+    predicted_kind = precursor_kind if precursor_confirmed or current_kind == "none" else current_kind
     precursor_observed = _observable_precursor_present(attack_state, precursor_score)
 
     for horizon_steps in range(1, max(1, maximum_horizon_steps) + 1):
@@ -1123,6 +1123,7 @@ def _multi_horizon_forecasts(
                 "alert_level": _alert_level(risk),
                 "is_warning": bool(
                     precursor_observed
+                    and precursor_confirmed
                     and risk >= warning_risk_threshold
                 ),
                 "prediction_origin": (
@@ -1401,50 +1402,11 @@ def _forecast_risk(
 
 
 def _classify_precursor_signals(signals: dict[str, Any]) -> str:
-    """Классифицировать предвестник только по наблюдаемой телеметрии.
-
-    Пороги заданы в нормированных координатах демонстрационного датчика. Они
-    намеренно требуют второй ступени плавного 20-секундного тренда; отдельно
-    анализатор проверяет два последовательных отсчёта, поэтому одиночный
-    выброс не авторизует превентивную защиту.
-    """
-    if float(signals.get("dns_query_pressure_ratio", 0.0)) >= 0.30:
-        return "dns_flood"
-    if float(signals.get("application_work_pressure_ratio", 0.0)) >= 0.30:
-        return "application_flood"
-    if (
-        float(signals.get("authentication_failure_rate_per_second", 0.0)) >= 0.025
-        and float(signals.get("authentication_failure_ratio", 0.0)) >= 0.8
-    ):
-        return "brute_force"
-    if (
-        float(signals.get("power_control_anomaly_ratio", 0.0)) >= 0.18
-        or float(signals.get("power_voltage_sag_ratio", 0.0)) >= 0.02
-    ):
-        return "power_attack"
-    if float(signals.get("syn_backlog_growth_ratio", 0.0)) >= 0.18:
-        return "syn_flood"
-    if (
-        # В модели источниками являются реальные L1-абоненты, поэтому даже
-        # 3 независимых источника уже отличают распределённое воздействие от
-        # одноисточникового DoS. Порог 100 относился бы к внешнему ботнету и
-        # пропускал бы локальную распределённую атаку.
-        int(signals.get("suspicious_source_count", 0)) >= 2
-        and float(signals.get("source_entropy_ratio", 0.0)) >= 0.05
-        and float(signals.get("traffic_acceleration_ratio", 0.0)) >= 0.15
-    ):
-        return "ddos"
-    if (
-        # Для одноисточникового DoS второй последовательный отсчёт пересекает
-        # оба порога; первая слабая ступень smoothstep остаётся ниже них.
-        float(signals.get("traffic_acceleration_ratio", 0.0)) >= 0.11
-        and float(signals.get("target_concentration_ratio", 0.0)) >= 0.22
-    ):
-        return "dos"
-    return "unknown_degradation_or_attack"
+    match = match_attack_signature(signals)
+    return match["kind"] if match else "unknown_degradation_or_attack"
 
 
-def _predicted_attack_kind(attack_state: dict[str, Any], forecast_risk: float) -> str:
+def _predicted_attack_kind(attack_state: dict[str, Any], forecast_risk: float, precursor_kind: str) -> str:
     events = attack_state.get("events", []) if isinstance(attack_state, dict) else []
     precursors = attack_state.get("precursors", []) if isinstance(attack_state, dict) else []
     if events or precursors:
@@ -1452,10 +1414,8 @@ def _predicted_attack_kind(attack_state: dict[str, Any], forecast_risk: float) -
             str(event.get("kind", "unknown"))
             for event in events
         }
-        kinds.update(
-            _classify_precursor_signals(item.get("signals", {}))
-            for item in precursors
-        )
+        if precursor_kind != "none":
+            kinds.update(precursor_kind.split("+"))
         return "+".join(sorted(kinds))
     if forecast_risk >= 0.50:
         return "unknown_degradation_or_attack"
@@ -1464,10 +1424,12 @@ def _predicted_attack_kind(attack_state: dict[str, Any], forecast_risk: float) -
     return "none"
 
 
-def _predicted_precursor_kind(attack_state: dict[str, Any]) -> str:
+def _predicted_precursor_kind(attack_state: dict[str, Any], classified_records=None) -> str:
     precursors = attack_state.get("precursors", []) if isinstance(attack_state, dict) else []
     if not precursors:
         return "none"
+    if classified_records is not None:
+        return "+".join(sorted({item["kind"] for item in classified_records})) or "unknown_degradation_or_attack"
     return "+".join(sorted({_classify_precursor_signals(item.get("signals", {})) for item in precursors}))
 
 
@@ -1508,12 +1470,24 @@ def _recommendation(
             steps.append("Проверьте очередь незавершённых соединений и настройки защиты SYN.")
         if "dns_flood" in predicted_attack:
             steps.append("Проверьте частоту DNS-запросов и журнал службы; рассмотрите ограничения запросов после подтверждения источника.")
+        if "dhcp_flood" in predicted_attack:
+            steps.append("Проверьте журнал выдачи адресов, загрузку службы DHCP и точки, на которых наблюдаются запросы.")
         if "application_flood" in predicted_attack:
             steps.append("Проверьте тяжёлые запросы медиаприложения и загрузку процессора; рассмотрите лимиты дорогих операций после подтверждения источника.")
         if "brute_force" in predicted_attack:
             steps.append("Проверьте ошибки входа; рассмотрите многофакторную аутентификацию и правила блокировки учётных записей.")
         if "power_attack" in predicted_attack:
             steps.append("Проверьте журнал управления питанием, напряжение и запас энергии ИБП (источника бесперебойного питания).")
+        for kind, instruction in {
+            "bgp_hijack": "Сверьте происхождение префикса с RPKI (реестром полномочий на объявление адресов) и журналом маршрутизации.",
+            "privilege_escalation": "Сверьте изменение привилегий с аудитом узла и разрешёнными действиями администратора.",
+            "network_discovery": "Сопоставьте обращения к разным службам с расписанием разрешённых проверок.",
+            "user_execution": "Сопоставьте время запуска процесса и рост загрузки CPU с действиями пользователя.",
+            "exfiltration": "Проверьте объём исходящего потока, назначение и связь с известным каналом управления.",
+            "mobile_network_dos": "Сравните доступность мобильного абонента с соседними линиями и картой покрытия.",
+        }.items():
+            if kind in predicted_attack.split("+"):
+                steps.append(instruction)
         steps.append("Подтвердите источник по журналам до решения об ограничении доступа; решение и выполнение остаются за человеком.")
     if lyapunov_remap_pressure > 0.0:
         steps.append("Проверьте рост отклонения состояния по Ляпунову на следующих наблюдениях.")
@@ -1528,28 +1502,25 @@ def _recommendation(
     }
 
 
-def _forecast_entities(attack_state: dict[str, Any]) -> dict[str, Any]:
+def _forecast_entities(attack_state: dict[str, Any], history, step_index: int) -> dict[str, Any]:
     events = attack_state.get("events", []) if isinstance(attack_state, dict) else []
     precursors = attack_state.get("precursors", []) if isinstance(attack_state, dict) else []
     # Для раннего прогноза допустимы только идентификатор узла, на котором
     # измерен сигнал, и сами сигналы. attack_id/start_step намеренно не читаются.
-    next_records = [
-        {
-            "observation_type": "precursor",
-            "target_id": str(item.get("sensor_node_id")),
-            "kind": _classify_precursor_signals(item.get("signals", {})),
-            "source_ids": sorted(str(source) for source in item.get("observed_source_node_ids", []) if source),
-        }
-        for item in precursors
-        if item.get("sensor_node_id")
-        and _classify_precursor_signals(item.get("signals", {})) != "unknown_degradation_or_attack"
-    ]
+    for channel, samples in list(history.items()):
+        history[channel] = {step: sample for step, sample in samples.items()
+                            if step_index - len(LAG_WEIGHTS) < step < step_index}
+        if not history[channel]:
+            del history[channel]
+    next_records = _signature_records(precursors, "precursor", history, step_index)
+    signature_records = _signature_records(attack_state.get("signature_observations", []), "observed_signature", history, step_index)
     current_records = [
         {
             "observation_type": "active_event",
             "attack_id": str(item.get("attack_id", "")),
             "target_id": str(item.get("target_id")),
             "kind": str(item.get("kind", "unknown")),
+            **{key: item[key] for key in ("attack_family", "attack_mechanism", "attack_label_ru") if key in item},
             "source_ids": sorted(str(source) for source in item.get("ingress_nodes", []) if source),
         }
         for item in events
@@ -1590,7 +1561,36 @@ def _forecast_entities(attack_state: dict[str, Any]) -> dict[str, Any]:
         "entity_records": [*current_records, *next_records],
         "current_entity_records": current_records,
         "next_entity_records": next_records,
+        "signature_entity_records": signature_records,
     }
+
+
+def _signature_records(observations, observation_type, history, step_index):
+    records = []
+    for item in observations:
+        sensor_id = item.get("sensor_node_id")
+        if not sensor_id:
+            continue
+        signals = item.get("signals", {})
+        samples = history.setdefault((observation_type, str(sensor_id)), {})
+        previous = [samples.get(step_index - lag) for lag in range(1, len(LAG_WEIGHTS))]
+        match = match_attack_signature(signals, history=previous)
+        # Два показания в одной точке в тот же шаг нельзя склеивать в одну сигнатуру.
+        samples[step_index] = None if step_index in samples else dict(signals)
+        if match is None:
+            continue
+        kind = match["kind"]
+        records.append({
+            "observation_type": observation_type,
+            "target_id": str(sensor_id),
+            "kind": kind,
+            "feature_match": match,
+            **{key: match[key] for key in ("attack_family", "attack_mechanism", "attack_label_ru") if key in match},
+            "mitre_technique_candidates": [mapping.technique_id for mapping in MITRE_TENSOR_MAPPINGS
+                                           if mapping.attack_kind.value == kind],
+            "source_ids": sorted(str(source) for source in item.get("observed_source_node_ids", []) if source),
+        })
+    return records
 
 
 def _sla_restoration_plan(attack_state: dict[str, Any]) -> dict[str, Any]:

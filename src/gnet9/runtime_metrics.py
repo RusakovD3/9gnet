@@ -24,7 +24,9 @@ EDGE_METRICS = (
 EDGE_UNITS = ("Mbit/s", "ms", "ms", "ratio", "ratio", "ratio", "Mbit/s", "ratio", "ratio")
 ATTACK_PROFILES = {"normal": 0, "dos": 1, "ddos": 2, "syn_flood": 3,
                    "brute_force": 4, "power_attack": 5, "mixed": 6,
-                   "dns_flood": 7, "application_flood": 8}
+                   "dns_flood": 7, "application_flood": 8,
+                   "bgp_hijack": 9, "privilege_escalation": 10, "network_discovery": 11,
+                   "user_execution": 12, "exfiltration": 13, "mobile_network_dos": 14, "dhcp_flood": 15}
 
 
 def _tensor_value(attrs: dict[str, Any], name: str, default: float = 0.0) -> float:
@@ -86,8 +88,12 @@ def network_runtime_metrics(model, flows: list[dict[str, Any]], events=(), *, de
         for source, target in zip(route, route[1:]):
             edge_flows[tuple(sorted((source, target)))].append(flow)
     active_by_node = defaultdict(set)
+    endpoint_cpu_rise = defaultdict(float)
     for event in events:
-        active_by_node[event["target_id"]].add(event["kind"])
+        target = event["target_id"]
+        active_by_node[target].add(event["kind"])
+        endpoint_cpu_rise[target] = max(endpoint_cpu_rise[target],
+                                        float(event.get("sensor_signals", {}).get("endpoint_cpu_rise_ratio", 0.0)))
     nodes = []
     for node, attrs in sorted(model.graph.nodes(data=True)):
         carried = node_flows[node]
@@ -118,6 +124,7 @@ def network_runtime_metrics(model, flows: list[dict[str, Any]], events=(), *, de
         normal_packets = sum(int(f["packet_count"]) for f in normal)
         baseline_cpu = _tensor_value(attrs, "cpu_load_percent", float(attrs.get("runtime", {}).get("cpu_util_percent", 0.0)))
         cpu = max(baseline_cpu, 100.0 * queue["busy_probability"]) if attrs.get("level") == "L2" or attrs.get("role") == "service-server" else baseline_cpu
+        cpu = min(100.0, cpu + 100 * endpoint_cpu_rise[node])
         values = (arrival, negative, service, min(1.0, queue["busy_probability"]),
                   observed_drops / max(normal_packets, 1), queue["mean_queue_packets"],
                   queue["mean_system_time_ms"], queue["delay_variance_ms2"],

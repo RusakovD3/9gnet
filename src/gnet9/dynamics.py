@@ -41,6 +41,7 @@ from .metrics import (
 from .models import NetworkModel, StateTensor
 from .kalman import DEFAULT_PROCESS_VARIANCE, DEFAULT_MEASUREMENT_VARIANCE, validate_noise_variances
 from .hypernetwork import hypernetwork_embedding
+from .l1_d0sl import SLA_GRADE_WEIGHTS, weighted_sla_compliance
 from .packet_simulator import TRAFFIC_APPS, simulate_packet_snapshot
 from .routing import FixedTopologyRoutes
 from .tensor_matrix import (
@@ -262,6 +263,7 @@ def _attack_response_evaluation(snapshots: list[dict[str, Any]]) -> list[dict[st
         for event in snapshot.get("attacks", {}).get("events", []):
             record = records.setdefault(event["attack_id"], {
                 "attack_id": event["attack_id"], "kind": event["kind"], "target_id": event["target_id"],
+                **{key: event[key] for key in ("attack_family", "attack_mechanism", "attack_label_ru") if key in event},
                 "first_step": snapshot["step_index"], "last_step": snapshot["step_index"],
                 "maximum_hausdorff": 0.0, "maximum_koopman_risk": 0.0,
                 "maximum_lyapunov_pressure": 0.0,
@@ -1140,10 +1142,15 @@ def _koopman_evaluation(
     окно и совпали ли наблюдаемая цель и класс телеметрии.
     """
     onset_events: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    warning_windows = []
     for snapshot in snapshots:
         for event in snapshot.get("attacks", {}).get("events", []):
             if int(event.get("relative_step", -1)) == 0:
                 onset_events.append((snapshot, event))
+        koopman = snapshot.get("koopman", {})
+        if koopman.get("forecast_is_early_warning"):
+            window_start, window_end = _forecast_step_window(koopman)
+            warning_windows.append((snapshot, window_start, window_end, _forecast_entity_pairs(koopman)))
 
     records: list[dict[str, Any]] = []
     for onset_snapshot, event in onset_events:
@@ -1153,15 +1160,11 @@ def _koopman_evaluation(
         onset_time = int(onset_snapshot.get("time_seconds", 0))
         onset_step = int(onset_snapshot.get("step_index", -2))
         candidates = []
-        for snapshot in snapshots:
-            koopman = snapshot.get("koopman", {})
-            window_start, window_end = _forecast_step_window(koopman)
-            predicted_pairs = _forecast_entity_pairs(koopman)
+        for snapshot, window_start, window_end, predicted_pairs in warning_windows:
             if (
                 int(snapshot.get("time_seconds", 0)) < onset_time
                 and window_start <= onset_step <= window_end
                 and (target_id, attack_kind) in predicted_pairs
-                and koopman.get("forecast_is_early_warning")
             ):
                 candidates.append(snapshot)
         # Самое раннее подтверждённое предупреждение показывает фактический
@@ -1184,43 +1187,34 @@ def _koopman_evaluation(
         )
 
     false_warnings: list[dict[str, Any]] = []
-    last_false_step_by_pair: dict[tuple[str, str], int] = {}
+    censored_warnings: list[dict[str, Any]] = []
+    last_unmatched_step: dict[tuple[bool, str, str], int] = {}
+    last_observed_step = max((int(snapshot.get("step_index", 0)) for snapshot in snapshots), default=0)
     onset_by_step: dict[int, list[dict[str, Any]]] = {}
     for onset_snapshot, event in onset_events:
         onset_by_step.setdefault(int(onset_snapshot.get("step_index", 0)), []).append(event)
-    for snapshot in snapshots:
-        koopman = snapshot.get("koopman", {})
-        if not koopman.get("forecast_is_early_warning"):
-            continue
-        window_start, window_end = _forecast_step_window(koopman)
-        predicted_pairs = _forecast_entity_pairs(koopman)
-        actual = [
-            event
+    for snapshot, window_start, window_end, predicted_pairs in warning_windows:
+        actual_pairs = {
+            (event.get("target_id"), event.get("kind"))
             for step in range(window_start, window_end + 1)
             for event in onset_by_step.get(step, [])
-        ]
-        for target_id, predicted_kind in predicted_pairs:
-            if not any(
-                event.get("target_id") == target_id and event.get("kind") == predicted_kind
-                for event in actual
-            ):
-                warning_step = int(snapshot.get("step_index", 0))
-                pair = (target_id, predicted_kind)
-                previous_step = last_false_step_by_pair.get(pair)
-                # Consecutive samples of the same unresolved alert form one
-                # false-warning episode rather than inflating the denominator.
-                if previous_step is None or warning_step > previous_step + 1:
-                    false_warnings.append(
-                        {
-                            "warning_step": warning_step,
-                            "forecast_window_start_step": window_start,
-                            "forecast_window_end_step": window_end,
-                            "target_id": target_id,
-                            "predicted_kind": predicted_kind,
-                            "counting_semantics": "deduplicated_contiguous_warning_episode",
-                        }
-                    )
-                last_false_step_by_pair[pair] = warning_step
+        }
+        warning_step = int(snapshot.get("step_index", 0))
+        censored = window_end > last_observed_step
+        destination = censored_warnings if censored else false_warnings
+        for target_id, predicted_kind in sorted(predicted_pairs - actual_pairs):
+            key = (censored, target_id, predicted_kind)
+            previous_step = last_unmatched_step.get(key)
+            if previous_step is None or warning_step > previous_step + 1:
+                destination.append({
+                    "warning_step": warning_step,
+                    "forecast_window_start_step": window_start,
+                    "forecast_window_end_step": window_end,
+                    "target_id": target_id,
+                    "predicted_kind": predicted_kind,
+                    "counting_semantics": "deduplicated_contiguous_warning_episode",
+                })
+            last_unmatched_step[key] = warning_step
     predicted_count = sum(1 for item in records if item["predicted_before_onset"])
     leads = [int(item["lead_time_seconds"]) for item in records if item["predicted_before_onset"]]
     slo_predicted_count = sum(
@@ -1288,7 +1282,7 @@ def _koopman_evaluation(
     }
     slo_status = (
         "PASSED_SYNTHETIC_SCENARIO"
-        if records and not slo_misses and not false_warnings
+        if records and not slo_misses and not false_warnings and not censored_warnings
         else "FAILED_OR_NOT_APPLICABLE"
     )
     slo_status_ru = (
@@ -1326,6 +1320,8 @@ def _koopman_evaluation(
         "false_positive_attack_id_count": len(false_warnings),
         "false_positive_warning_count": len(false_warnings),
         "false_positive_warnings": false_warnings,
+        "right_censored_warning_count": len(censored_warnings),
+        "right_censored_warnings": censored_warnings,
         "minimum_observed_lead_seconds": min(leads, default=0),
         "maximum_observed_lead_seconds": max(leads, default=0),
         "mean_observed_lead_seconds": sum(leads) / max(len(leads), 1),
@@ -1340,7 +1336,8 @@ def _koopman_evaluation(
         "prediction_slo_semantics_ru": (
             "Строгая постпроверка: каждое фактическое начало должно быть "
             f"предупреждено минимум за {required_lead_seconds} с; ложные "
-            "предупреждения считаются отдельными эпизодами."
+            "предупреждения считаются отдельными эпизодами. Если окно выходит за пределы "
+            "прогона и совпадения нет, предупреждение остаётся непроверенным."
         ),
         "false_warnings_per_simulated_hour": (
             len(false_warnings) * 3600.0 / max(duration_seconds, 1)
@@ -1598,17 +1595,15 @@ def _json_value(value: Any) -> Any:
 
 def _sla_resilience(snapshots, step_seconds):
     """Среднее соблюдение SLA за фактически пройденный промежуток."""
-    weights = {"gold": 3, "silver": 2, "bronze": 1}
     points = []
     for snapshot in snapshots:
         if snapshot["step_index"] == 0:
             continue
         tiers = snapshot.get("attacks", {}).get("sla_restoration", {}).get("tiers", [])
-        numerator = sum(weights[t["sla_grade"]] * int(t["sla_compliant_flow_count"]) for t in tiers)
-        denominator = sum(weights[t["sla_grade"]] * int(t["flow_count"]) for t in tiers)
-        if denominator:
-            points.append({"step_index": snapshot["step_index"], "score": numerator / denominator})
-    return {"grade_weights": weights, "time_mean": sum(p["score"] for p in points) / len(points) if points else None,
+        score = weighted_sla_compliance(tiers)
+        if score is not None:
+            points.append({"step_index": snapshot["step_index"], "score": score})
+    return {"grade_weights": dict(SLA_GRADE_WEIGHTS), "time_mean": sum(p["score"] for p in points) / len(points) if points else None,
             "minimum": min((p["score"] for p in points), default=None),
             "observed_duration_seconds": len(points) * step_seconds, "points": points,
             "definition": "weighted_compliant_flows_divided_by_weighted_accounted_flows",

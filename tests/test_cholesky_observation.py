@@ -79,6 +79,78 @@ def test_local_causal_prefix_and_axis_permutations():
     assert result["vertices"]["maximum_mask_distance"] == pytest.approx(.1 / np.sqrt(.0026))
 
 
+def test_local_chi_square_gate_preserves_observation_and_protects_filter_memory():
+    reference = _state()
+    bank = LocalObservationFilter(reference, process_variance=.5, measurement_variance=.5)
+    observation = copy.deepcopy(reference)
+    delay = VERTEX_METRICS.index("mean_delay_ms")
+    observation["vertex_vectors"][0][delay] = 6.
+    observation["vertex_vectors"][1][delay] = 5.9
+    # При нулевой начальной дисперсии S=Q+R=1. Невязки 5 и 4,9 дают 25 и 24,01.
+    # Девятый показатель ребра сохраняется, но не участвует в отбраковке шума.
+    observation["edge_vectors"][0][-1] = 20.
+
+    report = bank.analyze(observation, nominal=True)
+
+    assert report["innovation_chi_square_threshold"] == 24.7
+    vertices = report["vertices"]
+    assert vertices["innovation_rejected_entity_count"] == 1
+    assert vertices["top_deformed_entities"][0]["entity_id"] == "b"
+    assert vertices["top_deformed_entities"][0]["innovation_chi_square"] == 25.
+    assert vertices["top_deformed_entities"][0]["filtered_normalized_vector"][delay] == 5.
+    assert bank.blocks["vertices"]["mean"][:, delay] == pytest.approx([2.45, 0.])
+    assert bank.blocks["vertices"]["variance"][:, delay] == pytest.approx([.25, 0.])
+    assert report["edges"]["innovation_rejected_entity_count"] == 0
+    assert vertices["hausdorff_mahalanobis_to_t0"] == 5.
+    assert report["edges"]["hausdorff_mahalanobis_to_t0"] == 19.
+
+
+def test_local_window_resets_on_tenth_step_and_observed_mode_changes():
+    reference = _state()
+    bank = LocalObservationFilter(reference)
+    changed = copy.deepcopy(reference)
+    delay = VERTEX_METRICS.index("mean_delay_ms")
+    changed["vertex_vectors"][0][delay] = 1.05
+    first = bank.analyze(changed, nominal=True, step_index=9)
+    assert first["window"]["global_reset_reasons"] == []
+    mean_before = bank.blocks["vertices"]["mean"].copy()
+    assert bank.blocks["vertices"]["variance"][1, delay] > 0
+
+    threat = copy.deepcopy(reference)
+    threat["vertex_vectors"][0][delay] = 40.
+    report = bank.analyze(threat, nominal=False, event_active=True, step_index=10)
+    assert report["window"]["global_reset_reasons"] == ["timer", "observed_mode_change"]
+    assert report["window"]["observation_mode"] == "event"
+    assert report["vertices"]["top_deformed_entities"][0]["filtered_normalized_vector"][delay] == 39.
+    assert bank.blocks["vertices"]["mean"] == pytest.approx(mean_before)
+    assert not bank.blocks["vertices"]["variance"].any()
+    continued = bank.analyze(threat, nominal=False, event_active=True, step_index=11)
+    assert continued["window"]["global_reset_reasons"] == []
+    restored = bank.analyze(reference, nominal=True, step_index=12)
+    assert restored["window"]["global_reset_reasons"] == ["observed_mode_change"]
+
+
+def test_local_covariance_reset_applies_only_to_inconsistent_entity():
+    reference = _state()
+    bank = LocalObservationFilter(reference, process_variance=0., measurement_variance=.01)
+    changed = copy.deepcopy(reference)
+    delay = VERTEX_METRICS.index("mean_delay_ms")
+    # При K=0 и S=0,01 стандартизованные невязки [3, -3, 3, -3] имеют
+    # выборочную дисперсию 12. Каждый отдельный отсчёт даёт χ²=9 < 24,7.
+    for step, delay_ms in enumerate((1.3, .7, 1.3, .7), start=1):
+        changed["vertex_vectors"][0][delay] = delay_ms
+        result = bank.analyze(changed, nominal=True, step_index=step)
+        assert result["vertices"]["covariance_reset_entity_count"] == int(step == 4)
+
+    vertices = result["vertices"]
+    assert vertices["entity_ids"] == ("a", "b")
+    assert vertices["innovation_chi_square_by_entity"] == pytest.approx([0., 9.])
+    status_codes = result["filter_status_codes"]
+    assert vertices["filter_status_by_entity"] == [status_codes["updated"], status_codes["covariance_reset"]]
+    assert vertices["top_deformed_entities"][0]["innovation_covariance_ratio"] == pytest.approx(12.)
+    assert result["edges"]["covariance_reset_entity_count"] == 0
+
+
 def test_pipeline_exports_local_precision_and_preserves_t0():
     model = GNetBaselineBuilder().build()
     original = copy.deepcopy(model.to_serializable())
@@ -88,11 +160,26 @@ def test_pipeline_exports_local_precision_and_preserves_t0():
         kalman = analysis["kalman_filter"]
         assert kalman["local_observation"]["vertices"]["dimension"] == 11
         assert kalman["local_observation"]["edges"]["dimension"] == 9
+        assert set(kalman["local_observation"]["vertices"]["entity_ids"]) == set(model.graph)
+        assert len(kalman["local_observation"]["vertices"]["filter_status_by_entity"]) == len(model.graph)
         uncertainty = kalman["koopman_input_uncertainty"]
         assert uncertainty["operator_revision_used"] == analysis["operator_revision_used"]
         assert np.isfinite(uncertainty["normalized_std_vector"]).all()
         assert analysis["tensor_matrix_koopman"]["input_kalman_filtered"]
     assert model.to_serializable() == original
+
+
+def test_overlapping_events_reset_when_the_observed_set_changes():
+    reference = _state()
+    analyzer = LocalObservationFilter(reference)
+    first = (("C1", "dos", False),)
+    overlap = first + (("M1_01", "syn_flood", False),)
+    analyzer.analyze(reference, nominal=True, step_index=0)
+    analyzer.analyze(reference, nominal=False, step_index=1, event_active=True, observed_events=first)
+    second = analyzer.analyze(reference, nominal=False, step_index=2, event_active=True, observed_events=overlap)
+    steady = analyzer.analyze(reference, nominal=False, step_index=3, event_active=True, observed_events=overlap)
+    assert second["window"]["global_reset_reasons"] == ["observed_event_change"]
+    assert steady["window"]["global_reset_reasons"] == []
 
 
 def test_tensor_filter_preserves_damage_and_ignores_future_metadata():

@@ -1,5 +1,6 @@
 from src.gnet9.dynamics import DynamicsConfig, _tensor_state_snapshot, simulate_stationary_dynamics
 from src.gnet9.attacks import attack_catalog
+from src.gnet9.arbitrator import evaluate_defense_game
 from src.gnet9.tensor_matrix import (
     TensorKroneckerKoopman,
     build_tensor_matrix_view,
@@ -57,6 +58,18 @@ def test_arbitrator_exports_kvu_game_and_safe_sdn_intent() -> None:
     assert game["recommended_action"]
     assert snapshot["arbitrator"]["recommendation"]["execution_mode"] == "human_only"
     assert "remap" not in snapshot["arbitrator"]
+
+
+def test_defense_game_uses_weighted_observed_sla_risk() -> None:
+    # Один нарушенный Gold и один исправный Bronze дают риск 3/(3+1).
+    tiers = [
+        {"sla_grade": "gold", "flow_count": 1, "sla_compliant_flow_count": 0},
+        {"sla_grade": "bronze", "flow_count": 1, "sla_compliant_flow_count": 1},
+    ]
+    game = evaluate_defense_game(MODEL, target_ids=[], threat_pressure=.2,
+                                 matrix_koopman_pressure=0., sla_tiers=tiers)
+    assert game["observed_sla_risk"] == .75
+    assert game["threat_pressure"] == .75
 
 
 def test_attack_catalog_binds_vvh_tth_to_target_capacity_profile() -> None:

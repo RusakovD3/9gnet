@@ -1,12 +1,14 @@
 import csv
 import json
 from pathlib import Path
+import re
 
 import pytest
 
 from main import _write_dynamics_json, export_attack_catalog, export_l1_monitoring, export_stationary_dynamics, parse_args
 from src.gnet9.attacks import attack_catalog, predictive_demo_minimum_steps
 from src.gnet9.constants import SUBSCRIBER_COUNT
+from src.gnet9.detection_rules import export_detection_rules
 from src.gnet9.dynamics import DynamicsConfig
 from src.gnet9.topology_builder import GNetBaselineBuilder
 
@@ -102,6 +104,105 @@ def test_compact_dynamics_export_keeps_runtime_flows_without_serializing_them(
     assert summary["training"]["accepted_transitions_total"] == 1
     assert summary["prediction"]["evaluated"] is False
     assert (tmp_path / "run_summary.md").is_file()
+    rules = tmp_path / "detection_rules"
+    report = json.loads((rules / "manifest.json").read_text(encoding="utf-8"))
+    assert report["sigma"]["rule_count"] == report["suricata"]["rule_count"] == 0
+    assert not (rules / "gnet9.rules").exists()
+
+
+def test_attack_run_exports_local_rules_and_keeps_source_unconfirmed(tmp_path: Path) -> None:
+    model = GNetBaselineBuilder().build()
+    destination = tmp_path / "network_dynamics.json"
+    runtime = export_stationary_dynamics(
+        model, destination, DynamicsConfig(step_count=8, step_seconds=5, attack_scenario="mitre-demo"),
+    )
+    rules = tmp_path / "detection_rules"
+    report = json.loads((rules / "manifest.json").read_text(encoding="utf-8"))
+    assert report["yara"]["rule_count"] == 0
+    sigma = (rules / "gnet9.yml").read_text(encoding="utf-8")
+    assert "attack.t1499.001" in sigma
+    logs = [json.loads(line) for line in (rules / "observations.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert any(row["technique_id"] == "T1499.001" for row in logs)
+    signatures = (rules / "gnet9.rules").read_text(encoding="utf-8").splitlines()
+    assert len(signatures) == 1
+    assert signatures[0].startswith(f"alert tcp any any -> {model.graph.nodes['M1_01']['ip_address']} any")
+    assert "tcp.flags:S,CE;" in signatures[0]
+    active = [snapshot for snapshot in runtime["snapshots"] if snapshot["attacks"]["events"]]
+    assert active
+    for snapshot in active:
+        trigger = snapshot["arbitrator"]["trigger_card"]
+        assert trigger["source_confirmed"] is False
+        assert "review_confirmed_attack_sources" not in trigger["controls"]
+
+    export_stationary_dynamics(model, destination, DynamicsConfig(step_count=0))
+    assert not (rules / "gnet9.rules").exists()
+    assert not (rules / "gnet9.yml").exists()
+    assert not (rules / "observations.jsonl").exists()
+
+
+def test_sigma_matches_observed_hypotheses_and_preserves_simulation_truth(tmp_path: Path) -> None:
+    snapshot = {
+        "step_index": 2, "time_seconds": 10,
+        "koopman": {"forecast_entity_records": [
+            {"observation_type": "precursor", "target_id": "C1", "kind": "dos",
+             "mitre_technique_candidates": ["T1498.001"]},
+        ], "signature_entity_records": [
+            {"observation_type": "observed_signature", "target_id": "C2", "kind": "dos",
+             "mitre_technique_candidates": ["T1498.001"], "feature_match": {"margin_ratio": 1.0}},
+            {"observation_type": "observed_signature", "target_id": "C1", "kind": "bgp_hijack",
+             "mitre_technique_candidates": []},
+        ]},
+        "attacks": {"events": [
+            {"target_id": "M1_01", "kind": "brute_force", "mitre_technique_id": "T1110.001"},
+        ]},
+    }
+    export_detection_rules(None, [snapshot], tmp_path)
+
+    logs = [
+        json.loads(line)
+        for line in (tmp_path / "observations.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["classification_source"] for row in logs] == [
+        "precursor_heuristic", "observed_numeric_hypothesis", "observed_numeric_hypothesis",
+        "simulated_active_event",
+    ]
+    assert logs[1]["feature_match"] == {"margin_ratio": 1.0}
+    assert logs[2]["technique_id"] is None and logs[2]["attack_kind"] == "bgp_hijack"
+    assert logs[3]["technique_id"] == "T1110.001"
+    sigma = (tmp_path / "gnet9.yml").read_text(encoding="utf-8")
+    assert "technique_id: 'T1498.001'" in sigma
+    assert "attack_kind: 'bgp_hijack'" in sigma and "attack.bgp_hijack" not in sigma
+    assert "classification_source:\n            - 'precursor_heuristic'" in sigma
+    assert "'observed_numeric_hypothesis'" in sigma
+    assert "T1110.001" not in sigma and "simulated_active_event" not in sigma
+
+
+def test_yara_rule_matches_only_the_benign_fixture_and_clears_on_rerun(tmp_path: Path) -> None:
+    snapshot = {
+        "step_index": 2, "time_seconds": 10, "koopman": {"forecast_entity_records": []},
+        "attacks": {"events": [
+            {"target_id": "M1_01", "kind": "user_execution", "mitre_technique_id": "T1204"},
+        ]},
+    }
+    export_detection_rules(None, [snapshot], tmp_path)
+
+    report = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    yara = report["yara"]
+    assert yara["rule_count"] == 1
+    assert yara["semantics"] == "benign_simulator_fixture_only"
+    rule = (tmp_path / yara["file"]).read_text(encoding="utf-8")
+    fixture = (tmp_path / yara["sample"]).read_bytes()
+    literal, size = re.search(
+        r'\$fixture = (".+")\n    condition:\n        \$fixture at 0 and filesize == (\d+)', rule,
+    ).groups()
+    marker = json.loads(literal).encode("ascii")
+    assert len(fixture) == int(size) and fixture == marker
+    assert b"GNET9_SYNTHETIC_USER_EXECUTION" in fixture and b"T1204" in fixture
+    assert b"T1204" != marker
+
+    export_detection_rules(None, [], tmp_path)
+    assert not (tmp_path / yara["file"]).exists()
+    assert not (tmp_path / yara["sample"]).exists()
 
 
 @pytest.mark.parametrize(

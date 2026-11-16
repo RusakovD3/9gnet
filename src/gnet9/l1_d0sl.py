@@ -27,6 +27,20 @@ class SlaGrade(str, Enum):
     BRONZE = "bronze"
 
 
+SLA_GRADE_WEIGHTS = {"gold": 3, "silver": 2, "bronze": 1}
+
+
+def weighted_sla_compliance(tiers: list[dict[str, Any]]) -> float | None:
+    """Безразмерная доля соблюдения SLA по счётчикам 0 ≤ compliant ≤ flow_count.
+
+    Один исправный Bronze и один нарушенный Gold дают 1/(1+3) = 0,25.
+    При отсутствии учитываемых потоков доля не определена.
+    """
+    compliant = sum(SLA_GRADE_WEIGHTS[t["sla_grade"]] * t["sla_compliant_flow_count"] for t in tiers)
+    total = sum(SLA_GRADE_WEIGHTS[t["sla_grade"]] * t["flow_count"] for t in tiers)
+    return compliant / total if total else None
+
+
 class TrafficKind(str, Enum):
     """Supported traffic classes in the current L1 model."""
 
