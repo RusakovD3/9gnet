@@ -1,4 +1,6 @@
 matplotlib>=3.8
+# Нижняя граница зависимости Matplotlib с исправлениями обработки TIFF.
+pillow>=13.0.0; python_version >= "3.11"
 networkx>=3.2
 numpy>=1.26
 pytest>=8.0

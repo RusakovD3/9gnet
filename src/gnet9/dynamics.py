@@ -98,7 +98,6 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
     if not health["ok"]:
         raise ValueError(f"Cannot simulate dynamics from unhealthy baseline: {health['violation_count']} violations")
 
-    start_step = 0 if config.include_t0 else 1
     snapshots: list[dict[str, Any]] = []
     power_runtime_state: dict[str, dict[str, Any]] = {}
     routing = FixedTopologyRoutes(model)
@@ -152,7 +151,9 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
         kalman_process_variance=config.kalman_process_variance,
         kalman_measurement_variance=config.kalman_measurement_variance,
     )
-    for step_index in range(start_step, config.step_count + 1):
+    # Фильтру и обучению нужен предшественник первого перехода даже тогда,
+    # когда вызывающая сторона просит убрать t0 из списка снимков.
+    for step_index in range(config.step_count + 1):
         snapshot = (
             reference_snapshot
             if step_index == 0
@@ -193,6 +194,9 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
             model=model,
         )
         if step_index == 0:
+            ideal_t0 = validate_ideal_t0(model, snapshot)
+            if not ideal_t0["ok"]:
+                raise ValueError(f"t0 is not ideal: {ideal_t0['violation_count']} violations")
             phase = "reference"
         elif step_index < first_precursor_step:
             phase = "nominal_training"
@@ -204,11 +208,8 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
             "nominal_transitions": koopman_view["observed_nominal_transition_count_after_update"],
             "operator_updated": koopman_view["update_applied_for_next_step"],
         }
-        snapshots.append(snapshot)
-
-    ideal_t0 = validate_ideal_t0(model, snapshots[0] if config.include_t0 and snapshots else None)
-    if not ideal_t0["ok"]:
-        raise ValueError(f"t0 is not ideal: {ideal_t0['violation_count']} violations")
+        if step_index or config.include_t0:
+            snapshots.append(snapshot)
 
     return {
         "mode": (
@@ -342,7 +343,7 @@ def validate_ideal_t0(model: NetworkModel, snapshot: dict[str, Any] | None = Non
                 violations.append({"scope": "L1", "node": node_id, "reason": "invalid_single_access_attachment"})
             else:
                 metrics["single_access_subscriber_count"] += 1
-            primary_edge = model.graph.edges[node_id, home_access]
+            primary_edge = model.graph.get_edge_data(node_id, home_access, default={})
             if (
                 primary_edge.get("access_role") != "primary"
                 or primary_edge.get("standby") is not False

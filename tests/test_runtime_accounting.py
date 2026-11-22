@@ -58,6 +58,20 @@ def test_gelenbe_delay_survives_underflow_of_nonfull_state_probability():
     assert result["delay_variance_ms2"] == pytest.approx(128e66)
 
 
+def test_gelenbe_preserves_rare_but_representable_overflow():
+    # При ρ = 1/2 сумма весов состояний равна 2 − 2^(-128).
+    result = gelenbe_queue(1.0, 2.0, 0.0, 128)
+    expected = 1 / (2 ** 129 - 1)
+    assert result["overflow_rate_pps"] == pytest.approx(expected, rel=1e-12, abs=0)
+
+
+def test_gelenbe_high_service_rate_keeps_representable_jitter():
+    # K=1: время обслуживания экспоненциально, его СКО равно среднему.
+    result = gelenbe_queue(1e156, 1e156, 0.0, 1)
+    assert result["jitter_ms"] == pytest.approx(1e-153, rel=1e-12, abs=0)
+    assert result["delay_variance_ms2"] == pytest.approx(1e-306, rel=1e-12, abs=0)
+
+
 @pytest.mark.parametrize("reverse_route", [False, True])
 def test_end_to_end_packet_losses_have_one_explicit_accounting_owner(reverse_route):
     model = _model()

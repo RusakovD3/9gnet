@@ -5,10 +5,12 @@ import csv
 import json
 import math
 import shutil
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any
+from typing import Any, TextIO
 
 from src.gnet9.address_visualizer import draw_ip_address_map, export_ip_address_plan
 from src.gnet9.attack_signatures import signature_catalog
@@ -218,18 +220,28 @@ def export_attack_catalog(
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+@contextmanager
+def _staged_export(path: Path, *, newline: str) -> Iterator[TextIO]:
+    """Заменить отчёт только после успешной записи и закрытия файла."""
+    stream = NamedTemporaryFile(mode="w", encoding="utf-8", newline=newline, dir=path.parent,
+                                prefix=".gnet9-", delete=False)
+    staged = Path(stream.name)
+    try:
+        with stream:
+            yield stream
+        staged.replace(path)
+    finally:
+        staged.unlink(missing_ok=True)
+
+
 def export_l1_monitoring(model, path: Path) -> None:
     """Export full second-by-second L1 monitoring history to CSV."""
-    rows: list[dict[str, Any]] = []
-    for node_id, attrs in iter_l1_subscribers(model):
-        base = _l1_export_base(node_id, attrs)
-        for point in attrs.get("monitoring", []):
-            rows.append({**base, **point})
-
-    with path.open("w", encoding="utf-8", newline="") as file:
+    with _staged_export(path, newline="") as file:
         writer = csv.DictWriter(file, fieldnames=L1_MONITORING_FIELDS)
         writer.writeheader()
-        writer.writerows(rows)
+        for node_id, attrs in iter_l1_subscribers(model):
+            base = _l1_export_base(node_id, attrs)
+            writer.writerows({**base, **point} for point in attrs.get("monitoring", []))
 
 
 def export_l1_profiles(model, path: Path) -> None:
@@ -310,30 +322,22 @@ def _dynamics_export_view(dynamics: dict[str, Any], packet_detail: str) -> dict[
 def _write_dynamics_json(path: Path, payload: dict[str, Any]) -> None:
     """Записывать снимки по одному, заменяя прежний отчёт целиком."""
     encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-    staged = None
-    try:
-        with NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", dir=path.parent,
-                                prefix=".gnet9-dynamics-", delete=False) as stream:
-            staged = Path(stream.name)
-            stream.write("{\n")
-            for index, (name, value) in enumerate(payload.items()):
-                if index:
-                    stream.write(",\n")
-                stream.write(f"  {encoder.encode(name)}: ")
-                if name == "snapshots":
-                    stream.write("[\n")
-                    for step, snapshot in enumerate(value):
-                        if step:
-                            stream.write(",\n")
-                        stream.write(f"    {encoder.encode(snapshot)}")
-                    stream.write("\n  ]")
-                else:
-                    stream.write(encoder.encode(value))
-            stream.write("\n}\n")
-        staged.replace(path)
-    finally:
-        if staged is not None:
-            staged.unlink(missing_ok=True)
+    with _staged_export(path, newline="\n") as stream:
+        stream.write("{\n")
+        for index, (name, value) in enumerate(payload.items()):
+            if index:
+                stream.write(",\n")
+            stream.write(f"  {encoder.encode(name)}: ")
+            if name == "snapshots":
+                stream.write("[\n")
+                for step, snapshot in enumerate(value):
+                    if step:
+                        stream.write(",\n")
+                    stream.write(f"    {encoder.encode(snapshot)}")
+                stream.write("\n  ]")
+            else:
+                stream.write(encoder.encode(value))
+        stream.write("\n}\n")
 
 
 def export_stationary_dynamics(
@@ -681,18 +685,20 @@ def main() -> None:
                 telemetry_config,
                 source_path=args.validate_telemetry_csv,
             )
-        except TelemetryValidationError as error:
+        except (TelemetryValidationError, OSError, UnicodeError, csv.Error) as error:
             raise SystemExit(f"Ошибка проверки внешней телеметрии: {error}") from error
         report_path = output_dir / "telemetry_validation_report.json"
         write_validation_report(report, report_path)
         gate = report["deployment_gate"]
         metrics = report["independent_holdout"]["metrics"]
+        rate = metrics["false_warnings_per_hour"]
+        rate_text = f"{rate:.3f}" if rate is not None else "нет данных"
         print(f"Отчёт валидации телеметрии: {report_path}")
         print(
             "Независимый holdout: "
             f"precision={metrics['precision'] * 100:.1f}%, "
             f"recall={metrics['recall'] * 100:.1f}%, "
-            f"ложных эпизодов/ч={metrics['false_warnings_per_hour']:.3f}; "
+            f"ложных эпизодов/ч={rate_text}; "
             f"допуск={gate['status']}."
         )
         return

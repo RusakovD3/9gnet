@@ -50,6 +50,20 @@ def test_l1_monitoring_csv_exports_single_access_field(tmp_path: Path) -> None:
     assert all("D:\\programming\\9gnet" not in note for note in model.notes)
 
 
+def test_l1_streamed_csv_keeps_last_complete_export_on_error(tmp_path, monkeypatch):
+    destination = tmp_path / "monitoring.csv"
+    destination.write_bytes(b"previous complete export")
+    def subscribers(model):
+        yield "C1", {"monitoring": [{"second": 0}]}
+        raise ValueError("incomplete monitoring")
+
+    monkeypatch.setattr("main.iter_l1_subscribers", subscribers)
+    with pytest.raises(ValueError, match="incomplete monitoring"):
+        export_l1_monitoring(None, destination)
+    assert destination.read_bytes() == b"previous complete export"
+    assert list(tmp_path.iterdir()) == [destination]
+
+
 @pytest.mark.parametrize("scenario", ["predictive-demo", "mitre-demo"])
 def test_exported_attack_catalog_matches_custom_simulation_schedule(tmp_path: Path, scenario: str) -> None:
     model = GNetBaselineBuilder().build()

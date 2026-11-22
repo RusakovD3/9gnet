@@ -6,7 +6,7 @@ import networkx as nx
 
 from src.gnet9.baseline import l0_service_tensor
 from src.gnet9.constants import L2_NODE_COUNT, SUBSCRIBER_COUNT
-from src.gnet9.dynamics import DynamicsConfig, simulate_stationary_dynamics, validate_healthy_baseline
+from src.gnet9.dynamics import DynamicsConfig, simulate_stationary_dynamics, validate_healthy_baseline, validate_ideal_t0
 from src.gnet9 import dynamics_charts
 from src.gnet9.dynamics_charts import extract_application_series, extract_dynamics_chart_series
 from src.gnet9 import routing
@@ -15,6 +15,48 @@ from src.gnet9.topology_builder import GNetBaselineBuilder
 
 
 MODEL = GNetBaselineBuilder().build()
+
+
+def test_hidden_t0_still_validates_and_trains_first_transition():
+    config = DynamicsConfig(step_count=2, snapshot_detail="summary", packet_detail="summary")
+    visible = simulate_stationary_dynamics(MODEL, config)
+    hidden = simulate_stationary_dynamics(MODEL, replace(config, include_t0=False))
+    assert visible["training_summary"]["nominal_transitions"] == 2
+    assert hidden["training_summary"] == visible["training_summary"]
+    assert hidden["ideal_t0"] == visible["ideal_t0"]
+    assert hidden["snapshots"] == visible["snapshots"][1:]
+
+
+def test_t0_reports_missing_access_link():
+    graph = MODEL.graph.copy()
+    client = "M1_01"
+    graph.remove_edge(client, graph.nodes[client]["home_access"])
+    result = validate_ideal_t0(replace(MODEL, graph=graph))
+    assert not result["ok"]
+    assert any(v.get("node") == client and v["reason"] == "invalid_single_access_attachment"
+               for v in result["violations"])
+
+
+def test_fixed_distances_match_individual_paths_for_all_endpoint_types():
+    graph = nx.Graph()
+    graph.add_nodes_from(("a", "b", "c"), role="core-router")
+    graph.add_nodes_from(("x", "y", "z", "isolated"), role="service-server")
+    graph.add_weighted_edges_from([
+        ("x", "a", 2), ("a", "b", 6), ("b", "c", 2), ("a", "y", 1),
+        ("y", "c", 1), ("x", "z", 3), ("z", "b", 1),
+    ], weight="latency_ms")
+    graph.add_edge("a", "c", medium=routing.LOGICAL_SERVICE_MEDIUM, latency_ms=0)
+    model = SimpleNamespace(graph=graph)
+    routes = routing.FixedTopologyRoutes(model)
+    for source in graph:
+        for target in graph:
+            try:
+                expected = routing.shortest_data_path_length(model, source, target)
+            except nx.NetworkXNoPath:
+                expected = None
+            assert routes.distance(source, target) == expected
+    assert routes.distance("unknown", "a") is None
+    assert routes.distance("a", "unknown") is None
 
 
 def test_fixed_topology_routes_reuse_paths_without_exposing_cache(monkeypatch):

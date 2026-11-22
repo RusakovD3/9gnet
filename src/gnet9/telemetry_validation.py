@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 import csv
 from dataclasses import asdict, dataclass
 from hashlib import sha256
@@ -82,6 +83,8 @@ def read_telemetry_csv(path: Path) -> list[TelemetryPoint]:
         reader = csv.DictReader(file)
         if reader.fieldnames is None:
             raise TelemetryValidationError("CSV не содержит строку заголовков")
+        if len(set(reader.fieldnames)) != len(reader.fieldnames):
+            raise TelemetryValidationError("CSV содержит повторяющиеся имена столбцов")
         missing = [column for column in REQUIRED_COLUMNS if column not in reader.fieldnames]
         if missing:
             raise TelemetryValidationError(
@@ -89,6 +92,8 @@ def read_telemetry_csv(path: Path) -> list[TelemetryPoint]:
             )
         points: list[TelemetryPoint] = []
         for row_number, row in enumerate(reader, start=2):
+            if None in row:
+                raise TelemetryValidationError(f"Строка {row_number}: больше столбцов, чем в заголовке")
             try:
                 timestamp = float(row["timestamp_seconds"])
                 risk_score = float(row["risk_score"])
@@ -96,12 +101,6 @@ def read_telemetry_csv(path: Path) -> list[TelemetryPoint]:
                 raise TelemetryValidationError(
                     f"Строка {row_number}: timestamp_seconds и risk_score должны быть числами"
                 ) from error
-            if not math.isfinite(timestamp) or not math.isfinite(risk_score):
-                raise TelemetryValidationError(f"Строка {row_number}: значения должны быть конечными")
-            if not 0.0 <= risk_score <= 1.0:
-                raise TelemetryValidationError(
-                    f"Строка {row_number}: risk_score должен находиться в диапазоне [0, 1]"
-                )
             onset = _parse_bool(row["attack_onset"], row_number)
             attack_id = str(row.get("attack_id") or "").strip()
             attack_kind = str(row.get("attack_kind") or "").strip()
@@ -116,14 +115,24 @@ def read_telemetry_csv(path: Path) -> list[TelemetryPoint]:
                     attack_kind=attack_kind,
                 )
             )
+    _validate_points(points)
+    return points
+
+
+def _validate_points(points: list[TelemetryPoint]) -> None:
     if len(points) < 3:
         raise TelemetryValidationError("Нужно не менее трёх отсчётов телеметрии")
-    for previous, current in zip(points, points[1:]):
-        if current.timestamp_seconds <= previous.timestamp_seconds:
+    previous_time = -math.inf
+    for row_number, point in enumerate(points, start=2):
+        if not math.isfinite(point.timestamp_seconds) or not math.isfinite(point.risk_score):
+            raise TelemetryValidationError(f"Строка {row_number}: значения должны быть конечными")
+        if not 0.0 <= point.risk_score <= 1.0:
+            raise TelemetryValidationError(f"Строка {row_number}: risk_score должен находиться в диапазоне [0, 1]")
+        if point.timestamp_seconds <= previous_time:
             raise TelemetryValidationError(
-                "timestamp_seconds должен строго возрастать; сортировка входных данных не выполняется намеренно"
+                f"Строка {row_number}: timestamp_seconds должен строго возрастать"
             )
-    return points
+        previous_time = point.timestamp_seconds
 
 
 def validate_external_telemetry(
@@ -141,32 +150,25 @@ def validate_external_telemetry(
 
     config = config or TelemetryValidationConfig()
     config.validate()
-    if len(points) < 3:
-        raise TelemetryValidationError("Нужно не менее трёх отсчётов")
+    _validate_points(points)
     split_index = int(len(points) * config.training_fraction)
     split_index = min(max(split_index, 1), len(points) - 1)
     training_points = points[:split_index]
     holdout_points = points[split_index:]
     candidates = _threshold_candidates(training_points)
-    candidate_evaluations = [
-        _evaluate_threshold(training_points, threshold, config)
-        for threshold in candidates
-    ]
-    feasible = [
-        item for item in candidate_evaluations if _meets_quality_gate(item, config)
-    ]
+    training_gap = _maximum_sample_gap(training_points)
     selected = max(
-        feasible or candidate_evaluations,
+        (_evaluate_threshold(training_points, threshold, config, training_gap) for threshold in candidates),
         key=lambda item: (
             int(_meets_quality_gate(item, config)),
             float(item["recall"]),
             float(item["precision"]),
-            -float(item["false_warnings_per_hour"]),
+            -item["false_warnings_per_hour"] if item["false_warnings_per_hour"] is not None else -math.inf,
             float(item["warning_risk_threshold"]),
         ),
     )
     threshold = float(selected["warning_risk_threshold"])
-    holdout = _evaluate_threshold(holdout_points, threshold, config)
+    holdout = _evaluate_threshold(holdout_points, threshold, config, _maximum_sample_gap(holdout_points))
     training_gate = _meets_quality_gate(selected, config)
     holdout_gate = _meets_quality_gate(holdout, config)
     eligible = bool(training_gate and holdout_gate)
@@ -197,14 +199,14 @@ def validate_external_telemetry(
         "threshold_selection": {
             "candidate_count": len(candidates),
             "selection_uses_holdout": False,
-            "selection_status": "feasible" if feasible else "no_training_threshold_meets_gate",
+            "selection_status": "feasible" if training_gate else "no_training_threshold_meets_gate",
             "selected_warning_risk_threshold": threshold,
             "warning_threshold_origin": "chronological_external_telemetry_calibration",
-            "training_metrics": _public_metrics(selected),
+            "training_metrics": selected,
         },
         "independent_holdout": {
             "performed": True,
-            "metrics": _public_metrics(holdout),
+            "metrics": holdout,
             "quality_gate_passed": holdout_gate,
         },
         "deployment_profile": {
@@ -241,24 +243,46 @@ def load_pilot_calibration(path: Path) -> dict[str, Any]:
         raise TelemetryValidationError(f"Отчёт калибровки не найден: {path}")
     try:
         report = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, ValueError) as error:
         raise TelemetryValidationError(f"Не удалось прочитать отчёт калибровки: {path}") from error
-    if report.get("report_version") != REPORT_VERSION:
+    if not isinstance(report, dict):
+        raise TelemetryValidationError("Отчёт калибровки должен быть объектом JSON")
+    if type(report.get("report_version")) is not int or report["report_version"] != REPORT_VERSION:
         raise TelemetryValidationError("Неподдерживаемая версия отчёта калибровки")
-    profile = report.get("deployment_profile", {})
-    gate = report.get("deployment_gate", {})
-    threshold = profile.get("warning_risk_threshold")
-    if not gate.get("passed") or not profile.get("eligible_for_pilot"):
+    if report.get("report_kind") != "external_telemetry_chronological_holdout_validation":
+        raise TelemetryValidationError("Требуется отчёт хронологической проверки телеметрии")
+    profile = _report_section(report, "deployment_profile")
+    gate = _report_section(report, "deployment_gate")
+    holdout = _report_section(report, "independent_holdout")
+    selection = _report_section(report, "threshold_selection")
+    # В JSON строка «false» и число 1 отличаются от логического true.
+    if not all(flag is True for flag in (
+        gate.get("passed"), gate.get("training_quality_gate_passed"),
+        gate.get("holdout_quality_gate_passed"), profile.get("eligible_for_pilot"),
+        holdout.get("performed"), holdout.get("quality_gate_passed"),
+    )):
         raise TelemetryValidationError(
             "Отчёт не прошёл независимую проверку и не может применяться как профиль порога"
         )
-    if not isinstance(threshold, (int, float)) or not 0.0 <= float(threshold) <= 1.0:
-        raise TelemetryValidationError("В отчёте отсутствует корректный warning_risk_threshold")
+    threshold = profile.get("warning_risk_threshold")
+    thresholds = (threshold, selection.get("selected_warning_risk_threshold"),
+                  _report_section(selection, "training_metrics").get("warning_risk_threshold"),
+                  _report_section(holdout, "metrics").get("warning_risk_threshold"))
+    if not all(type(value) in (int, float) and 0 <= value <= 1 and value == threshold
+               for value in thresholds):
+        raise TelemetryValidationError("Порог профиля должен совпадать с проверенным порогом в диапазоне [0, 1]")
     return {
         "warning_risk_threshold": float(threshold),
         "warning_threshold_origin": str(profile.get("warning_threshold_origin")),
-        "source_sha256": report.get("data_contract", {}).get("source_sha256"),
+        "source_sha256": _report_section(report, "data_contract").get("source_sha256"),
     }
+
+
+def _report_section(report: dict, name: str) -> dict:
+    section = report.get(name)
+    if not isinstance(section, dict):
+        raise TelemetryValidationError(f"В отчёте нужен раздел {name} в формате объекта JSON")
+    return section
 
 
 def _parse_bool(value: str | None, row_number: int) -> bool:
@@ -283,90 +307,70 @@ def _evaluate_threshold(
     points: list[TelemetryPoint],
     threshold: float,
     config: TelemetryValidationConfig,
+    max_gap: float,
 ) -> dict[str, Any]:
-    onsets = [point for point in points if point.attack_onset]
-    warning_episodes = _warning_episodes(points, threshold)
-    used_episode_indexes: set[int] = set()
-    records: list[dict[str, Any]] = []
-    for onset in onsets:
+    episodes = _warning_episodes(points, threshold, max_gap)
+    next_episode = 0
+    onset_count = 0
+    leads: list[float] = []
+    for onset in points:
+        if not onset.attack_onset:
+            continue
+        onset_count += 1
         earliest = onset.timestamp_seconds - config.maximum_lead_seconds
         latest = onset.timestamp_seconds - config.minimum_lead_seconds
-        candidates = [
-            (index, sample_time)
-            for index, episode in enumerate(warning_episodes)
-            if index not in used_episode_indexes
-            for sample_time in episode["sample_times"]
-            if earliest <= sample_time <= latest
-        ]
-        if candidates:
-            episode_index, warning_time = max(candidates, key=lambda item: item[1])
-            used_episode_indexes.add(episode_index)
-            lead = onset.timestamp_seconds - warning_time
-            records.append(
-                {
-                    "attack_id": onset.attack_id,
-                    "attack_kind": onset.attack_kind,
-                    "onset_seconds": onset.timestamp_seconds,
-                    "predicted": True,
-                    "warning_seconds": warning_time,
-                    "lead_seconds": lead,
-                }
-            )
-        else:
-            records.append(
-                {
-                    "attack_id": onset.attack_id,
-                    "attack_kind": onset.attack_kind,
-                    "onset_seconds": onset.timestamp_seconds,
-                    "predicted": False,
-                    "warning_seconds": None,
-                    "lead_seconds": None,
-                }
-            )
-    predicted = sum(record["predicted"] for record in records)
-    false_episodes = len(warning_episodes) - len(used_episode_indexes)
-    duration_seconds = max(points[-1].timestamp_seconds - points[0].timestamp_seconds, 1.0)
+        # Окна движутся вперёд. Самый ранний подходящий эпизод оставляет
+        # следующие эпизоды доступными для соседних начал инцидентов.
+        while next_episode < len(episodes) and episodes[next_episode][-1] < earliest:
+            next_episode += 1
+        if next_episode < len(episodes):
+            samples = episodes[next_episode]
+            stop = bisect_right(samples, latest)
+            if stop and samples[stop - 1] >= earliest:
+                leads.append(onset.timestamp_seconds - samples[stop - 1])
+                next_episode += 1
+    predicted = len(leads)
+    false_episodes = len(episodes) - predicted
+    duration_seconds = points[-1].timestamp_seconds - points[0].timestamp_seconds
     precision = predicted / max(predicted + false_episodes, 1)
-    recall = predicted / max(len(onsets), 1)
-    leads = [float(record["lead_seconds"]) for record in records if record["lead_seconds"] is not None]
+    recall = predicted / max(onset_count, 1)
     return {
         # Порог — часть правила решения, а не округлённая подпись графика.
         # Обучение, holdout и сохранённый профиль используют одно значение.
         "warning_risk_threshold": float(threshold),
         "row_count": len(points),
         "duration_seconds": duration_seconds,
-        "attack_onset_count": len(onsets),
+        "attack_onset_count": onset_count,
         "predicted_onset_count": predicted,
-        "missed_attack_ids": [record["attack_id"] for record in records if not record["predicted"]],
-        "warning_episode_count": len(warning_episodes),
+        "missed_attack_count": onset_count - predicted,
+        "warning_episode_count": len(episodes),
         "false_warning_episode_count": false_episodes,
-        "false_warnings_per_hour": false_episodes * 3600.0 / duration_seconds,
+        "false_warnings_per_hour": false_episodes * 3600.0 / duration_seconds if duration_seconds else None,
         "precision": precision,
         "recall": recall,
         "f1": 2.0 * precision * recall / max(precision + recall, 1e-12),
         "minimum_observed_lead_seconds": min(leads, default=0.0),
         "median_observed_lead_seconds": median(leads) if leads else 0.0,
-        "event_records": records,
     }
 
 
-def _warning_episodes(points: list[TelemetryPoint], threshold: float) -> list[dict[str, Any]]:
-    selected = [point.timestamp_seconds for point in points if point.risk_score >= threshold]
-    if not selected:
-        return []
+def _maximum_sample_gap(points: list[TelemetryPoint]) -> float:
     intervals = [right.timestamp_seconds - left.timestamp_seconds for left, right in zip(points, points[1:])]
-    sample_interval = median(intervals) if intervals else 1.0
-    max_gap = max(sample_interval * 1.5, 1e-9)
-    episodes: list[list[float]] = [[selected[0]]]
-    for sample_time in selected[1:]:
-        if sample_time - episodes[-1][-1] <= max_gap:
-            episodes[-1].append(sample_time)
-        else:
-            episodes.append([sample_time])
-    return [
-        {"start_seconds": values[0], "end_seconds": values[-1], "sample_times": values}
-        for values in episodes
-    ]
+    return 1.5 * median(intervals) if intervals else 0.0
+
+
+def _warning_episodes(points: list[TelemetryPoint], threshold: float, max_gap: float) -> list[list[float]]:
+    episodes: list[list[float]] = []
+    active = False
+    for point in points:
+        if point.risk_score < threshold:
+            active = False
+            continue
+        if not active or point.timestamp_seconds - episodes[-1][-1] > max_gap:
+            episodes.append([])
+        episodes[-1].append(point.timestamp_seconds)
+        active = True
+    return episodes
 
 
 def _meets_quality_gate(metrics: dict[str, Any], config: TelemetryValidationConfig) -> bool:
@@ -374,21 +378,9 @@ def _meets_quality_gate(metrics: dict[str, Any], config: TelemetryValidationConf
         int(metrics["attack_onset_count"]) >= config.minimum_events_per_partition
         and float(metrics["precision"]) >= config.minimum_precision
         and float(metrics["recall"]) >= config.minimum_recall
-        and float(metrics["false_warnings_per_hour"]) <= config.maximum_false_warnings_per_hour
-        and not metrics["missed_attack_ids"]
+        and metrics["false_warnings_per_hour"] is not None
+        and metrics["false_warnings_per_hour"] <= config.maximum_false_warnings_per_hour
     )
-
-
-def _public_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
-    """Не переносить ID инцидентов и временные строки из CSV в отчёт."""
-
-    result = {
-        key: value
-        for key, value in metrics.items()
-        if key not in {"event_records", "missed_attack_ids"}
-    }
-    result["missed_attack_count"] = len(metrics["missed_attack_ids"])
-    return result
 
 
 def _time_range(points: list[TelemetryPoint]) -> list[float]:

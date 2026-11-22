@@ -660,8 +660,8 @@ class KoopmanOnlineAnalyzer:
             "active_attack_score": round(active_attack_score, 6),
             "precursor_score": round(precursor_score, 6),
             "predicted_attack_score": round(predicted_attack_score, 6),
-            "forecast_attack_probability": round(forecast_risk, 6),
-            "forecast_risk_score": round(forecast_risk, 6),
+            "forecast_attack_probability": forecast_risk,
+            "forecast_risk_score": forecast_risk,
             "probability_is_calibrated": False,
             "risk_score_semantics": "uncalibrated_detection_risk_rank",
             "forecast_attack_kind": predicted_attack,
@@ -1112,7 +1112,9 @@ def _multi_horizon_forecasts(
                 "horizon_seconds": horizon_steps * step_seconds,
                 "target_step": step_index + horizon_steps,
                 "target_time_seconds": time_seconds + horizon_steps * step_seconds,
-                "risk_score": round(risk, 6),
+                # Ряд риска используют для калибровки. Сохраняем то же
+                # значение, которое ниже сравнивается с порогом предупреждения.
+                "risk_score": risk,
                 "koopman_dmd_only_risk_score": round(dmd_risk, 6),
                 "koopman_plus_delay_trend_risk_score": round(trend_risk, 6),
                 "precursor_classifier_risk_increment": round(max(0.0, risk - trend_risk), 6),

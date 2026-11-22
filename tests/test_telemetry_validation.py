@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import csv
 from dataclasses import replace
+import json
 from pathlib import Path
 
 import pytest
 
 from src.gnet9.telemetry_validation import (
+    TelemetryPoint,
     TelemetryValidationConfig,
     TelemetryValidationError,
     load_pilot_calibration,
@@ -16,6 +18,93 @@ from src.gnet9.telemetry_validation import (
     validate_external_telemetry,
     write_validation_report,
 )
+
+
+def _two_part_trace(warnings, onsets, *, period=50):
+    return [TelemetryPoint(t, 0.9 if t % period in warnings else 0.1,
+                           t % period in onsets, f"event-{t}", "")
+            for t in range(2 * period)]
+
+
+def test_overlapping_lead_windows_can_match_two_distinct_episodes():
+    points = _two_part_trace({1, 7}, {20, 24})
+    config = TelemetryValidationConfig(training_fraction=0.5, minimum_events_per_partition=2)
+    report = validate_external_telemetry(points, config)
+    metrics = report["independent_holdout"]["metrics"]
+    assert metrics["predicted_onset_count"] == 2
+    assert metrics["false_warning_episode_count"] == 0
+    assert metrics["minimum_observed_lead_seconds"] == 17
+    assert report["deployment_gate"]["passed"]
+
+
+def test_recall_limit_controls_allowed_misses_in_both_partitions():
+    points = _two_part_trace({5, 35, 65, 95}, {20, 50, 80, 110, 140}, period=160)
+    config = TelemetryValidationConfig(training_fraction=0.5, minimum_recall=0.8)
+    report = validate_external_telemetry(points, config)
+    assert report["independent_holdout"]["metrics"]["missed_attack_count"] == 1
+    assert report["deployment_gate"]["passed"]
+    assert not validate_external_telemetry(points, replace(config, minimum_recall=0.81))["deployment_gate"]["passed"]
+
+
+def test_healthy_sample_between_warnings_always_ends_episode():
+    times = [0, 10, 10.1, 10.2, 20, 20.2, 30, 40, 50, 60, 70, 80]
+    points = [TelemetryPoint(t, float(t in (10, 10.2)), t in (20, 20.2), "", "") for t in times]
+    report = validate_external_telemetry(points, TelemetryValidationConfig(training_fraction=0.7))
+    metrics = report["threshold_selection"]["training_metrics"]
+    assert metrics["warning_risk_threshold"] == 1.0
+    assert metrics["warning_episode_count"] == 2
+
+
+def test_programmatic_telemetry_requires_chronological_samples():
+    points = _two_part_trace({1}, {20})
+    points[0], points[1] = points[1], points[0]
+    with pytest.raises(TelemetryValidationError, match="возрастать"):
+        validate_external_telemetry(points)
+
+
+def test_subsecond_exposure_and_single_sample_partition():
+    points = [TelemetryPoint(t, 0.5, False, "", "") for t in (0, 0.25, 0.5)]
+    report = validate_external_telemetry(points)
+    assert report["threshold_selection"]["training_metrics"]["false_warnings_per_hour"] == 14400
+    assert report["independent_holdout"]["metrics"]["false_warnings_per_hour"] is None
+    assert not report["deployment_gate"]["passed"]
+
+
+@pytest.mark.parametrize("rows", [
+    "timestamp_seconds,risk_score,risk_score,attack_onset\n0,0.1,0.9,0",
+    "timestamp_seconds,risk_score,attack_onset\n0,0.1,0,1",
+])
+def test_ambiguous_csv_columns_are_rejected(tmp_path, rows):
+    trace = tmp_path / "ambiguous.csv"
+    trace.write_text(rows + "\n1,0.1,0,0\n2,0.1,0,0\n", encoding="utf-8")
+    with pytest.raises(TelemetryValidationError, match="столбц"):
+        read_telemetry_csv(trace)
+
+
+@pytest.mark.parametrize(("section", "field", "value"), [
+    ("deployment_gate", "passed", "false"),
+    ("deployment_profile", "eligible_for_pilot", 1),
+    ("deployment_profile", "warning_risk_threshold", True),
+    ("deployment_profile", "warning_risk_threshold", 0.42),
+    ("independent_holdout", "quality_gate_passed", False),
+])
+def test_inconsistent_calibration_report_is_rejected(tmp_path, section, field, value):
+    report = validate_external_telemetry(_two_part_trace({5}, {20}),
+        TelemetryValidationConfig(training_fraction=0.5, minimum_events_per_partition=1))
+    assert report["deployment_gate"]["passed"]
+    report[section][field] = value
+    path = tmp_path / "bad.json"
+    write_validation_report(report, path)
+    with pytest.raises(TelemetryValidationError):
+        load_pilot_calibration(path)
+
+
+@pytest.mark.parametrize("payload", [[], None, {"report_version": 1, "deployment_profile": []}])
+def test_calibration_report_requires_json_objects(tmp_path, payload):
+    path = tmp_path / "wrong_shape.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(TelemetryValidationError):
+        load_pilot_calibration(path)
 
 
 def _write_known_trace(path: Path, *, add_false_warning: bool = False) -> None:

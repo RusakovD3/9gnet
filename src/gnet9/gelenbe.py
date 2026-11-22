@@ -46,22 +46,26 @@ def gelenbe_queue(arrival: float, service: float, negative: float, capacity: int
         stages = states[:-1] + 1.0
         mean_stages = float(stages @ conditional)
         variance_stages = float((stages - mean_stages) ** 2 @ conditional)
-        delay = mean_stages / removal
-        delay_variance = (mean_stages + variance_stages) / removal ** 2
+        delay_ms = mean_stages * 1000.0 / removal
+        # Сначала переводим СКО в миллисекунды: квадрат интенсивности
+        # может переполниться даже при представимой дисперсии в мс².
+        jitter_ms = math.sqrt(mean_stages + variance_stages) * 1000.0 / removal
     else:
-        delay = delay_variance = 0.0
+        delay_ms = jitter_ms = 0.0
     return {
         "arrival_rate_pps": arrival, "service_rate_pps": service,
         "negative_arrival_rate_pps": negative,
         "blocking_probability": float(probability[-1]),
         "effective_arrival_rate_pps": admitted,
         "served_rate_pps": served, "destroyed_rate_pps": destroyed,
-        "overflow_rate_pps": max(0.0, arrival - admitted),
+        # Вход с интенсивностью λ видит полный буфер с вероятностью p(K).
+        # Вычитание двух почти равных потоков теряло редкие переполнения.
+        "overflow_rate_pps": arrival * float(probability[-1]),
         "destroyed_fraction": destroyed / arrival if arrival else 0.0,
         "busy_probability": busy, "utilization_rho": arrival / removal,
         "mean_system_packets": population,
         "mean_queue_packets": max(0.0, population - busy),
-        "mean_system_time_ms": delay * 1000.0,
-        "delay_variance_ms2": delay_variance * 1_000_000.0,
-        "jitter_ms": math.sqrt(delay_variance) * 1000.0,
+        "mean_system_time_ms": delay_ms,
+        "delay_variance_ms2": jitter_ms * jitter_ms,
+        "jitter_ms": jitter_ms,
     }

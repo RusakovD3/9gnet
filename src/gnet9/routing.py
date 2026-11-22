@@ -35,7 +35,7 @@ class FixedTopologyRoutes:
     def __init__(self, model: NetworkModel):
         self._model = model
         self._paths: dict[tuple[str, str], tuple[str, ...]] = {}
-        self._distances: dict[tuple[str, str], float | None] = {}
+        self._transit_distances: dict[str, dict[str, float]] = {}
 
     def path(self, source: str, target: str) -> list[str]:
         key = (source, target)
@@ -44,13 +44,25 @@ class FixedTopologyRoutes:
         return list(self._paths[key])
 
     def distance(self, source: str, target: str) -> float | None:
-        key = (source, target)
-        if key not in self._distances:
-            try:
-                self._distances[key] = shortest_data_path_length(self._model, source, target)
-            except (nx.NetworkXNoPath, nx.NodeNotFound):
-                self._distances[key] = None
-        return self._distances[key]
+        graph = self._model.graph
+        if source not in graph or target not in graph:
+            return None
+        if source not in self._transit_distances:
+            view = data_plane_routing_view(self._model, endpoints=(source,))
+            self._transit_distances[source] = nx.single_source_dijkstra_path_length(
+                view, source, weight="latency_ms"
+            )
+        distances = self._transit_distances[source]
+        if target in distances:
+            return distances[target]
+        # Конечное устройство можно добавить только последним ребром.
+        # Один обход обслуживает все цели и не превращает сервер в транзит.
+        neighbors = graph.pred[target] if graph.is_directed() else graph[target]
+        return min((
+            distances[peer] + attrs.get("latency_ms", 1)
+            for peer, attrs in neighbors.items()
+            if peer in distances and attrs.get("medium") != LOGICAL_SERVICE_MEDIUM
+        ), default=None)
 
     @cached_property
     def latency_scale_ms(self) -> float:

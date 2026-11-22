@@ -269,6 +269,22 @@ def test_early_warning_uses_only_classified_confirmed_sensors() -> None:
     assert after_gap["forecast_is_early_warning"] is False
 
 
+def test_warning_and_report_use_the_same_unrounded_risk(monkeypatch):
+    threshold = 0.4000002
+    risk = 0.4000003
+    monkeypatch.setattr("src.gnet9.koopman._forecast_risk", lambda **kwargs: risk)
+    reference = {"metric_names": ["OBS.precursor_confidence"], "vector": [0.0]}
+    analyzer = KoopmanOnlineAnalyzer.from_t0(MODEL, reference, step_seconds=2, warning_risk_threshold=threshold)
+    observation = {"scenario": "mitre-demo", "precursors": [
+        {"sensor_node_id": "C2", "signals": {"syn_backlog_growth_ratio": 0.9}},
+    ]}
+    result = analyzer.analyze_step(MODEL, {**reference, "vector": [0.9]},
+                                   attack_state=observation, step_index=1, time_seconds=2)
+    assert result["forecast_is_early_warning"]
+    assert result["forecast_risk_score"] == risk
+    assert all(item["risk_score"] >= threshold for item in result["horizon_forecasts"] if item["is_warning"])
+
+
 def test_predictive_demo_warns_before_attack_without_false_warning() -> None:
     dynamics = _predictive_dynamics()
     evaluation = dynamics["koopman_evaluation"]
