@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .constants import ATTACK_KIND_DISPLAY_NAMES
 from .dynamics_charts import DYNAMICS_CHART_FILES
+from .flow_details import TRAFFIC_LABELS
 
 
 def _number(value):
@@ -46,7 +47,9 @@ def _prediction_summary(evaluation):
     result = {key: evaluation.get(key) for key in (
         "attack_onset_count", "predicted_before_onset_count", "prediction_recall",
         "prediction_precision", "false_positive_warning_count", "right_censored_warning_count", "minimum_observed_lead_seconds",
-        "maximum_observed_lead_seconds", "prediction_slo_seconds", "prediction_slo_status")}
+        "maximum_observed_lead_seconds", "prediction_slo_seconds", "prediction_slo_status",
+        "warning_episode_count", "observed_duration_seconds", "gap_duration_seconds",
+        "warning_duration_seconds", "warning_occupancy_ratio", "false_warnings_per_simulated_hour")}
     result["evaluated"] = bool(evaluation.get("attack_onset_count"))
     if not result["evaluated"]:
         for key in ("prediction_recall", "prediction_precision", "minimum_observed_lead_seconds",
@@ -97,6 +100,7 @@ def build_run_summary(dynamics):
             "weighted_time_mean_ratio": _number(dynamics.get("sla_resilience", {}).get("time_mean")),
             "weighted_minimum_ratio": _number(dynamics.get("sla_resilience", {}).get("minimum")),
             "by_class": _sla_by_class(snapshots),
+            "worst_service": dynamics.get("service_sla_evaluation", {}).get("worst_service"),
             "accounting": "all_legitimate_flows_on_fixed_routes",
         },
         "recommendations": [
@@ -105,6 +109,12 @@ def build_run_summary(dynamics):
             for snapshot in snapshots
             if snapshot.get("arbitrator", {}).get("recommendation", {}).get("requires_human_action")
         ],
+        "service_sla_forecast": {
+            k: v for k, v in dynamics.get("service_sla_evaluation", {}).items()
+            if k in {"maximum_horizon_seconds", "methods", "by_horizon_seconds", "by_service", "cases",
+                     "attribution", "route_stress", "operator_alert_evaluation"}
+        },
+        "service_sla_runtime": dynamics.get("service_sla_runtime", {}),
         "operation_mode": "forecast_and_human_recommendations_only",
         "events": [{key: record.get(key) for key in (
             "attack_id", "kind", "attack_family", "attack_mechanism", "attack_label_ru",
@@ -131,6 +141,96 @@ def _display(value, *, percent=False):
     return f"{number * 100:.2f}%" if percent else f"{number:g}"
 
 
+def _service_forecast_text(summary):
+    forecast = summary["service_sla_forecast"]
+    lines = ["", "## Нарушения SLA по потокам", ""]
+    worst = summary["sla"]["worst_service"]
+    if worst is None:
+        return lines + ["Измерения критериев потоков отсутствуют."]
+    service = TRAFFIC_LABELS.get(worst["service"], worst["service"])
+    if worst["failed_flows"]:
+        criterion = worst["criterion_at_worst"]
+        lines.append(f"Худшая доля выполнения SLA у услуги «{service}» в {worst['time_seconds']} с "
+                     f"составила {_display(worst['compliance_ratio'], percent=True)}. "
+                     f"Нарушения у {worst['failed_flows']} из {worst['assessed_flows']} потоков. "
+                     f"У потока `{criterion['flow_id']}` показатель «{criterion['label_ru']}» "
+                     f"составил {_display(criterion['measured_value'])} {criterion['unit']} "
+                     f"при пороге {_display(criterion['budget'])} {criterion['unit']}.")
+    else:
+        lines.append("Все потоки выполнили проверенные требования на каждом наблюдавшемся шаге.")
+    lines += ["", "| Услуга | Минимум выполнения SLA | Время минимума, с | Первый прогноз Купмана (поток и критерий) | Выдан / ожидался, с |",
+              "|---|---:|---:|---|---:|"]
+    for service, row in forecast.get("by_service", {}).items():
+        warning = row["first_warning"]
+        description = f"`{warning['flow_id']}` · {warning['label_ru']}" if warning else "Предупреждений нет"
+        timing = f"{warning['issue_time_seconds']} / {warning['target_time_seconds']}" if warning else "—"
+        lines.append(f"| {TRAFFIC_LABELS.get(service, service)} "
+                     f"| {_display(row['minimum_compliance_ratio'], percent=True)} "
+                     f"| {row['worst_time_seconds']} | {description} | {timing} |")
+    lines += ["", "Измерения получены из пакетной модели. Для каждого потока Купман прогнозирует "
+              "запас до действующего порога. Сигнатуры атак в этот прогноз не входят. "
+              "Текущее нарушение учитывается только при первом наблюдаемом переходе через порог.", "",
+              "| Горизонт, с | Метод | Предупреждены / начала | Ложные | Ложные / ч | Время под тревогой | Окно не проверено | Средняя ошибка момента, с¹ |",
+              "|---:|---|---:|---:|---:|---:|---:|---:|"]
+    method_names = {"koopman": "Купман", "persistence": "Последнее значение", "trend": "Линейный тренд"}
+    for h, methods in forecast.get("by_horizon_seconds", {}).items():
+        for method, row in methods.items():
+            lines.append(f"| {h} | {method_names[method]} | {row['hits']} / {row['onsets']} "
+                         f"| {row['false_alarms']} | {_display(row['false_alarms_per_observed_hour'])} "
+                         f"| {_display(row['warning_occupancy_ratio'], percent=True)} | {row['censored']} "
+                         f"| {_display(row['mean_absolute_timing_error_seconds'])} |")
+    lines += ["", "¹ Среднее абсолютное расхождение прогноза и факта среди предупреждённых нарушений."]
+    sources = forecast.get("methods", {}).get("koopman", {}).get("by_forecast_source", {})
+    source_names = {"healthy_margin_increment": "Изменение запаса, обучение на исправных наблюдениях",
+                    "shared_route_delay_translation": "Общий наклон задержки на пути с потерями",
+                    "poisson_demand_delivery_koopman": "Спрос и эффективность доставки"}
+    if sources:
+        lines += ["", "| Источник первого предупреждения в окне | Попадания | Ложные | Исход неизвестен |",
+                  "|---|---:|---:|---:|"]
+        for source, counts in sources.items():
+            lines.append(f"| {source_names.get(source, source)} | {counts['hits']} | "
+                         f"{counts['false_alarms']} | {counts['censored']} |")
+    lines += [
+              "", f"Примеры ниже соответствуют окну {forecast.get('maximum_horizon_seconds', 0)} с. "
+              "Нарушение того же критерия должно начаться до конца окна. "
+              "Момент первого ожидаемого пересечения сравнивается с фактическим отдельно.",
+              "", "| Исход прогноза Купмана | Услуга и поток | Критерий | Выдан / ожидался / начался, с |",
+              "|---|---|---|---|"]
+    for key, label in (("hit", "Предупреждён"), ("false_alarm", "Ложная тревога"), ("miss", "Пропущен")):
+        case = forecast.get("cases", {}).get(key)
+        if case is None:
+            lines.append(f"| {label} | Такого случая в прогоне нет | — | — |")
+            continue
+        times = [case.get("issue_time_seconds"), case.get("target_time_seconds"),
+                 case.get("actual_time_seconds", case.get("time_seconds"))]
+        lines.append(f"| {label} | {TRAFFIC_LABELS.get(case['service'], case['service'])}, "
+                     f"`{case['flow_id']}` | {case['label_ru']} | "
+                     + " / ".join("—" if t is None else str(t) for t in times) + " |")
+    lines += ["", "[График измерений, порогов и прогнозов по этим случаям](charts/service_sla_forecast.png)."]
+    issued = forecast.get("operator_alert_evaluation", {})
+    if issued:
+        lines += ["", "Для рабочего предупреждения о задержке медиапотока правило, выбранное на "
+                  "predictive-demo/11, требует измеренной потери и прогнозируемого пересечения за 2 с.",
+                  "", "| Окно зачёта, с | Предупреждены / все начала | Ложные / ч |",
+                  "|---:|---:|---:|"]
+        for horizon, row in issued.items():
+            lines.append(f"| {horizon} | {row['hits']} / {row['onsets']} | "
+                         f"{_display(row['false_alarms_per_observed_hour'])} |")
+    conditional = forecast.get("route_stress", {}).get("methods", {}).get("route_stress_one_drop")
+    if conditional:
+        lines += ["", "По датчику на пути и счётчику потока отдельно проверяется, "
+                  "нарушит ли порог ещё одна потеря при текущем спросе. "
+                  f"Предупреждены {conditional['hits']} из {conditional['onsets']} начал по проверяемым "
+                  f"критериям потерь, ложных тревог — {conditional['false_alarms']}, "
+                  f"окон с неизвестным исходом — {conditional['censored']}."]
+    runtime = summary["service_sla_runtime"]
+    if runtime:
+        lines += ["", f"Время вычисления прогноза на этом компьютере в среднем "
+                  f"{_display(runtime['offline_compute_mean_ms'])} мс на шаг. "
+                  "Доставка предупреждений оператору в опыте не измерялась."]
+    return lines
+
+
 def export_run_summary(dynamics, directory: Path):
     summary = build_run_summary(dynamics)
     directory.mkdir(parents=True, exist_ok=True)
@@ -151,6 +251,13 @@ def export_run_summary(dynamics, directory: Path):
             f"минимальное упреждение — {_display(prediction['minimum_observed_lead_seconds'])} с.")
     else:
         lines.append("Наблюдённых начал атак нет: точность предупреждений по этому прогону не оценивается.")
+    if prediction.get("observed_duration_seconds") is not None:
+        lines.append(
+            f"Время под тревогой — {_display(prediction['warning_duration_seconds'])} с "
+            f"из {_display(prediction['observed_duration_seconds'])} с наблюдения "
+            f"({_display(prediction['warning_occupancy_ratio'], percent=True)}). "
+            f"Ложных эпизодов за час наблюдения — {_display(prediction['false_warnings_per_simulated_hour'])}."
+        )
     if prediction.get("right_censored_warning_count"):
         lines.append(f"Непроверенные предупреждения с окном за концом прогона — "
                      f"{prediction['right_censored_warning_count']}.")
@@ -161,6 +268,7 @@ def export_run_summary(dynamics, directory: Path):
         lines.append(f"| {label} | {_display(row['minimum_compliance_ratio'], percent=True)} "
             f"| {_display(row['worst_step'])} | {_display(row['compliant_flows_at_worst_step'])} / "
             f"{_display(row['accounted_flows_at_worst_step'])} |")
+    lines += _service_forecast_text(summary)
     lines += ["", "## Рекомендации человеку", "",
               "Структура сети и маршруты фиксированы. Меры защиты программа не исполняет.", ""]
     for item in summary["recommendations"]:

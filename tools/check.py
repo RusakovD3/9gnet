@@ -35,7 +35,7 @@ SMOKE_FILES = (
     "charts/koopman_risk.png", "charts/lyapunov_growth.png", "charts/native_traffic.png",
     "charts/attack_traffic.png", "charts/sla_by_class.png", "charts/attacked_node_sla.png",
     "charts/event_timeline.png", "charts/arbitrator_signals.png", "charts/capacity_bottlenecks.png",
-    "charts/link_utilization.png", "charts/resource_utilization.png",
+    "charts/link_utilization.png", "charts/resource_utilization.png", "charts/service_sla_forecast.png",
     "charts/security_dashboard.png",
     "step_log.csv",
     "run_summary.json", "run_summary.md",

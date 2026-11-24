@@ -126,7 +126,7 @@ def test_png_exports_render_for_empty_and_recorded_data(tmp_path):
             "koopman_risk.png", "lyapunov_growth.png", "native_traffic.png",
             "attack_traffic.png", "sla_by_class.png", "attacked_node_sla.png",
             "event_timeline.png", "arbitrator_signals.png", "capacity_bottlenecks.png",
-            "link_utilization.png", "resource_utilization.png",
+            "link_utilization.png", "resource_utilization.png", "service_sla_forecast.png",
         }
         for path in exported.values():
             image = plt.imread(path)

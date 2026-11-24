@@ -12,6 +12,7 @@ from matplotlib.patches import Rectangle
 from matplotlib.ticker import MaxNLocator
 import numpy as np
 from .arbitrator import TRIGGER_BANDS
+from .flow_details import TRAFFIC_LABELS
 from .plot_style import (PANEL, TEXT, MUTED, BLUE, GREEN,
                          AMBER, RED, PURPLE, save_figure, style_axis)
 from .security_dashboard import ATTACK_COLORS
@@ -29,6 +30,7 @@ DYNAMICS_CHART_FILES = {
     "attack_traffic": "attack_traffic.png",
     "sla": "sla_by_class.png",
     "target_sla": "attacked_node_sla.png",
+    "service_forecast": "service_sla_forecast.png",
     "timeline": "event_timeline.png",
     "arbitrator": "arbitrator_signals.png",
     "capacity": "capacity_bottlenecks.png",
@@ -91,6 +93,7 @@ def export_dynamics_charts(
     _plot_attack_traffic(snapshots, charts["attack_traffic"])
     _plot_sla_by_class(series, charts["sla"])
     _plot_target_sla(detail or snapshots, charts["target_sla"])
+    _plot_service_forecast(dynamics.get("service_sla_evaluation", {}), charts["service_forecast"])
     _plot_timeline(dynamics, charts["timeline"])
     _plot_arbitrator(series, charts["arbitrator"])
     _plot_capacity_bottlenecks(model, detail, charts["capacity"])
@@ -322,6 +325,69 @@ def _target_sla_rows(snapshots):
                 passed, total = counts.get(step, (0, 0))
                 counts[step] = (passed + int(compliant), total + 1)
     return rows
+
+
+def _plot_service_forecast(evaluation, path):
+    fig, axes = plt.subplots(3, 1, figsize=(11.5, 9))
+    cases = evaluation.get("cases", {})
+    outcomes = (("hit", "Предупреждённое нарушение"), ("false_alarm", "Ложная тревога"),
+                ("miss", "Пропущенное нарушение"))
+    for ax, (key, label) in zip(axes, outcomes):
+        case = cases.get(key)
+        if case is None:
+            _style_axes(ax, label, "", legend=False)
+            ax.text(.5, .5, "Такого случая в прогоне нет", transform=ax.transAxes,
+                    ha="center", va="center", color=MUTED)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            continue
+        samples = case.get("measurements", [])
+        times = [s["time_seconds"] for s in samples]
+        values = [s["value"] for s in samples]
+        budgets = [s["budget"] for s in samples]
+        period = evaluation.get("step_seconds")
+        # Пропуски должны разрывать линию наблюдений.
+        for i in reversed(range(1, len(times))):
+            if period and times[i] > times[i-1] + period:
+                times.insert(i, np.nan)
+                values.insert(i, np.nan)
+                budgets.insert(i, np.nan)
+        ax.plot(times, values, marker="o", markersize=3, color=BLUE, label="Измерение")
+        ax.step(times, budgets, where="post", color=AMBER, linestyle=":", label="Порог SLA")
+        if "issue_time_seconds" in case:
+            ax.axvline(case["issue_time_seconds"], color=MUTED, linewidth=1, label="Выдан прогноз")
+            ax.plot([case["issue_time_seconds"], case["target_time_seconds"]],
+                    [case["measured_value"]] * 2, color=GREEN, linestyle="-.",
+                    label="Последнее значение")
+            if "trend_at_target" in case:
+                ax.plot([case["issue_time_seconds"], case["target_time_seconds"]],
+                        [case["measured_value"], case["trend_at_target"]], linestyle=":", color=TEXT,
+                        label="Тренд потока")
+            source = {"shared_route_delay_translation": "Наклон на общем пути",
+                      "poisson_demand_delivery_koopman": "Спрос и доставка",
+                      "healthy_margin_increment": "Изменение запаса"}.get(case.get("forecast_source"), "Прогноз Купмана")
+            ax.plot([case["issue_time_seconds"], case["target_time_seconds"]],
+                    [case["measured_value"], case["predicted_value"]],
+                    linestyle="--", marker="D", markersize=4, color=PURPLE, label=source)
+            if "predicted_budget" in case and case["predicted_budget"] != case.get("budget"):
+                ax.scatter([case["target_time_seconds"]], [case["predicted_budget"]], marker="x",
+                           color=AMBER, label="Порог при прогнозируемом спросе")
+        impact_time = case.get("impact_time_seconds", evaluation.get("impact_time_seconds"))
+        if impact_time is not None:
+            ax.axvline(impact_time, color=AMBER, linestyle="-.", label="Начало воздействия")
+        for i, t in enumerate(case.get("flow_impact_starts_seconds", ())):
+            ax.axvline(t, color=AMBER, linestyle="-.", label=None if i else "Начало воздействия на поток")
+        if key != "false_alarm":
+            actual = case["time_seconds"] if key == "miss" else case["actual_time_seconds"]
+            ax.axvline(actual, color=RED, linestyle="--", label="Начало нарушения")
+        service = TRAFFIC_LABELS.get(case["service"], case["service"])
+        _style_axes(ax, f"{label} · {service} · {case['flow_id']} · {case['label_ru']}",
+                    case["unit"], legend=False)
+        ax.legend(loc="best", fontsize=7, ncol=2, facecolor=PANEL, labelcolor=TEXT)
+        ax.set_xlabel("Время модели, с", color=MUTED, fontsize=9)
+    fig.suptitle("Прогноз Купмана по критериям SLA отдельных потоков", color=TEXT, fontsize=15)
+    fig.subplots_adjust(left=.09, right=.97, hspace=.65, bottom=.07, top=.91)
+    save_figure(fig, path)
 
 
 def _plot_target_sla(snapshots, path):

@@ -527,5 +527,5 @@ def test_chart_export_keeps_only_the_compact_current_chart_set(
     )
 
     assert set(paths) == {"koopman", "lyapunov", "native_traffic", "attack_traffic", "sla",
-                          "target_sla", "timeline", "arbitrator", "capacity", "links", "resources"}
+                          "target_sla", "service_forecast", "timeline", "arbitrator", "capacity", "links", "resources"}
     assert all(not (tmp_path / stale_name).exists() for stale_name in stale_names)

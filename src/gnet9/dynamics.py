@@ -9,6 +9,7 @@ recommendations for a human operator while preserving the ideal ``t0`` reference
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from time import perf_counter
 from typing import Any, Literal
 
 import networkx as nx
@@ -44,6 +45,8 @@ from .hypernetwork import hypernetwork_embedding
 from .l1_d0sl import SLA_GRADE_WEIGHTS, weighted_sla_compliance
 from .packet_simulator import TRAFFIC_APPS, simulate_packet_snapshot
 from .routing import FixedTopologyRoutes
+from .service_forecast import ServiceSLAForecaster, _score_window, evaluate_service_forecasts, operator_warnings
+from .route_stress import RouteStressMonitor, evaluate_route_stress
 from .tensor_matrix import (
     build_tensor_matrix_view,
     tensor_matrix_export,
@@ -99,6 +102,12 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
         raise ValueError(f"Cannot simulate dynamics from unhealthy baseline: {health['violation_count']} violations")
 
     snapshots: list[dict[str, Any]] = []
+    sla_forecaster = ServiceSLAForecaster(config.step_seconds, retain_trace=True)
+    route_monitor = RouteStressMonitor(config.step_seconds)
+    route_views = []
+    impacts_by_flow = {}
+    previous_impacts = set()
+    sla_compute_ms = []
     power_runtime_state: dict[str, dict[str, Any]] = {}
     routing = FixedTopologyRoutes(model)
     catalog = attack_catalog(model, config.attack_scenario, config=config)
@@ -193,6 +202,29 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
             koopman_view,
             model=model,
         )
+        traffic = snapshot.get("traffic", {})
+        sla_started = perf_counter()
+        snapshot["service_sla_forecast"] = sla_forecaster.observe(
+            traffic.get("flows", ()), time_seconds=snapshot["time_seconds"],
+            nominal=koopman_view["nominal_training"]["observation_eligible"],
+        )
+        view = snapshot["service_sla_forecast"]
+        view["operator_warnings"] = operator_warnings(view)
+        route_view = route_monitor.observe(traffic.get("flows", ()), snapshot.get("attacks", {}).get("precursors", ()),
+                                           time_seconds=snapshot["time_seconds"])
+        snapshot["service_sla_forecast"]["route_stress_warnings"] = route_view["warnings"]
+        if step_index or config.include_t0:
+            route_views.append(route_view)
+        sla_compute_ms.append((perf_counter() - sla_started) * 1000)
+        # Только разметка для ретроспективного графика, после выпуска прогнозов.
+        impacts = {(f["traffic_kind"], f["client_node"], event)
+                   for f in traffic.get("flows", ()) if f.get("attack_impacted")
+                   for event in f.get("attack_ids", ())}
+        for service, client, _ in impacts - previous_impacts:
+            impacts_by_flow.setdefault((service, client), set()).add(snapshot["time_seconds"])
+        previous_impacts = impacts
+        if config.packet_detail == "summary":
+            traffic.pop("flows", None)
         if step_index == 0:
             ideal_t0 = validate_ideal_t0(model, snapshot)
             if not ideal_t0["ok"]:
@@ -211,6 +243,20 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
         if step_index or config.include_t0:
             snapshots.append(snapshot)
 
+    service_views = [s["service_sla_forecast"] for s in snapshots]
+    service_evaluation = evaluate_service_forecasts(service_views)
+    if config.step_seconds == 2:
+        issued = [{**v, "warnings": v["operator_warnings"]} for v in service_views]
+        service_evaluation["operator_alert_evaluation"] = {
+            str(h): _score_window(issued, "koopman", h)[0] for h in (2, 10, 20)}
+    service_evaluation["route_stress"] = evaluate_route_stress(route_views, service_views)
+    sla_forecaster.case_traces(service_evaluation)
+    for case in service_evaluation["cases"].values():
+        if case and case.get("measurements"):
+            measured = case["measurements"]
+            times = impacts_by_flow.get((case["service"], case["flow_id"]), ())
+            case["flow_impact_starts_seconds"] = sorted(
+                t for t in times if measured[0]["time_seconds"] <= t <= measured[-1]["time_seconds"])
     return {
         "mode": (
             "predictive_weighted_attack_demonstration"
@@ -231,6 +277,12 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
         "health": health,
         "ideal_t0": ideal_t0,
         "snapshot_count": len(snapshots),
+        "service_sla_evaluation": service_evaluation,
+        "service_sla_runtime": {
+            "offline_compute_mean_ms": sum(sla_compute_ms) / len(sla_compute_ms),
+            "offline_compute_max_ms": max(sla_compute_ms),
+            "external_delivery_ms": None,
+        },
         "koopman_evaluation": _koopman_evaluation(
             snapshots,
             step_seconds=config.step_seconds,
@@ -789,6 +841,7 @@ def _snapshot(
             time_seconds=time_seconds,
             step_seconds=config.step_seconds,
             detail=config.packet_detail,
+            retain_flows=True,
             packet_sample_limit=config.packet_sample_limit,
             attack_events=attack_events,
             attack_precursors=attack_precursors,
@@ -1130,6 +1183,85 @@ def _tensor_snapshot(tensor: StateTensor) -> dict[str, Any]:
     }
 
 
+@dataclass
+class _WarningEpisode:
+    target_id: str
+    kind: str
+    # Шаг выдачи, время выдачи (с), начало и конец окна в шагах.
+    samples: list[tuple[int, int, int, int]]
+    segment_end_step: int
+
+
+def _warning_episodes_and_exposure(snapshots, step_seconds):
+    """Соседние отсчёты одной цели и типа составляют один эпизод.
+
+    Статус левого отсчёта действует до следующего отсчёта внутри непрерывного
+    участка. У последнего отсчёта нет длительности. При шаге 2 с одна тревога
+    перед следующим отсчётом даёт 2 с под тревогой.
+    """
+    episodes: list[_WarningEpisode] = []
+    observed_seconds = warning_seconds = 0
+    start = 0
+    while start < len(snapshots):
+        end = start
+        while end + 1 < len(snapshots):
+            left, right = snapshots[end:end + 2]
+            dt = right["time_seconds"] - left["time_seconds"]
+            if right["step_index"] != left["step_index"] + 1 or not 0 < dt <= step_seconds:
+                break
+            end += 1
+        active = {}
+        for index in range(start, end + 1):
+            snapshot = snapshots[index]
+            step = snapshot["step_index"]
+            time = snapshot["time_seconds"]
+            koopman = snapshot.get("koopman", {})
+            warning = koopman.get("forecast_is_early_warning", False)
+            if index < end:
+                dt = snapshots[index + 1]["time_seconds"] - time
+                observed_seconds += dt
+                if warning:
+                    warning_seconds += dt
+            pairs = _forecast_entity_pairs(koopman) if warning else set()
+            current = {}
+            for target, kind in sorted(pairs):
+                episode = active.get((target, kind))
+                if episode is None:
+                    episode = _WarningEpisode(target, kind, [], snapshots[end]["step_index"])
+                    episodes.append(episode)
+                episode.samples.append((step, time, *_forecast_step_window(koopman)))
+                current[target, kind] = episode
+            active = current
+        start = end + 1
+    span = snapshots[-1]["time_seconds"] - snapshots[0]["time_seconds"] if snapshots else 0
+    return episodes, observed_seconds, warning_seconds, span - observed_seconds
+
+
+def _match_warning_episodes(episodes, onsets, step_seconds):
+    """Максимальное число пар. При равенстве предпочитаем ранние начала и сигналы."""
+    graph = nx.Graph()
+    first_signals = {}
+    latest_step = max((ep.samples[-1][0] for ep in episodes), default=0)
+    onset_priority = (latest_step + 1) * (len(onsets) + 1)
+    for onset_index, (snapshot, event) in enumerate(onsets):
+        step, time = snapshot["step_index"], snapshot["time_seconds"]
+        for episode_index, episode in enumerate(episodes):
+            if (step > episode.segment_end_step or episode.target_id != event.get("target_id")
+                    or (episode.kind and episode.kind != event.get("kind"))):
+                continue
+            for issue_step, issue_time, window_start, window_end in episode.samples:
+                if time - issue_time >= step_seconds and window_start <= step <= window_end:
+                    first_signals[onset_index, episode_index] = (issue_step, issue_time)
+                    graph.add_edge(("onset", onset_index), ("warning", episode_index),
+                                   weight=-(onset_index * onset_priority + issue_step))
+                    break
+    matched = {}
+    for left, right in nx.max_weight_matching(graph, maxcardinality=True):
+        onset, episode = (left[1], right[1]) if left[0] == "onset" else (right[1], left[1])
+        matched[onset] = (episode, *first_signals[onset, episode])
+    return matched
+
+
 def _koopman_evaluation(
     snapshots: list[dict[str, Any]],
     *,
@@ -1142,80 +1274,40 @@ def _koopman_evaluation(
     прогона проверяется, попало ли реальное начало воздействия в выданное им
     окно и совпали ли наблюдаемая цель и класс телеметрии.
     """
-    onset_events: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    warning_windows = []
-    for snapshot in snapshots:
-        for event in snapshot.get("attacks", {}).get("events", []):
-            if int(event.get("relative_step", -1)) == 0:
-                onset_events.append((snapshot, event))
-        koopman = snapshot.get("koopman", {})
-        if koopman.get("forecast_is_early_warning"):
-            window_start, window_end = _forecast_step_window(koopman)
-            warning_windows.append((snapshot, window_start, window_end, _forecast_entity_pairs(koopman)))
-
-    records: list[dict[str, Any]] = []
-    for onset_snapshot, event in onset_events:
-        attack_id = str(event["attack_id"])
-        attack_kind = str(event.get("kind", "unknown"))
-        target_id = str(event.get("target_id", "unknown"))
-        onset_time = int(onset_snapshot.get("time_seconds", 0))
-        onset_step = int(onset_snapshot.get("step_index", -2))
-        candidates = []
-        for snapshot, window_start, window_end, predicted_pairs in warning_windows:
-            if (
-                int(snapshot.get("time_seconds", 0)) < onset_time
-                and window_start <= onset_step <= window_end
-                and (target_id, attack_kind) in predicted_pairs
-            ):
-                candidates.append(snapshot)
-        # Самое раннее подтверждённое предупреждение показывает фактический
-        # максимум доступного упреждения, а не только последний сигнал перед атакой.
-        warning = min(candidates, key=lambda item: int(item.get("time_seconds", 0)), default=None)
-        lead_seconds = 0 if warning is None else onset_time - int(warning.get("time_seconds", 0))
-        predicted = warning is not None and lead_seconds >= step_seconds
-        records.append(
-            {
-                "attack_id": attack_id,
-                "kind": event.get("kind"),
-                "target_id": event.get("target_id"),
-                "onset_step": int(onset_snapshot.get("step_index", 0)),
-                "onset_time_seconds": onset_time,
-                "warning_step": None if warning is None else int(warning.get("step_index", 0)),
-                "warning_time_seconds": None if warning is None else int(warning.get("time_seconds", 0)),
-                "lead_time_seconds": lead_seconds,
-                "predicted_before_onset": predicted,
-            }
-        )
-
-    false_warnings: list[dict[str, Any]] = []
-    censored_warnings: list[dict[str, Any]] = []
-    last_unmatched_step: dict[tuple[bool, str, str], int] = {}
-    last_observed_step = max((int(snapshot.get("step_index", 0)) for snapshot in snapshots), default=0)
-    onset_by_step: dict[int, list[dict[str, Any]]] = {}
-    for onset_snapshot, event in onset_events:
-        onset_by_step.setdefault(int(onset_snapshot.get("step_index", 0)), []).append(event)
-    for snapshot, window_start, window_end, predicted_pairs in warning_windows:
-        actual_pairs = {
-            (event.get("target_id"), event.get("kind"))
-            for step in range(window_start, window_end + 1)
-            for event in onset_by_step.get(step, [])
-        }
-        warning_step = int(snapshot.get("step_index", 0))
-        censored = window_end > last_observed_step
-        destination = censored_warnings if censored else false_warnings
-        for target_id, predicted_kind in sorted(predicted_pairs - actual_pairs):
-            key = (censored, target_id, predicted_kind)
-            previous_step = last_unmatched_step.get(key)
-            if previous_step is None or warning_step > previous_step + 1:
-                destination.append({
-                    "warning_step": warning_step,
-                    "forecast_window_start_step": window_start,
-                    "forecast_window_end_step": window_end,
-                    "target_id": target_id,
-                    "predicted_kind": predicted_kind,
-                    "counting_semantics": "deduplicated_contiguous_warning_episode",
-                })
-            last_unmatched_step[key] = warning_step
+    onset_events = [(snap, event) for snap in snapshots
+                    for event in snap.get("attacks", {}).get("events", [])
+                    if int(event.get("relative_step", -1)) == 0]
+    episodes, observed_seconds, warning_seconds, gap_seconds = _warning_episodes_and_exposure(
+        snapshots, step_seconds)
+    matched = _match_warning_episodes(episodes, onset_events, step_seconds)
+    records = []
+    for index, (snapshot, event) in enumerate(onset_events):
+        match = matched.get(index)
+        onset_time = snapshot["time_seconds"]
+        records.append({
+            "attack_id": str(event["attack_id"]), "kind": event.get("kind"),
+            "target_id": event.get("target_id"), "onset_step": snapshot["step_index"],
+            "onset_time_seconds": onset_time, "warning_episode_index": match[0] if match else None,
+            "warning_step": match[1] if match else None, "warning_time_seconds": match[2] if match else None,
+            "lead_time_seconds": onset_time - match[2] if match else 0,
+            "predicted_before_onset": match is not None,
+        })
+    false_warnings = []
+    censored_warnings = []
+    used = {match[0] for match in matched.values()}
+    for index, episode in enumerate(episodes):
+        if index in used:
+            continue
+        end = max(sample[3] for sample in episode.samples)
+        destination = censored_warnings if end > episode.segment_end_step else false_warnings
+        destination.append({
+            "warning_episode_index": index, "warning_step": episode.samples[0][0],
+            "last_warning_step": episode.samples[-1][0],
+            "forecast_window_start_step": min(sample[2] for sample in episode.samples),
+            "forecast_window_end_step": end, "target_id": episode.target_id,
+            "predicted_kind": episode.kind or None,
+            "counting_semantics": "deduplicated_contiguous_warning_episode",
+        })
     predicted_count = sum(1 for item in records if item["predicted_before_onset"])
     leads = [int(item["lead_time_seconds"]) for item in records if item["predicted_before_onset"]]
     slo_predicted_count = sum(
@@ -1239,10 +1331,6 @@ def _koopman_evaluation(
     recall = predicted_count / max(len(records), 1)
     precision = predicted_count / max(predicted_count + len(false_warnings), 1)
     f1 = 2.0 * precision * recall / max(precision + recall, 1e-12)
-    duration_seconds = max(
-        (int(snapshot.get("time_seconds", 0)) for snapshot in snapshots),
-        default=0,
-    )
     ordered_leads = sorted(leads)
     median_lead = (
         0.0
@@ -1340,8 +1428,13 @@ def _koopman_evaluation(
             "предупреждения считаются отдельными эпизодами. Если окно выходит за пределы "
             "прогона и совпадения нет, предупреждение остаётся непроверенным."
         ),
+        "warning_episode_count": len(episodes),
+        "observed_duration_seconds": observed_seconds,
+        "gap_duration_seconds": gap_seconds,
+        "warning_duration_seconds": warning_seconds,
+        "warning_occupancy_ratio": warning_seconds / observed_seconds if observed_seconds else None,
         "false_warnings_per_simulated_hour": (
-            len(false_warnings) * 3600.0 / max(duration_seconds, 1)
+            len(false_warnings) * 3600.0 / observed_seconds if observed_seconds else None
         ),
         "per_attack_kind": per_kind,
         "all_attacks_predicted_at_least_one_step_ahead": bool(records) and predicted_count == len(records),
@@ -1505,9 +1598,9 @@ def _forecast_entity_pairs(koopman: dict[str, Any]) -> set[tuple[str, str]]:
     """Сохранить соответствие «наблюдаемый узел → классифицированный тип»."""
     records = koopman.get("forecast_entity_records", [])
     pairs = {
-        (str(item.get("target_id")), str(item.get("kind")))
+        (str(item["target_id"]), str(item.get("kind") or ""))
         for item in records
-        if isinstance(item, dict) and item.get("target_id") and item.get("kind")
+        if isinstance(item, dict) and item.get("target_id")
     }
     if pairs:
         return pairs
@@ -1517,7 +1610,7 @@ def _forecast_entity_pairs(koopman: dict[str, Any]) -> set[tuple[str, str]]:
         item for item in str(koopman.get("forecast_next_attack_kind", "")).split("+")
         if item and item != "none"
     ]
-    return {(target, kind) for target in targets for kind in kinds}
+    return {(target, kind) for target in targets for kind in (kinds or [""])}
 
 
 def _validate_config(config: DynamicsConfig) -> None:

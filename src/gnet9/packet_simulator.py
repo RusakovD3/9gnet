@@ -130,6 +130,7 @@ def simulate_packet_snapshot(
     time_seconds: int,
     step_seconds: int,
     detail: PacketDetail = "sample",
+    retain_flows: bool = False,
     packet_sample_limit: int = 48,
     attack_events: list[dict[str, Any]] | None = None,
     attack_precursors: list[dict[str, Any]] | None = None,
@@ -185,7 +186,7 @@ def simulate_packet_snapshot(
         "network_state": network_runtime_metrics(model, flows, attack_events or [], detail=detail),
         "attack_state": attack_state,
     }
-    if detail in {"flows", "sample"}:
+    if retain_flows or detail in {"flows", "sample"}:
         result["flows"] = flows
     if detail == "sample":
         result["packet_sample"] = _build_packet_sample(

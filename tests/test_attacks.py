@@ -13,6 +13,40 @@ from src.gnet9.topology_builder import GNetBaselineBuilder
 MODEL = GNetBaselineBuilder().build()
 
 
+def test_warning_episode_can_only_predict_one_onset():
+    trace = [{"step_index": step, "time_seconds": step} for step in range(10)]
+    for step in (1, 2):
+        trace[step]["koopman"] = {
+            "forecast_is_early_warning": True, "forecast_window_start_step": 4,
+            "forecast_window_end_step": 7,
+            "forecast_entity_records": [{"target_id": "C1", "kind": "dos"}],
+        }
+    for step in (4, 5):
+        trace[step]["attacks"] = {"events": [
+            {"relative_step": 0, "target_id": "C1", "kind": "dos", "attack_id": str(step)}]}
+    result = _koopman_evaluation(trace, step_seconds=1, required_lead_seconds=2)
+    assert result["predicted_before_onset_count"] == 1
+    assert result["prediction_recall"] == 0.5
+    assert result["warning_episode_count"] == 1
+    assert result["warning_duration_seconds"] == 2
+    assert result["warning_occupancy_ratio"] == 2 / 9
+
+
+def test_overlapping_warnings_match_by_target_type_and_window():
+    trace = [{"step_index": step, "time_seconds": step} for step in range(12)]
+    for step, target, kind, end in ((1, "C1", None, 8), (3, "C1", "dos", 6),
+                                    (4, "C2", "dos", 8), (9, "C1", "dos", 12)):
+        trace[step]["koopman"] = {"forecast_is_early_warning": True, "forecast_window_start_step": step + 1,
+            "forecast_window_end_step": end, "forecast_entity_records": [{"target_id": target, "kind": kind}]}
+    for step, kind in ((6, "dos"), (8, "ddos")):
+        trace[step]["attacks"] = {"events": [
+            {"relative_step": 0, "target_id": "C1", "kind": kind, "attack_id": str(step)}]}
+    result = _koopman_evaluation(trace, step_seconds=1, required_lead_seconds=1)
+    assert [(r["onset_step"], r["warning_step"]) for r in result["records"]] == [(6, 3), (8, 1)]
+    assert result["false_positive_warning_count"] == 1
+    assert result["right_censored_warning_count"] == 1
+
+
 def test_false_warning_requires_coverage_of_its_whole_window():
     warning = {
         "step_index": 1, "time_seconds": 5,
@@ -30,6 +64,21 @@ def test_false_warning_requires_coverage_of_its_whole_window():
     assert unresolved["false_positive_warning_count"] == 0
     assert resolved["right_censored_warning_count"] == 0
     assert resolved["false_positive_warning_count"] == 1
+
+
+def test_separate_repeats_and_wrong_types_count_as_unmatched_episodes():
+    trace = [{"step_index": s, "time_seconds": 100 + 2 * s} for s in range(8)]
+    for step, kind in ((1, "dos"), (3, "dos"), (4, "ddos")):
+        trace[step]["koopman"] = {"forecast_is_early_warning": True, "forecast_window_start_step": 5,
+            "forecast_window_end_step": 6, "forecast_entity_records": [{"target_id": "C1", "kind": kind}]}
+    trace[6]["attacks"] = {"events": [
+        {"relative_step": 0, "target_id": "C1", "kind": "dos", "attack_id": "first"}]}
+    score = _koopman_evaluation(trace, step_seconds=2, required_lead_seconds=4)
+    assert score["records"][0]["warning_step"] == 1
+    assert score["observed_duration_seconds"] == 14
+    assert score["false_positive_warning_count"] == 2
+    assert score["warning_episode_count"] == 3
+    assert score["prediction_precision"] == 1 / 3
 
 
 def test_attack_catalog_uses_official_mitre_techniques_and_explicit_assumptions() -> None:
