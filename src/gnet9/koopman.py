@@ -84,6 +84,98 @@ KOOPMAN_TREND_WINDOW_SECONDS = 12
 # сенсор и два последовательных причинных отсчёта.
 KOOPMAN_WARNING_RISK_THRESHOLD = 0.30
 NOMINAL_THREAT_SCORE_LIMIT = 0.10
+INPUT_SINGULAR_VALUE_TOLERANCE = 1e-7
+DIAGONAL_RIDGE = 1e-4
+MAXIMUM_NOMINAL_COEFFICIENT = 0.995
+CONFIRMATION_SECONDS = 4
+NORMAL_ARRIVAL_METRIC = "OBS.normal_arrival_rate_pps"
+
+
+@dataclass
+class NominalArrivalFit:
+    """Аффинный AR(1) в пакетах/с по парам исходных исправных наблюдений."""
+
+    count: int = 0
+    mean_x: float = 0.0
+    mean_y: float = 0.0
+    centered_xx: float = 0.0
+    centered_xy: float = 0.0
+    low: float = math.inf
+    high: float = -math.inf
+
+    def add_pair(self, x: float, y: float) -> None:
+        self.count += 1
+        delta = x - self.mean_x
+        self.mean_x += delta / self.count
+        self.mean_y += (y - self.mean_y) / self.count
+        self.centered_xx += delta * (x - self.mean_x)
+        self.centered_xy += delta * (y - self.mean_y)
+        self.low = min(self.low, x)
+        self.high = max(self.high, x)
+
+    def parameters(self) -> dict[str, Any]:
+        mean = (self.mean_x + self.mean_y) / 2.0
+        raw_slope = None
+        if self.count >= 2 and self.high > self.low:
+            # Переход от раздельных средних x,y к общему стационарному среднему.
+            offset = self.mean_x - mean
+            xx = self.centered_xx + self.count * offset**2
+            xy = self.centered_xy + self.count * offset * (self.mean_y - mean)
+            raw_slope = xy / xx
+        return {
+            "metric": NORMAL_ARRIVAL_METRIC,
+            "input": "raw_normal_arrivals_from_accepted_healthy_pairs",
+            "transition_count": self.count,
+            "mean_of_pair_endpoints_pps": mean if self.count else None,
+            "raw_lag_one_coefficient": raw_slope,
+            "lag_one_coefficient": (
+                float(np.clip(raw_slope, -MAXIMUM_NOMINAL_COEFFICIENT, MAXIMUM_NOMINAL_COEFFICIENT))
+                if raw_slope is not None else None
+            ),
+            "observed_input_range_pps": [self.low, self.high] if self.count else None,
+        }
+
+
+def _physical_domains(names: list[str]) -> dict[str, dict[str, float | None]]:
+    """Пределы компактного вектора в исходных единицах симулятора."""
+    fractions = {
+        "L1.sla_margin.min", "L2.stability_margin.min", "EDGE.stability_margin.min",
+        "EDGE.loss_probability.max", "L8.terrain_risk.max", "L7.remap_pressure.mean",
+        "OBS.state_hausdorff_normalized", "OBS.account_lockout_pressure", "OBS.precursor_confidence",
+    }
+    nonnegative = {
+        "L1.traffic_intensity_rho.mean", "EDGE.utilization.mean",
+        "L7.gold_threat_minimum_distance_ms.mean", "L7.koopman_residual.mean",
+        "OBS.normal_arrival_rate_pps",
+    }
+    percentages = {"L2.cpu_load_percent.max", "L2.ram_load_percent.max",
+                   "OBS.maximum_target_utilization_percent"}
+    reserved = {"OBS.rerouted_gold_flow_count", "OBS.rerouted_silver_flow_count",
+                "OBS.rerouted_bronze_flow_count", "OBS.isolated_flow_count",
+                "OBS.service_failover_count", "OBS.route_change_ratio",
+                "OBS.maximum_post_remap_utilization_percent"}
+    domains = {}
+    for name in names:
+        lower = 0.0 if name in THREAT_METRICS | nonnegative | percentages | fractions else None
+        upper = None
+        if name in reserved:
+            upper = 0.0
+        elif name in percentages:
+            upper = 100.0
+        elif name in fractions or (name in THREAT_METRICS and name.endswith("_ratio")):
+            upper = 1.0
+        domains[name] = {"lower": lower, "upper": upper}
+    return domains
+
+
+def _input_spectrum(inputs: np.ndarray) -> dict[str, Any]:
+    """SVD входов до регуляризации, в единицах нормированного состояния."""
+    singular = np.linalg.svd(inputs, compute_uv=False)
+    retained = singular[singular > INPUT_SINGULAR_VALUE_TOLERANCE]
+    return {"singular_values": singular.tolist(), "rank": int(retained.size),
+            "feature_count": inputs.shape[1], "absolute_tolerance": INPUT_SINGULAR_VALUE_TOLERANCE,
+            "condition_number_on_retained_subspace": (
+                float(retained[0] / retained[-1]) if retained.size else None)}
 
 
 def _healthy_quality_observation(metric_names, vector, attack_state) -> bool:
@@ -138,6 +230,9 @@ class KoopmanOnlineAnalyzer:
     reference_context: dict[str, Any]
     online_gram: np.ndarray
     online_cross: np.ndarray
+    observed_input_qr: np.ndarray
+    observed_input_low: np.ndarray
+    observed_input_high: np.ndarray
     lyapunov_matrix: np.ndarray
     lyapunov_solver_iterations: int
     lyapunov_solver_residual: float
@@ -155,6 +250,8 @@ class KoopmanOnlineAnalyzer:
     analysis_revision: int = 0
     operator_revision: int = 0
     nominal_observation_count: int = 0
+    nominal_arrivals: NominalArrivalFit = field(default_factory=NominalArrivalFit)
+    previous_raw_arrival_pps: float | None = None
     last_observed_threat_step: int | None = None
     previous_transition_was_nominal: bool = True
     tensor_koopman: TensorKroneckerKoopman | None = None
@@ -179,16 +276,17 @@ class KoopmanOnlineAnalyzer:
     ) -> "KoopmanOnlineAnalyzer":
         metric_names = list(state_vector["metric_names"])
         reference = np.asarray(state_vector["vector"], dtype=float)
+        if (not metric_names or len(set(metric_names)) != len(metric_names)
+                or reference.shape != (len(metric_names),) or not np.isfinite(reference).all()):
+            raise ValueError("Эталону нужны уникальные имена и конечное значение каждой координаты")
         scale = _scale_vector(metric_names, reference)
         training = _ideal_training_vectors(metric_names, reference, scale)
         normalized_training = (training - reference) / scale
         x = normalized_training[:-1].T
         y = normalized_training[1:].T
-        online_gram = x @ x.T
-        online_cross = y @ x.T
-        operator = _operator_from_covariances(online_gram, online_cross)
+        diagonal = np.sum(x * y, axis=1) / (np.sum(x * x, axis=1) + DIAGONAL_RIDGE)
+        operator = np.diag(np.clip(diagonal, 0.0, MAXIMUM_NOMINAL_COEFFICIENT))
         operator = _stabilize_threat_dimensions(operator, metric_names)
-        operator = _limit_spectral_radius(operator)
         residual = _training_residual(operator, normalized_training)
         lyapunov_matrix, lyapunov_iterations, lyapunov_residual = _discrete_lyapunov_matrix(operator)
         return cls(
@@ -213,9 +311,13 @@ class KoopmanOnlineAnalyzer:
                 operator=operator,
                 training_sample_count=int(training.shape[0]),
                 training_rank=int(np.linalg.matrix_rank(normalized_training)),
+                input_spectrum=_input_spectrum(x.T),
             ),
-            online_gram=online_gram,
-            online_cross=online_cross,
+            online_gram=np.zeros_like(operator),
+            online_cross=np.zeros_like(operator),
+            observed_input_qr=np.empty((0, len(reference))),
+            observed_input_low=np.full_like(reference, np.inf),
+            observed_input_high=np.full_like(reference, -np.inf),
             lyapunov_matrix=lyapunov_matrix,
             lyapunov_solver_iterations=lyapunov_iterations,
             lyapunov_solver_residual=lyapunov_residual,
@@ -256,6 +358,10 @@ class KoopmanOnlineAnalyzer:
         runtime_state: dict[str, Any] | None = None,
         routing: FixedTopologyRoutes | None = None,
     ) -> dict[str, Any]:
+        raw_current = np.asarray(state_vector["vector"], dtype=float)
+        if (list(state_vector.get("metric_names", self.metric_names)) != self.metric_names
+                or raw_current.shape != self.reference_vector.shape or not np.isfinite(raw_current).all()):
+            raise ValueError("Ожидается конечный вектор в порядке координат эталона")
         self.analysis_revision += 1
         # Текущий снимок является атомарным: residual, rollout, спектр и
         # Ляпунов используют одну и ту же пару K/P. Возможное online-обновление
@@ -266,9 +372,11 @@ class KoopmanOnlineAnalyzer:
         lyapunov_solver_iterations_used = self.lyapunov_solver_iterations
         lyapunov_solver_residual_used = self.lyapunov_solver_residual
         nominal_observation_count_used = self.nominal_observation_count
+        observed_spectrum = _input_spectrum(self.observed_input_qr)
+        observed_spectrum["sample_count"] = nominal_observation_count_used
         operator_fingerprint_used = _matrix_fingerprint(operator_used)
         lyapunov_fingerprint_used = _matrix_fingerprint(lyapunov_matrix_used)
-        current = np.asarray(state_vector["vector"], dtype=float)
+        current = raw_current
         raw_normalized = self._normalize(current)
         active_attack_score = _attack_score(self.metric_names, current)
         precursor_score = _precursor_score(self.metric_names, current)
@@ -349,17 +457,40 @@ class KoopmanOnlineAnalyzer:
         previous_streaks = self.sensor_streaks if self.last_sensor_step == step_index - 1 else {}
         self.sensor_streaks = {sensor: previous_streaks.get(sensor, 0) + 1 for sensor in observed_sensors}
         self.last_sensor_step = step_index
-        required_confirmation_samples = 1 if attack_state.get("scenario") == "mitre-demo" else 2
+        required_confirmation_samples = max(1, math.ceil(CONFIRMATION_SECONDS / max(1, self.step_seconds)))
         confirmed_records = [record for record in forecast_entities["next_entity_records"]
                              if self.sensor_streaks[record["target_id"]] >= required_confirmation_samples]
         confirmed_sensors = {record["target_id"] for record in confirmed_records}
         predicted_next_attack = _predicted_precursor_kind(attack_state, confirmed_records)
-        horizon_forecasts, predicted_vectors = _multi_horizon_forecasts(
+        numeric_origins = self._numeric_origins(z_current, nominal=filter_applied)
+        arrival_fit = self.nominal_arrivals.parameters()
+        arrival_index = None
+        if NORMAL_ARRIVAL_METRIC in self.metric_names:
+            arrival_index = self.metric_names.index(NORMAL_ARRIVAL_METRIC)
+            if self.nominal_arrivals.count == 0:
+                origin = "persistence_no_healthy_arrival_pair"
+            elif arrival_fit["lag_one_coefficient"] is None:
+                origin = "nominal_arrival_mean_insufficient_variation"
+            elif self.nominal_arrivals.low <= raw_current[arrival_index] <= self.nominal_arrivals.high:
+                origin = "observed_affine_arrival_dmd"
+            else:
+                origin = "nominal_arrival_mean_outside_observed_range"
+            numeric_origins[arrival_index] = origin
+        support_ranges = [
+            [float(low), float(high)] if low <= high else None
+            for low, high in zip(self.observed_input_low, self.observed_input_high)
+        ]
+        horizon_forecasts = _multi_horizon_forecasts(
             metric_names=self.metric_names,
             reference_vector=self.reference_vector,
             scale_vector=self.scale_vector,
             operator=operator_used,
             z_current=z_current,
+            raw_current=raw_current,
+            numeric_origins=numeric_origins,
+            arrival_index=arrival_index,
+            arrival_fit=arrival_fit,
+            physical_domains=self.reference_context["physical_domains"],
             observed_trend=observed_trend,
             attack_state=attack_state,
             target_ids=sorted(confirmed_sensors) or forecast_entities["current_target_ids"],
@@ -377,7 +508,7 @@ class KoopmanOnlineAnalyzer:
             warning_risk_threshold=self.warning_risk_threshold,
         )
         first_forecast = horizon_forecasts[0]
-        predicted_next = predicted_vectors[0]
+        predicted_next = first_forecast["predicted_vector"]
         predicted_reference_distance = float(first_forecast["predicted_reference_distance"])
         predicted_attack_score = float(first_forecast["predicted_attack_score"])
         forecast_risk = max(float(item["risk_score"]) for item in horizon_forecasts)
@@ -410,17 +541,24 @@ class KoopmanOnlineAnalyzer:
         # P_used. Если предыдущий шаг использовал иную ревизию, энергия его
         # состояния пересчитывается сейчас, а не смешивается с прежним базисом.
         comparable_previous_lyapunov = 0.0
+        lyapunov_transition = None
         lyapunov_basis_rebased = bool(
             self.previous_vector is not None
             and self.previous_analysis_operator_revision is not None
             and self.previous_analysis_operator_revision != operator_revision_used
         )
         if self.previous_vector is not None:
-            z_previous_for_energy = self._normalize(self.previous_vector)
-            _, comparable_previous_lyapunov = _lyapunov_state_energy(
-                z_previous_for_energy,
+            previous_raw_energy, comparable_previous_lyapunov = _lyapunov_state_energy(
+                z_previous,
                 lyapunov_matrix_used,
             )
+            error_energy = lyapunov_matrix_used @ transition_residual_vector
+            lyapunov_transition = {
+                "unforced_delta_raw": -float(z_previous @ z_previous),
+                "cross_term_raw": 2.0 * float(predicted_current @ error_energy),
+                "residual_energy_raw": float(transition_residual_vector @ error_energy),
+                "observed_delta_raw": float(z_current @ lyapunov_matrix_used @ z_current) - previous_raw_energy,
+            }
         lyapunov_raw, lyapunov_value = _lyapunov_state_energy(
             z_current,
             lyapunov_matrix_used,
@@ -509,6 +647,8 @@ class KoopmanOnlineAnalyzer:
         if transition_accepted:
             z_previous_for_update = self._normalize(self.previous_vector)
             self.nominal_observation_count += 1
+            if arrival_index is not None and self.previous_raw_arrival_pps is not None:
+                self.nominal_arrivals.add_pair(self.previous_raw_arrival_pps, float(raw_current[arrival_index]))
             update_applied_for_next_step = self._update_observed_operator(
                 z_previous_for_update,
                 z_current,
@@ -525,6 +665,8 @@ class KoopmanOnlineAnalyzer:
         # Состояние становится предыдущим только после завершения анализа и
         # потенциального коммита модели для следующего шага.
         self.previous_vector = current.copy()
+        if arrival_index is not None:
+            self.previous_raw_arrival_pps = float(raw_current[arrival_index])
         self.previous_transition_was_nominal = nominal_now
         self.previous_analysis_operator_revision = operator_revision_used
         self.state_history.append(z_current.copy())
@@ -562,11 +704,18 @@ class KoopmanOnlineAnalyzer:
             },
             "training_reference": self.reference_context,
             "training_residual": round(self.training_residual, 8),
+            "numeric_forecast_origin": dict(zip(self.metric_names, numeric_origins)),
             "nominal_training": {
                 "observation_eligible": nominal_now,
                 "transition_accepted": transition_accepted,
                 "input": "filtered_normalized_observations",
                 "requires_two_healthy_observations": True,
+                "observed_input_spectrum": observed_spectrum,
+                "diagonal_coefficients_used": np.diag(operator_used).tolist(),
+                "observed_normalized_input_ranges_used": support_ranges,
+                "ridge_penalty": DIAGONAL_RIDGE,
+                "ordinary_arrival_fit_used": arrival_fit,
+                "maximum_coefficient": MAXIMUM_NOMINAL_COEFFICIENT,
             },
             "t0_signature": self.reference_context["t0_signature"],
             "step_index": step_index,
@@ -591,6 +740,7 @@ class KoopmanOnlineAnalyzer:
             "lagged_feature_count": len(self.metric_names) * self.delay_embedding_depth,
             "uses_augmented_hankel_operator": False,
             "warning_confirmation_samples": required_confirmation_samples,
+            "warning_confirmation_seconds": CONFIRMATION_SECONDS,
             "confirmed_sensor_nodes": sorted(confirmed_sensors),
             "maximum_forecast_horizon_steps": self.maximum_forecast_horizon_steps,
             "maximum_forecast_horizon_seconds": actual_forecast_horizon_seconds,
@@ -700,6 +850,7 @@ class KoopmanOnlineAnalyzer:
             "lyapunov_value": round(lyapunov_value, 6),
             "lyapunov_raw_value": round(lyapunov_raw, 6),
             "lyapunov_delta": round(lyapunov_delta, 6),
+            "lyapunov_transition": lyapunov_transition,
             "lyapunov_derivative_per_second": round(lyapunov_derivative, 6),
             "lyapunov_basis_rebased_after_operator_update": lyapunov_basis_rebased,
             "lyapunov_previous_state_recomputed_on_matrix_used": bool(
@@ -720,6 +871,7 @@ class KoopmanOnlineAnalyzer:
             "lyapunov_matrix_fingerprint_after_update": lyapunov_fingerprint_after_update,
             "lyapunov_solver": {
                 "equation": "K.T @ P @ K - P = -I",
+                "applies_to": "unforced_linear_map_with_fixed_operator_revision",
                 "method": "smith_doubling_iteration",
                 "operator_revision": operator_revision_used,
                 "iterations": lyapunov_solver_iterations_used,
@@ -746,7 +898,7 @@ class KoopmanOnlineAnalyzer:
             "route_hausdorff": route_hausdorff,
             "predicted_next_vector": {
                 "metric_names": self.metric_names,
-                "vector": [round(float(value), 6) for value in predicted_next.tolist()],
+                "vector": predicted_next,
             },
             "top_residual_metrics": _top_residuals(self.metric_names, transition_residual_vector),
             "arbitrator_recommendation": recommendation,
@@ -786,15 +938,38 @@ class KoopmanOnlineAnalyzer:
     def _denormalize(self, normalized: np.ndarray) -> np.ndarray:
         return self.reference_vector + normalized * self.scale_vector
 
+    def _numeric_origins(self, normalized: np.ndarray, *, nominal: bool) -> list[str]:
+        """Определить источник численного прогноза до наблюдения его цели."""
+        origins = []
+        for i, name in enumerate(self.metric_names):
+            if name in THREAT_METRICS:
+                origin = "persistence_untrained_threat_coordinate"
+            elif not nominal:
+                origin = "persistence_non_nominal_observation"
+            elif self.online_gram[i, i] <= INPUT_SINGULAR_VALUE_TOLERANCE ** 2:
+                origin = "persistence_unexcited_coordinate"
+            elif not self.observed_input_low[i] <= normalized[i] <= self.observed_input_high[i]:
+                origin = "persistence_outside_observed_range"
+            else:
+                origin = "observed_diagonal_dmd"
+            origins.append(origin)
+        return origins
+
     def _update_observed_operator(self, previous: np.ndarray, current: np.ndarray) -> bool:
         # Рабочий оператор учится и на небольших изменениях исправного трафика.
         # reference_vector и ideal_operator остаются неизменным эталоном t0.
-        forgetting_factor = 0.985
-        self.online_gram = forgetting_factor * self.online_gram + np.outer(previous, previous)
-        self.online_cross = forgetting_factor * self.online_cross + np.outer(current, previous)
-        candidate = _operator_from_covariances(self.online_gram, self.online_cross)
-        candidate = _stabilize_threat_dimensions(candidate, self.metric_names)
-        self.observed_operator = _limit_spectral_radius(candidate)
+        self.online_gram += np.outer(previous, previous)
+        self.online_cross += np.outer(current, previous)
+        self.observed_input_low = np.minimum(self.observed_input_low, previous)
+        self.observed_input_high = np.maximum(self.observed_input_high, previous)
+        # R имеет те же сингулярные числа, что и все накопленные входные строки.
+        self.observed_input_qr = np.linalg.qr(np.vstack((self.observed_input_qr, previous)), mode="r")
+        prior = np.diag(self.ideal_operator)
+        xx = self.online_gram.diagonal()
+        coefficients = (self.online_cross.diagonal() + DIAGONAL_RIDGE * prior) / (xx + DIAGONAL_RIDGE)
+        coefficients = np.where(xx > INPUT_SINGULAR_VALUE_TOLERANCE ** 2, coefficients, prior)
+        candidate = np.diag(np.clip(coefficients, 0.0, MAXIMUM_NOMINAL_COEFFICIENT))
+        self.observed_operator = _stabilize_threat_dimensions(candidate, self.metric_names)
         (
             self.lyapunov_matrix,
             self.lyapunov_solver_iterations,
@@ -893,6 +1068,13 @@ def apply_koopman_to_arbitrator(
         source_confirmed=False,
     )
     arbitrator["trigger_card"] = card
+    without_energy = build_trigger_card(
+        hausdorff=float(analysis.get("state_hausdorff", {}).get("normalized_distance", 0.0)),
+        risk=float(koopman["forecast_risk_score"]), lyapunov_pressure=0.0,
+        decision_pressure=max(current_pressure, predictive_pressure), confirmed=confirmed,
+        attack_kind=card["attack_kind"], source_confirmed=False,
+    )
+    analysis["response_stage_without_lyapunov"] = without_energy["response_stage"]
     recommendation = dict(koopman["arbitrator_recommendation"])
     recommendation.update(
         action=card["action"], response_stage=card["response_stage"],
@@ -1020,6 +1202,11 @@ def _multi_horizon_forecasts(
     scale_vector: np.ndarray,
     operator: np.ndarray,
     z_current: np.ndarray,
+    raw_current: np.ndarray,
+    numeric_origins: list[str],
+    arrival_index: int | None,
+    arrival_fit: dict[str, Any],
+    physical_domains: dict[str, dict[str, float | None]],
     observed_trend: np.ndarray,
     attack_state: dict[str, Any],
     target_ids: list[str],
@@ -1035,22 +1222,35 @@ def _multi_horizon_forecasts(
     step_seconds: int,
     maximum_horizon_steps: int,
     warning_risk_threshold: float,
-) -> tuple[list[dict[str, Any]], list[np.ndarray]]:
-    """Повторно применить Koopman и скорректировать threat-координаты трендом."""
+) -> list[dict[str, Any]]:
+    """Численная телеметрия и отдельный риск по наблюдаемым признакам."""
     forecasts: list[dict[str, Any]] = []
-    vectors: list[np.ndarray] = []
-    z_iterated = z_current.copy()
     z_dmd_only = z_current.copy()
+    z_trend = z_current.copy()
+    learned = np.asarray([origin == "observed_diagonal_dmd" for origin in numeric_origins])
+    lower = np.array([physical_domains[name]["lower"] if physical_domains[name]["lower"] is not None
+                      else -np.inf for name in metric_names])
+    upper = np.array([physical_domains[name]["upper"] if physical_domains[name]["upper"] is not None
+                      else np.inf for name in metric_names])
     threat_indices = [index for index, name in enumerate(metric_names) if name in THREAT_METRICS]
     current_kind = _current_attack_kind(attack_state)
     predicted_kind = precursor_kind if precursor_confirmed or current_kind == "none" else current_kind
     precursor_observed = _observable_precursor_present(attack_state, precursor_score)
 
     for horizon_steps in range(1, max(1, maximum_horizon_steps) + 1):
-        dmd_projection = operator @ z_dmd_only
-        z_dmd_only = np.clip(dmd_projection, -8.0, 8.0)
-        dmd_prediction = reference_vector + z_dmd_only * scale_vector
-        dmd_distance = _rms(z_dmd_only)
+        z_dmd_only = operator @ z_dmd_only
+        raw_dmd = reference_vector + z_dmd_only * scale_vector
+        dmd_prediction = np.clip(raw_dmd, lower, upper)
+        numeric_candidate = np.where(learned, raw_dmd, raw_current)
+        if arrival_index is not None and arrival_fit["transition_count"]:
+            mean_pps = arrival_fit["mean_of_pair_endpoints_pps"]
+            numeric_candidate[arrival_index] = mean_pps
+            if numeric_origins[arrival_index] == "observed_affine_arrival_dmd":
+                slope = arrival_fit["lag_one_coefficient"]
+                numeric_candidate[arrival_index] += slope**horizon_steps * (raw_current[arrival_index] - mean_pps)
+        numeric = np.clip(numeric_candidate, lower, upper)
+        changed = np.flatnonzero(numeric != numeric_candidate)
+        dmd_distance = _rms((dmd_prediction - reference_vector) / scale_vector)
         dmd_attack_score = _attack_score(metric_names, dmd_prediction)
         dmd_risk = _forecast_risk(
             deviation=dmd_distance,
@@ -1060,7 +1260,7 @@ def _multi_horizon_forecasts(
             precursor_only=precursor_score > 0.0 and active_attack_score == 0.0,
             threat_proximity_risk=0.0,
         )
-        operator_projection = operator @ z_iterated
+        operator_projection = operator @ z_trend
         trend_projection = z_current + observed_trend * horizon_steps
         trend_weight = min(0.78, 0.38 + 0.08 * horizon_steps)
         candidate = operator_projection.copy()
@@ -1069,9 +1269,9 @@ def _multi_horizon_forecasts(
                 (1.0 - trend_weight) * operator_projection[index]
                 + trend_weight * trend_projection[index]
             )
-        candidate = np.clip(candidate, -8.0, 8.0)
-        trend_prediction = reference_vector + candidate * scale_vector
-        trend_distance = _rms(candidate)
+        trend_prediction = np.clip(reference_vector + candidate * scale_vector, lower, upper)
+        z_trend = (trend_prediction - reference_vector) / scale_vector
+        trend_distance = _rms(z_trend)
         trend_attack_score = _attack_score(metric_names, trend_prediction)
         trend_risk = _forecast_risk(
             deviation=trend_distance,
@@ -1079,47 +1279,51 @@ def _multi_horizon_forecasts(
             operator_drift=operator_drift,
             attack_score=trend_attack_score,
             precursor_only=precursor_score > 0.0 and active_attack_score == 0.0,
-            threat_proximity_risk=(
-                threat_proximity_risk if precursor_observed else 0.0
-            ),
+            threat_proximity_risk=0.0,
         )
-        predicted = trend_prediction
         predicted = _inject_precursor_forecast(
             metric_names,
-            predicted,
+            trend_prediction,
             attack_state,
             precursor_score=precursor_score,
             horizon_steps=horizon_steps,
         )
-        z_iterated = (predicted - reference_vector) / scale_vector
-        predicted_distance = _rms(z_iterated)
+        predicted = np.clip(predicted, lower, upper)
+        predicted_distance = _rms((predicted - reference_vector) / scale_vector)
         predicted_attack_score = _attack_score(metric_names, predicted)
-        risk = _forecast_risk(
+        hybrid_inputs = dict(
             deviation=predicted_distance,
             residual=residual / np.sqrt(float(horizon_steps)),
             operator_drift=operator_drift,
             attack_score=predicted_attack_score,
             precursor_only=precursor_score > 0.0 and active_attack_score == 0.0,
-            threat_proximity_risk=(
-                threat_proximity_risk
-                if precursor_observed or active_attack_score > 0.0
-                else 0.0
-            ),
         )
+        rule_risk = _forecast_risk(**hybrid_inputs, threat_proximity_risk=0.0)
+        proximity = threat_proximity_risk if precursor_observed or active_attack_score > 0.0 else 0.0
+        risk = _forecast_risk(**hybrid_inputs, threat_proximity_risk=proximity)
         forecasts.append(
             {
                 "horizon_steps": horizon_steps,
                 "horizon_seconds": horizon_steps * step_seconds,
                 "target_step": step_index + horizon_steps,
                 "target_time_seconds": time_seconds + horizon_steps * step_seconds,
+                "predicted_vector": numeric.tolist(),
+                "dmd_raw_vector": raw_dmd.tolist(),
+                "dmd_projected_vector": dmd_prediction.tolist(),
+                "physical_projection": {
+                    "corrected_metric_count": len(changed),
+                    "correction_by_metric": {
+                        metric_names[i]: float(numeric[i] - numeric_candidate[i]) for i in changed
+                    },
+                },
                 # Ряд риска используют для калибровки. Сохраняем то же
                 # значение, которое ниже сравнивается с порогом предупреждения.
                 "risk_score": risk,
                 "koopman_dmd_only_risk_score": round(dmd_risk, 6),
                 "koopman_plus_delay_trend_risk_score": round(trend_risk, 6),
-                "precursor_classifier_risk_increment": round(max(0.0, risk - trend_risk), 6),
-                "predicted_attack_score": round(predicted_attack_score, 6),
-                "predicted_reference_distance": round(predicted_distance, 6),
+                "precursor_classifier_risk_increment": round(max(0.0, rule_risk - trend_risk), 6),
+                "predicted_attack_score": round(_attack_score(metric_names, numeric), 6),
+                "predicted_reference_distance": round(_rms((numeric - reference_vector) / scale_vector), 6),
                 "attack_kind": predicted_kind,
                 "target_ids": target_ids,
                 "alert_level": _alert_level(risk),
@@ -1131,10 +1335,17 @@ def _multi_horizon_forecasts(
                 "prediction_origin": (
                     "repeated_koopman_projection_plus_observed_delay_trend_plus_causal_precursor_classifier"
                 ),
+                "risk_components": {
+                    "delay_trend_increment": trend_risk - dmd_risk,
+                    "precursor_rule_increment": rule_risk - trend_risk,
+                    "target_proximity_increment": risk - rule_risk,
+                    "hybrid_attack_score": predicted_attack_score,
+                    "hybrid_reference_distance": predicted_distance,
+                    "class_and_target_source": "observed_signature_or_current_event",
+                },
             }
         )
-        vectors.append(predicted)
-    return forecasts, vectors
+    return forecasts
 
 
 def _observable_precursor_present(attack_state: dict[str, Any], precursor_score: float) -> bool:
@@ -1263,6 +1474,7 @@ def _reference_context(
     operator: np.ndarray,
     training_sample_count: int,
     training_rank: int,
+    input_spectrum: dict[str, Any],
 ) -> dict[str, Any]:
     sla_counts: dict[str, int] = {}
     traffic_counts: dict[str, int] = {}
@@ -1304,7 +1516,9 @@ def _reference_context(
         "trained_on": "ideal_t0_neighbourhood",
         "training_mode": "synthetic_healthy_neighbourhood_dmd",
         "training_data_origin": "deterministic_synthetic_metric_neighbourhood",
-        "operator_estimator": "regularized_covariance_dmd",
+        "operator_estimator": "constrained_diagonal_dmd_with_synthetic_prior",
+        "synthetic_input_spectrum": {**input_spectrum, "sample_count": training_sample_count - 1},
+        "physical_domains": _physical_domains(metric_names),
         "training_sample_count": training_sample_count,
         "training_rank": training_rank,
         "nominal_metric_count": sum(name not in THREAT_METRICS for name in metric_names),

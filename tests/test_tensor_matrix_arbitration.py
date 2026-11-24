@@ -72,6 +72,20 @@ def test_defense_game_uses_weighted_observed_sla_risk() -> None:
     assert game["threat_pressure"] == .75
 
 
+def test_reference_scenarios_select_best_worst_case_and_separate_service_priority():
+    from src.gnet9.koopman import _sla_restoration_plan
+
+    tiers = [{"sla_grade": grade, "flow_count": count, "sla_compliant_flow_count": 0,
+              "affected_flow_count": count} for grade, count in (("bronze", 100), ("gold", 1), ("silver", 50))]
+    plan = _sla_restoration_plan({"sla_restoration": {"tiers": tiers}})
+    assert [(tier["sla_grade"], tier["affected_flow_count"]) for tier in plan["tiers"]] == [
+        ("gold", 1), ("silver", 50), ("bronze", 100)]
+    game = evaluate_defense_game(MODEL, target_ids=["C1"], threat_pressure=1, matrix_koopman_pressure=0)
+    assert game["scenario_multipliers"] == {"MAINTAIN": 0.72, "ESCALATE": 1.0, "DISTRIBUTE": 0.88}
+    assert game["selected"]["attacker_action"] == "ESCALATE"
+    assert game["selected"]["defender_payoff"] == max(game["wald_maximin"]["worst_payoff_by_action"].values())
+
+
 def test_attack_catalog_binds_vvh_tth_to_target_capacity_profile() -> None:
     catalog = attack_catalog(MODEL, "mitre-demo")
     c1 = next(item for item in catalog if item["target_id"] == "C1")

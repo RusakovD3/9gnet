@@ -213,3 +213,9 @@ def test_tensor_filter_preserves_damage_and_ignores_future_metadata():
     assert first.tensor_filters["L2"].state == pytest.approx(before)
     assert changed.matrices["L2"].values == pytest.approx(initial)
     assert reference.matrices["L2"].values == pytest.approx(np.array([[10., 0.]]))
+
+def test_gate_reports_actual_innovation_dimension():
+    report = LocalObservationFilter(_state()).analyze(_state(), nominal=True)
+    assert report["vertices"]["innovation_dimension"] == 8
+    assert report["edges"]["innovation_dimension"] == 5
+    assert report["gate_calibration"] == "fixed_engineering_threshold"

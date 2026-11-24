@@ -151,6 +151,7 @@ class LocalObservationFilter:
                   "decision_role": "diagnostic_only",
                   "unsupported_local_techniques": ["T1110.001", "T0831"],
                   "innovation_chi_square_threshold": INNOVATION_CHI_SQUARE_THRESHOLD,
+                  "gate_calibration": "fixed_engineering_threshold",
                   "process_variance": self.process_variance,
                   "measurement_variance": self.measurement_variance,
                   "filter_status_codes": dict(FILTER_STATUS_CODES),
@@ -247,6 +248,7 @@ class LocalObservationFilter:
         result = {
             "entity_count": len(ids), "entity_ids": ids, "metric_names": list(names),
             "dimension": len(names), "sigma_point_count": 2 * len(names) + 1,
+            "innovation_dimension": int(np.count_nonzero(enabled)),
             "preserved_metric_names": [name for name, smooth in zip(names, enabled) if not smooth],
             "filter_status_by_entity": status.tolist(),
             "innovation_chi_square_by_entity": chi_square.round(6).tolist(),

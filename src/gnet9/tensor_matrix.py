@@ -254,6 +254,7 @@ class TensorKroneckerKoopman:
         operator = LazyKroneckerOperator(self.level_operator, self.feature_operator)
         predicted = operator.matvec(previous.reshape(-1)).reshape(previous.shape)
         residual = observables - predicted
+        uncoupled = np.diag(self.level_operator)[:, None] * previous @ self.feature_operator.T
         state_dimension = int(observables.size)
         parameter_count = int(self.level_operator.size + self.feature_operator.size)
         dense_parameter_count = int(state_dimension * state_dimension)
@@ -287,6 +288,7 @@ class TensorKroneckerKoopman:
             ),
             "reference_distance": round(float(np.linalg.norm(observables, ord="fro")), 8),
             "one_step_residual": round(float(np.sqrt(np.mean(np.square(residual)))), 8),
+            "residual_without_level_coupling": float(np.sqrt(np.mean((observables - uncoupled) ** 2))),
             "maximum_residual": round(float(np.max(np.abs(residual))) if residual.size else 0.0, 8),
             "per_level": {
                 level: {

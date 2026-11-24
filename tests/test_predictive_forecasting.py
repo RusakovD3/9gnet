@@ -278,6 +278,8 @@ def test_warning_and_report_use_the_same_unrounded_risk(monkeypatch):
     observation = {"scenario": "mitre-demo", "precursors": [
         {"sensor_node_id": "C2", "signals": {"syn_backlog_growth_ratio": 0.9}},
     ]}
+    analyzer.analyze_step(MODEL, {**reference, "vector": [0.9]},
+                          attack_state=observation, step_index=0, time_seconds=0)
     result = analyzer.analyze_step(MODEL, {**reference, "vector": [0.9]},
                                    attack_state=observation, step_index=1, time_seconds=2)
     assert result["forecast_is_early_warning"]
@@ -810,3 +812,20 @@ def test_exported_weibull_hazard_and_survival_match_declared_formulas() -> None:
         expected_survival = math.exp(-((interval / scale) ** shape))
         assert math.isclose(hazard, expected_hazard, rel_tol=2e-6, abs_tol=1e-9)
         assert math.isclose(survival, expected_survival, rel_tol=2e-6, abs_tol=1e-9)
+
+
+def test_single_outlying_sensor_can_saturate_distance_but_cannot_confirm_attack():
+    from src.gnet9.arbitrator import build_trigger_card
+    reference = {"by_level": {"L2": [
+        {"scope": "node", "node_id": f"r{i}", "tensor_name": "state", "level": "L2",
+         "metrics": {"cpu_load_percent": 20.}, "units": {"cpu_load_percent": "percent"}}
+        for i in range(100)]}}
+    current = deepcopy(reference)
+    current["by_level"]["L2"][0]["metrics"]["cpu_load_percent"] = 9999.
+    distance = state_tensor_hausdorff_view(reference, current, time_index=1)
+    assert distance["normalized_distance"] == 1.
+    assert distance["witnesses"]["current_to_t0_tensor_id"] == "node:r0:state"
+    card = build_trigger_card(hausdorff=1., risk=0., lyapunov_pressure=0., decision_pressure=1.,
+                              confirmed=False, attack_kind="unknown", source_confirmed=False)
+    assert card["response_stage"] == "confirm_observation"
+    assert not card["controls"]

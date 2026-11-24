@@ -155,3 +155,12 @@ def test_cpu_and_buffer_metrics_are_queue_estimates_with_explicit_units():
     assert "not_measured_ram" in compact["metric_origins"]["buffer_memory_mib"]
     assert compact["vertex_units"][7] == "ms2"
     assert compact["edge_units"][2] == "ms"
+
+def test_stationary_loss_during_short_burst_has_transient_bias():
+    # K=1, initially empty, λ=μ=1/s. P(full,t)=(1-exp(-2t))/2.
+    # An arrival during the first second sees mean P(full)=.5-(1-exp(-2))/4.
+    import math
+    stationary = gelenbe_queue(1., 1., 0., 1)
+    first_second = .5 - (1. - math.exp(-2.)) / 4.
+    assert stationary["blocking_probability"] - first_second == pytest.approx(.21616618)
+    assert stationary["served_rate_pps"] + stationary["overflow_rate_pps"] == pytest.approx(1.)

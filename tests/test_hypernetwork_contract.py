@@ -103,3 +103,11 @@ def test_lazy_operator_handles_independent_row_and_column_permutations(monkeypat
     monkeypatch.setattr(np, "kron", forbidden)
     np.testing.assert_allclose(operator.matvec(vector), dense @ vector)
     np.testing.assert_allclose(operator.rmatvec(vector), dense.T @ vector)
+
+def test_coupling_adds_error_for_isolated_source_with_quiet_neighbours(model):
+    reference = build_tensor_matrix_view(_tensor_state_snapshot(model))
+    channel = TensorKroneckerKoopman.from_reference(reference, model=model)
+    channel.previous_observables = np.zeros((len(channel.level_names), 4))
+    channel.previous_observables[channel.level_names.index("L0"), 0] = 1
+    report = channel.analyze(reference)
+    assert report["residual_without_level_coupling"] < report["one_step_residual"]

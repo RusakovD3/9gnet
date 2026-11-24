@@ -99,12 +99,15 @@ def build_algorithm_dialogue(dynamics: dict[str, Any]) -> dict[str, Any]:
                 "evidence": {
                     "selection_mode": game.get("selection_mode"),
                     "recommended_action": game.get("recommended_action"),
+                    "worst_case_load": selected.get("attacker_action"),
+                    "scenario_multipliers": game.get("scenario_multipliers"),
                     "defender_payoff": selected.get("defender_payoff"),
                     "attacker_payoff": selected.get("attacker_payoff"),
                 },
                 "message_ru": (
                     f"Рекомендация человеку: {ACTION_DISPLAY_NAMES.get(recommendation.get('action', 'OBSERVE'), 'неизвестное действие')}; "
-                    f"сравнение вариантов рекомендует: {ACTION_DISPLAY_NAMES.get(game.get('recommended_action', 'OBSERVE'), 'неизвестное действие')}."
+                    f"по худшему из трёх сценариев нагрузки рекомендуется "
+                    f"{ACTION_DISPLAY_NAMES.get(game.get('recommended_action', 'OBSERVE'), 'неизвестное действие')}."
                 ),
             },
             {

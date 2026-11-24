@@ -210,13 +210,7 @@ def evaluate_defense_game(
     matrix_koopman_pressure: float,
     sla_tiers: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Evaluate a small defender--attacker normal-form game for L7.
-
-    The result is a transparent finite game, not a claim that an adversary
-    actually follows the model.  A pure Nash equilibrium is reported only when
-    mutual best responses exist.  Otherwise the output names its conservative
-    maximin fallback rather than mislabelling it as Nash equilibrium.
-    """
+    """Сравнить минимальные выигрыши рекомендаций при трёх заданных нагрузках."""
     hierarchy = critical_node_hierarchy(model, limit=100)
     max_gold = max((row["gold_subscriber_count"] for row in hierarchy), default=0)
     target_rows = []
@@ -293,21 +287,19 @@ def evaluate_defense_game(
         for action, _, _ in defender_actions
     }
     wald_action = max(worst_case, key=worst_case.get)
-    if pure_equilibria:
-        selected = max(pure_equilibria, key=lambda cell: cell["defender_payoff"])
-        selection_mode = "pure_strategy_nash_equilibrium"
-    else:
-        selected = max(
-            (item for item in matrix if item["defender_action"] == wald_action),
-            key=lambda item: item["attacker_payoff"],
-        )
-        selection_mode = "maximin_fallback_no_pure_nash_equilibrium"
+    selected = min(
+        (item for item in matrix if item["defender_action"] == wald_action),
+        key=lambda item: item["defender_payoff"],
+    )
     return {
         "model": "finite_defender_attacker_normal_form_game",
         "semantics_ru": (
-            "Игровая оценка помогает арбитру сравнить цену защиты и ожидаемый ущерб; "
-            "она не моделирует волю реального нарушителя и не заменяет подтверждение телеметрией."
+            "Для каждой рекомендации сравниваются цена меры и худший ущерб при заданных "
+            "множителях нагрузки. Критерий Вальда выбирает наибольший из минимальных выигрышей. "
+            "Взвешенный показатель SLA использует веса классов 3/2/1. "
+            "Порядок проверки услуг человеком задаётся отдельно."
         ),
+        "scenario_multipliers": dict(attacker_actions),
         "target_rows": target_rows,
         "target_criticality": round(target_criticality, 6),
         "threat_pressure": round(effective_threat, 6),
@@ -317,7 +309,7 @@ def evaluate_defense_game(
         "pure_nash_equilibria": pure_equilibria,
         "wald_maximin": {"action": wald_action, "worst_payoff_by_action": worst_case},
         "equilibrium_found": bool(pure_equilibria),
-        "selection_mode": selection_mode,
+        "selection_mode": "wald_maximin_fixed_load_scenarios",
         "selected": selected,
         "recommended_action": selected["defender_action"],
     }
