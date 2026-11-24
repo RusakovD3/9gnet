@@ -28,7 +28,7 @@
 | Геленбе, Вейбулл и Купман | Очереди дают нагрузку, потери, число пакетов и задержку. Вейбулл задаёт интервалы симуляции, а Купман строит прогноз по текущим и прошлым наблюдениям. В исправном режиме и `mitre-demo` шаг по умолчанию 5 с, в `predictive-demo` — 2 с. |
 | ΔS, маски и MITRE ATT&CK | Для 10 техник используются взвешенные маски Адамара размером 11×8 (группы признаков × шаги наблюдения). Обязательные признаки проверяются на текущем шаге, затем взвешенная оценка сравнивает подходящие гипотезы. Возможные техники записываются в `mitre_technique_candidates`. |
 | Устойчивость и цепочка атаки | Диагностика включает локальное расстояние Хаусдорфа–Махаланобиса до `t0`, отдельное расстояние состояния для арбитра и изменение функции Ляпунова. Цепочка показывает наблюдаемые этапы и известные маршруты. Для произведения причинных матриц со схем нужны определения переходов между уровнями и данные для их оценки. |
-| d0sl, Нэш и Вальд | d0sl (файл правил качества услуг) задаёт требования к потокам. Игровая оценка учитывает нарушения SLA с весами Gold/Silver/Bronze 3/2/1, стоимость мер и прогноз. Отчёт показывает чистые равновесия Нэша и оценку Вальда (лучший результат в худшем случае). Вальд задаёт выбор при отсутствии чистого равновесия. |
+| d0sl и выбор рекомендации | d0sl задаёт требования к качеству потоков. Для каждой меры сравниваются три заданных множителя нагрузки (0,72, 0,88 и 1,00). По критерию Вальда выбирается мера с наибольшим выигрышем в худшем случае. Ущерб учитывает нарушения SLA с весами Gold/Silver/Bronze 3/2/1. Порядок проверки услуг человеком начинается с Gold. |
 | Тревоги, правила и действия | Панель показывает срочность, цепочку наблюдений, известный маршрут и рекомендации. Экспортируются Sigma и Suricata, а для безопасного образца T1204 — YARA. Интеграция с рабочими системами ИБ и применение мер относятся к внешнему контуру оператора. |
 
 Для перегрузок `attack_family` задаёт DoS или DDoS по наблюдаемым точкам
@@ -204,9 +204,10 @@ python main.py --debug-diagram
 
 ### Внешняя проверка порога
 
-Это отдельная проверка уже вычисленного `risk_score`, а не загрузчик сырых
-пакетов для обучения Купмана. Нужен свой обезличенный CSV с обязательными
-колонками `timestamp_seconds`, `risk_score`, `attack_onset`; дополнительно
+CSV позволяет оценить выбранный порог по готовому ряду `risk_score`.
+Происхождение ряда и качество численного прогноза услуг требуют отдельной
+проверки. Нужен свой обезличенный CSV с обязательными колонками
+`timestamp_seconds`, `risk_score`, `attack_onset`. Дополнительно
 поддерживаются `attack_id`, `attack_kind`. Время строго возрастает,
 риск — конечное число от 0 до 1, начало подтверждённой атаки — 0/1.
 Пустая метка `attack_onset` считается ошибкой входа: отсутствие разметки
@@ -234,7 +235,7 @@ python main.py --attack-scenario predictive-demo --calibration-report output/tel
 | `--telemetry-min-events-per-partition 5` | Минимум подтверждённых начал в каждой из двух частей ряда |
 | `--telemetry-min-precision 0.90` | Нижняя граница доли верных предупреждений, от 0 исключительно до 1 включительно |
 | `--telemetry-min-recall 0.90` | Нижняя граница доли обнаруженных начал атак, от 0 исключительно до 1 включительно |
-| `--telemetry-max-false-warnings-per-hour 0.10` | Верхняя граница ложных эпизодов за час, ≥ 0 |
+| `--telemetry-max-false-warnings-per-hour 0.10` | Верхняя граница числа ложных эпизодов за час наблюдения, ≥ 0 |
 
 По умолчанию последние 30% строк в хронологическом порядке не участвуют в подборе порога.
 Разделение выполняется по числу наблюдений; при неравномерном времени это
@@ -247,13 +248,24 @@ python main.py --attack-scenario predictive-demo --calibration-report output/tel
 10–20 секунд по умолчанию; параметр симуляции `--prediction-lead-seconds`
 не меняет его. Не снижайте требования только ради положительного отчёта.
 
+Отчёт версии 2 исключает из экспозиции (времени наблюдения) разрывы длиннее
+1,5 медианного интервала между отсчётами обучающей части. Один ложный эпизод
+за шесть наблюдаемых секунд даёт 600 эпизодов в час даже при десятичасовом
+разрыве записи. Отчёт показывает время под тревогой и его долю. Упреждение
+отсчитывается от первого подходящего отсчёта. Если к началу отложенной части
+уже действует тревога, учитывается длительность её продолжения. Для проверки
+совпадений используются новые эпизоды отложенной части. Если для
+неподтверждённого предупреждения не хватило времени до разрыва или конца
+участка, оно учитывается отдельно и препятствует допуску порога. Для применения
+порога из прежнего отчёта повторите проверку по исходному CSV.
+
 ## Результаты
 
 Они сохраняются в `output/`; следующий обычный запуск может их заменить.
 
 | Файл | Что читать |
 |---|---|
-| `run_summary.md`, `run_summary.json` | Начните здесь: принятые переходы обучения, предупреждения, худший SLA каждого класса, рекомендации человеку и границы оценки |
+| `run_summary.md`, `run_summary.json` | Принятые переходы обучения, худший SLA каждого класса и услуги, первый прогноз по потоку, критерий, ожидаемое время нарушения и рекомендации |
 | `baseline_summary.txt`, `network_logic.png`, `layer_scheme.png` | Состав сети, реальные связи и назначение девяти уровней |
 | `ip_address_map.png` | Адреса устройств и диапазоны абонентских подсетей; все отдельные адреса — в `ip_address_plan.json` |
 | `step_log.csv` | По одной строке на шаг: обучение, обычный трафик и атаки, фильтр, качество услуг и причина решения |
@@ -262,6 +274,7 @@ python main.py --attack-scenario predictive-demo --calibration-report output/tel
 | `charts/koopman_risk.png`, `charts/lyapunov_growth.png` | Оценка Купмана с порогами на шкале 0…1 и изменение Ляпунова на шкале −1…+1 |
 | `charts/native_traffic.png`, `charts/attack_traffic.png` | Обычные поступления Пуассона и пакетная интенсивность каждого эпизода |
 | `charts/sla_by_class.png`, `charts/attacked_node_sla.png` | Соблюдение SLA по классам и по атакованным узлам |
+| `charts/service_sla_forecast.png` | Измеренные значения, порог и время прогноза для подтверждённого предупреждения, ложной тревоги и пропуска. [Метод оценки по потокам](doc/full_project_explanation_ru.md#прогноз-нарушения-качества-отдельного-потока) |
 | `charts/event_timeline.png`, `charts/arbitrator_signals.png` | Время наблюдений, обучение, предупреждения и сигналы арбитра |
 | `charts/capacity_bottlenecks.png`, `charts/link_utilization.png`, `charts/resource_utilization.png` | Пики, нагрузка линий и нагрузка ресурсов во времени |
 | `charts/security_dashboard.png` | При пакетной модели: карта и панель тревог на шаге с наибольшей сохранённой срочностью; при равенстве — воздействие, затем ранний шаг |
@@ -424,3 +437,64 @@ python tools/check.py smoke
 В проекте три основных документа: этот файл для запуска,
 [устройство и расчёты](doc/full_project_explanation_ru.md) для понимания модели
 и [AGENTS.md](AGENTS.md) для правил доработки и проверки.
+
+## Контроль прогнозов на 2, 10 и 20 секунд
+
+Команды ниже выполняются из корня в окружении проекта. Сравниваются одни и те же
+измерения, первый отсчёт имеет время 0 с. Последние 1, 5 или 10 отсчётов без
+будущего факта исключаются из ошибки соответствующего горизонта. Стенд сохраняет
+по каждому прогону параметры, ошибки в исходных единицах, спектр входов, источники
+численного прогноза и результаты сопоставления предупреждений с событиями.
+
+```powershell
+New-Item -ItemType Directory -Force output/defense | Out-Null
+git archive --format=zip -o output/defense/source-20c1298.zip 20c1298 main.py src policies
+Expand-Archive output/defense/source-20c1298.zip output/defense/baseline -Force
+python tools/forecast_experiment.py --seed 11 --fit-alarm-budget --output output/defense/affine-validation-11.json
+foreach ($s in 42,7,1729) {
+    python tools/forecast_experiment.py --legacy --source output/defense/baseline --seed $s --output "output/defense/before-$s.json"
+    python tools/forecast_experiment.py --seed $s --calibration output/defense/affine-validation-11.json --output "output/defense/after-$s.json"
+}
+python tools/forecast_experiment.py --seed 42 --disable-operator --output output/defense/no-operator-42.json
+python tools/forecast_experiment.py --seed 42 --disable-injection --output output/defense/no-injection-42.json
+python tools/forecast_experiment.py --scenario mitre-demo --seed 42 --calibration output/defense/affine-validation-11.json --output output/defense/transfer-42.json
+python tools/forecast_experiment.py --legacy --source output/defense/baseline --scenario mitre-demo --seed 42 --output output/defense/before-mitre.json
+python tools/forecast_experiment.py --vary-demand --seed 42 --output output/defense/transfer-demand.json
+python tools/forecast_experiment.py --legacy --source output/defense/baseline --vary-demand --seed 42 --output output/defense/before-demand.json
+python tools/service_forecast_controls.py --output output/defense/controls.json
+```
+
+Последняя команда также создаёт `controls.png` с предупреждённым нарушением,
+ложной тревогой и пропуском. Для обычного запуска эти примеры, если они
+встретились, показаны в `output/charts/service_sla_forecast.png`.
+Время события, нарушения требования и выдачи прогноза может различаться.
+
+### Воспроизведение проверки по потокам
+
+В `service_sla_forecast.warnings` хранится каждое прогнозируемое пересечение
+порога, его источник и ожидаемое время. При шаге 2 с `operator_warnings`
+показывает предупреждения о задержке медиапотока по правилу, выбранному
+на калибровочном прогоне. Отдельное поле `route_stress_warnings` показывает,
+где ещё одна потеря при текущем спросе нарушила бы SLA. В отчёте результаты
+сопоставляются с началом нарушения того же критерия у того же абонента.
+[Разбор пропусков и сравнение с трендом](doc/full_project_explanation_ru.md#почему-прежний-прогноз-пропустил-2928-нарушений).
+
+```powershell
+$dir = 'output/flow-review'
+foreach ($s in 42,7,1729) { python tools/flow_precursor_audit.py --seed $s }
+python tools/flow_precursor_audit.py --stage summarize
+python tools/flow_replay.py record "$dir/calibration-11.jsonl.gz" --seed 11
+python tools/flow_replay.py record "$dir/holdout-83.jsonl.gz" --scenario mitre-demo --seed 83 --vary-demand
+python tools/flow_model_comparison.py "$dir/calibration-11.jsonl.gz" --per-criterion --output "$dir/selection-per-criterion.json"
+python tools/flow_model_comparison.py "$dir/holdout-83.jsonl.gz" --per-criterion --calibration "$dir/selection-per-criterion.json" --output "$dir/holdout-83-per-criterion.json"
+foreach ($s in 42,7,1729) {
+    python tools/flow_replay.py record "$dir/predictive-$s.jsonl.gz" --seed $s
+    python tools/flow_model_comparison.py "$dir/predictive-$s.jsonl.gz" --per-criterion --calibration "$dir/selection-per-criterion.json" --output "$dir/predictive-$s-per-criterion.json"
+}
+python tools/flow_observability.py
+python tools/flow_observability.py --holdout
+```
+
+Для общего отбора по семейству показателей выполните те же два расчёта
+калибровки и переноса без `--per-criterion`, указав отдельные выходные файлы.
+В обоих вариантах также приводится результат единого повторного подтверждения.
