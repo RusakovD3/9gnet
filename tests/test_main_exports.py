@@ -2,6 +2,7 @@ import csv
 import json
 from pathlib import Path
 import re
+import sys
 
 import pytest
 
@@ -11,6 +12,30 @@ from src.gnet9.constants import SUBSCRIBER_COUNT
 from src.gnet9.detection_rules import export_detection_rules
 from src.gnet9.dynamics import DynamicsConfig
 from src.gnet9.topology_builder import GNetBaselineBuilder
+
+
+def test_reports_only_writes_linked_results_in_separate_directory(tmp_path, monkeypatch):
+    import main
+
+    root = Path(main.__file__).parent
+    policy = tmp_path / "policies" / "l1_policies.d0sl"
+    policy.parent.mkdir()
+    policy.write_bytes((root / "policies" / policy.name).read_bytes())
+    monkeypatch.setattr(main, "__file__", str(tmp_path / "main.py"))
+    monkeypatch.setattr(sys, "argv", ["main.py", "--reports-only", "--dynamics-steps", "1"])
+    main.main()
+
+    directory = tmp_path / "output" / "reports"
+    assert set(directory.parent.iterdir()) == {directory}
+    assert not list(directory.rglob("*.png"))
+    assert not (directory / "baseline_topology.json").exists()
+    report = json.loads((directory / "run_summary.json").read_bytes())
+    assert report == json.loads((directory / "network_dynamics.json").read_bytes())["result_summary"]
+    assert report["observation"]["snapshot_count"] == 2
+    assert report["files"]["detection_rules"] == "detection_rules/manifest.json"
+    links = re.findall(r"\]\(([^)]+)\)", (directory / "run_summary.md").read_text(encoding="utf-8"))
+    for name in [*report["files"].values(), *links]:
+        assert (directory / name).is_file(), name
 
 
 def test_dynamics_json_replaces_only_a_complete_export(tmp_path: Path) -> None:

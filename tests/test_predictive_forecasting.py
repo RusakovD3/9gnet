@@ -793,6 +793,22 @@ def test_sparse_state_hausdorff_is_zero_at_t0_and_grows_with_drift() -> None:
     assert drift["witnesses"]["t0_to_current_tensor_id"] == "node:M1_01:state"
 
 
+@pytest.mark.parametrize("measurements, forward, reverse, witness", [
+    ([("B", 25), ("A", 0)], 10, 25, "B"),
+    ([("C", 25), ("A", 2)], 12, 35, "C"),
+    ([("C", 3)], 13, 13, "C"),
+])
+def test_state_distance_for_large_drift_and_changed_labels(measurements, forward, reverse, witness):
+    def state(rows):
+        return {"by_level": {"L1": [{"node_id": node, "metrics": {"x": x}} for node, x in rows]}}
+
+    view = state_tensor_hausdorff_view(state([("A", 0), ("B", 0)]), state(measurements), time_index=1)
+    assert view["directed_t0_to_current"] == forward
+    assert view["directed_current_to_t0"] == reverse
+    assert view["coordinate_hausdorff_distance"] == max(forward, reverse)
+    assert view["witnesses"]["current_to_t0_tensor_id"] == f"node:{witness}:tensor"
+
+
 def test_exported_weibull_hazard_and_survival_match_declared_formulas() -> None:
     schedule = predictive_demo_weibull_schedule(
         seed=42,

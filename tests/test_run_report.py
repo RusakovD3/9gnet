@@ -85,7 +85,7 @@ def test_nonfinite_json_is_rejected_without_overwriting_previous_result(tmp_path
     import main
     target = tmp_path / "network_dynamics.json"
     target.write_text("previous result", encoding="utf-8")
-    monkeypatch.setattr(main, "simulate_stationary_dynamics", lambda *args: {
+    monkeypatch.setattr(main, "simulate_stationary_dynamics", lambda *args, **kwargs: {
         "config": {"packet_detail": "summary"}, "snapshots": [], "invalid_value": float("nan")})
     with pytest.raises(ValueError):
         export_stationary_dynamics(None, target)

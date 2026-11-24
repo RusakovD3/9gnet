@@ -8,8 +8,7 @@ import platform
 from importlib import metadata
 from pathlib import Path
 
-from .constants import ATTACK_KIND_DISPLAY_NAMES
-from .dynamics_charts import DYNAMICS_CHART_FILES
+from .constants import ATTACK_KIND_DISPLAY_NAMES, DYNAMICS_CHART_FILES
 from .flow_details import TRAFFIC_LABELS
 
 
@@ -60,7 +59,7 @@ def _prediction_summary(evaluation):
     return result
 
 
-def build_run_summary(dynamics):
+def build_run_summary(dynamics, *, include_charts=True):
     """Сохранять отсутствие наблюдений как null, а не как успех или нулевую нагрузку."""
     snapshots = dynamics.get("snapshots", [])
     evaluation = dynamics.get("koopman_evaluation", {})
@@ -130,7 +129,8 @@ def build_run_summary(dynamics):
         ],
         "files": {"step_log": "step_log.csv", "complete_result": "network_dynamics.json",
                   "decisions": "algorithm_dialogue.md",
-                  **{key: f"charts/{name}" for key, name in DYNAMICS_CHART_FILES.items()}},
+                  "detection_rules": "detection_rules/manifest.json",
+                  **({key: f"charts/{name}" for key, name in DYNAMICS_CHART_FILES.items()} if include_charts else {})},
     }
 
 
@@ -206,7 +206,8 @@ def _service_forecast_text(summary):
         lines.append(f"| {label} | {TRAFFIC_LABELS.get(case['service'], case['service'])}, "
                      f"`{case['flow_id']}` | {case['label_ru']} | "
                      + " / ".join("—" if t is None else str(t) for t in times) + " |")
-    lines += ["", "[График измерений, порогов и прогнозов по этим случаям](charts/service_sla_forecast.png)."]
+    if "service_forecast" in summary["files"]:
+        lines += ["", "[График измерений, порогов и прогнозов по этим случаям](charts/service_sla_forecast.png)."]
     issued = forecast.get("operator_alert_evaluation", {})
     if issued:
         lines += ["", "Для рабочего предупреждения о задержке медиапотока правило, выбранное на "
@@ -232,7 +233,10 @@ def _service_forecast_text(summary):
 
 
 def export_run_summary(dynamics, directory: Path):
-    summary = build_run_summary(dynamics)
+    return write_run_summary(build_run_summary(dynamics), directory)
+
+
+def write_run_summary(summary, directory: Path):
     directory.mkdir(parents=True, exist_ok=True)
     json_path, text_path = directory / "run_summary.json", directory / "run_summary.md"
     json_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
@@ -289,12 +293,14 @@ def export_run_summary(dynamics, directory: Path):
     lines += ["", "## Как читать результат", ""]
     lines += [f"- {text}" for text in summary["interpretation_ru"]]
     lines += ["", "Подробности в [журнале шагов](step_log.csv), [расчётах JSON](network_dynamics.json) "
-              "и [пояснениях решений](algorithm_dialogue.md).", "",
-              "[Купман](charts/koopman_risk.png) · [Ляпунов](charts/lyapunov_growth.png) · "
-              "[Хронология](charts/event_timeline.png) · [Арбитр](charts/arbitrator_signals.png)", "",
-              "[Обычный трафик](charts/native_traffic.png) · [Трафик атак](charts/attack_traffic.png) · "
-              "[SLA сети](charts/sla_by_class.png) · [SLA атакованных узлов](charts/attacked_node_sla.png)", "",
-              "[Пики линий](charts/capacity_bottlenecks.png) · [Нагрузка линий](charts/link_utilization.png) · "
-              "[Ресурсы](charts/resource_utilization.png).", ""]
+              "и [пояснениях решений](algorithm_dialogue.md).",
+              "Состав правил наблюдения приведён в [перечне Sigma, Suricata и YARA](detection_rules/manifest.json).", ""]
+    if "koopman" in summary["files"]:
+        lines += ["[Купман](charts/koopman_risk.png) · [Ляпунов](charts/lyapunov_growth.png) · "
+                  "[Хронология](charts/event_timeline.png) · [Арбитр](charts/arbitrator_signals.png)", "",
+                  "[Обычный трафик](charts/native_traffic.png) · [Трафик атак](charts/attack_traffic.png) · "
+                  "[SLA сети](charts/sla_by_class.png) · [SLA атакованных узлов](charts/attacked_node_sla.png)", "",
+                  "[Пики линий](charts/capacity_bottlenecks.png) · [Нагрузка линий](charts/link_utilization.png) · "
+                  "[Ресурсы](charts/resource_utilization.png).", ""]
     text_path.write_text("\n".join(lines), encoding="utf-8")
     return summary

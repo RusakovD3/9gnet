@@ -45,6 +45,7 @@ from .hypernetwork import hypernetwork_embedding
 from .l1_d0sl import SLA_GRADE_WEIGHTS, weighted_sla_compliance
 from .packet_simulator import TRAFFIC_APPS, simulate_packet_snapshot
 from .routing import FixedTopologyRoutes
+from .runtime_metrics import compact_runtime_state
 from .service_forecast import ServiceSLAForecaster, _score_window, evaluate_service_forecasts, operator_warnings
 from .route_stress import RouteStressMonitor, evaluate_route_stress
 from .tensor_matrix import (
@@ -93,7 +94,9 @@ class DynamicsConfig:
         return data
 
 
-def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | None = None) -> dict[str, Any]:
+def simulate_stationary_dynamics(
+    model: NetworkModel, config: DynamicsConfig | None = None, *, compact_traffic_history: bool = False,
+) -> dict[str, Any]:
     """Return baseline or attacked snapshots using the compatibility API name."""
     config = config or DynamicsConfig()
     _validate_config(config)
@@ -241,6 +244,11 @@ def simulate_stationary_dynamics(model: NetworkModel, config: DynamicsConfig | N
             "operator_updated": koopman_view["update_applied_for_next_step"],
         }
         if step_index or config.include_t0:
+            if compact_traffic_history and traffic:
+                # После прогноза и проверки t0 отчёту достаточно агрегатов и векторов.
+                traffic.pop("flows", None)
+                traffic.pop("packet_sample", None)
+                traffic["network_state"] = compact_runtime_state(traffic["network_state"])
             snapshots.append(snapshot)
 
     service_views = [s["service_sla_forecast"] for s in snapshots]

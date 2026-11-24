@@ -9,8 +9,17 @@
 
 ## Как читать проект
 
-Начните с команд ниже и `output/run_summary.md` после запуска. Затем прочитайте
-[путь данных и план разбора для защиты](doc/full_project_explanation_ru.md#как-разобраться-в-проекте)
+Для первого запуска выполните [установку](#установка-и-первый-запуск).
+В готовом окружении выберите команду по нужному результату.
+
+| Что посмотреть | Команда | Что открыть |
+|---|---|---|
+| Исправная сеть, обучение и качество услуг | `python main.py --reports-only` | `output/reports/run_summary.md` |
+| Прогноз угроз и рекомендации оператору | `python main.py --reports-only --attack-scenario predictive-demo` | `output/reports/run_summary.md` |
+| Правила по наблюдениям демонстрационного сценария | `python main.py --reports-only --attack-scenario mitre-demo` | `output/reports/detection_rules/manifest.json` |
+| Полный комплект с картами и справочниками | `python main.py` | `output/run_summary.md` |
+
+Для разбора математики см. [путь данных и план разбора для защиты](doc/full_project_explanation_ru.md#как-разобраться-в-проекте)
 и [карту исходных файлов](doc/full_project_explanation_ru.md#структура-проекта-и-карта-файлов).
 Математические разделы того же документа объясняют формулы и допущения.
 [AGENTS.md](AGENTS.md) задаёт правила изменения и проверки кода.
@@ -189,6 +198,7 @@ python main.py --debug-diagram
 | `--packet-detail summary` | `summary` — итоги, `flows` — также отдельные потоки, `sample` — также показательные пакетные записи |
 | `--packet-sample-limit 48` | Целое ≥ 0; предел числа показательных записей на снимок при сохранении примеров |
 | `--no-packet-simulation` | Отключить пакетную модель; несовместимо с атаками и `--show-window` |
+| `--reports-only` | Записать расчёты, журнал, пояснения и правила в `output/reports/`. Карты и справочники создаёт полный запуск. |
 | `--show-window` | После экспорта открыть карту с выбором шага; нужна графическая среда |
 | `--debug-diagram` | Записать схему вызовов и журнал в `output/debug/` |
 | `--show-debug` | Записать диагностику и открыть её окно; отдельно указывать `--debug-diagram` не нужно |
@@ -261,7 +271,9 @@ python main.py --attack-scenario predictive-demo --calibration-report output/tel
 
 ## Результаты
 
-Они сохраняются в `output/`; следующий обычный запуск может их заменить.
+Полный запуск пишет в `output/`, режим `--reports-only` — в `output/reports/`.
+Повторный запуск в том же режиме обновляет предыдущий результат.
+Список ссылок в кратком отчёте соответствует выбранному режиму.
 
 | Файл | Что читать |
 |---|---|
@@ -360,59 +372,16 @@ output/                         созданные результаты, не в
 Подробная таблица «файл → задача → что смотреть» находится в основном
 [описании структуры](doc/full_project_explanation_ru.md#структура-проекта-и-карта-файлов).
 
-## Подготовка изменений в Git
-
-`git add` подготавливает изменения; `git commit`
-создаёт локальную запись; `git push` отправляет её на сервер.
-
-```powershell
-Set-Location D:\programming\9gnet
-.venv/Scripts/python.exe tools/check.py full
-if ($LASTEXITCODE -ne 0) { throw 'Полные проверки завершились ошибкой' }
-.venv/Scripts/python.exe tools/check.py smoke
-if ($LASTEXITCODE -ne 0) { throw 'Пробный запуск завершился ошибкой' }
-git diff --check
-if ($LASTEXITCODE -ne 0) { throw 'Найдены ошибки оформления изменений' }
-git status --short
-git diff --stat
-git add -- .gitignore .github/workflows/ci.yml pyproject.toml requirements.txt README.md AGENTS.md doc/full_project_explanation_ru.md main.py policies src/gnet9 tests tools
-git diff --cached --check
-if ($LASTEXITCODE -ne 0) { throw 'Проверьте подготовленные изменения' }
-git diff --cached --stat
-git diff --cached
-git commit -m "Проверить расчёты GNet9, исправить калибровку и экспорт, обновить документацию"
-if ($LASTEXITCODE -ne 0) { throw 'Коммит не создан' }
-```
-
-Перед отправкой проверьте текущую ветку и адрес получателя:
-
-```powershell
-git branch --show-current
-git remote -v
-# Для текущей ветки main и настроенного origin:
-git push origin main
-git status -sb
-```
-
-`git diff` показывает ещё не подготовленные изменения, `git diff --cached` —
-подготовленные к коммиту. После `git add` последующая правка файла сама
-не попадает в подготовленную версию: добавьте этот файл повторно.
-После коммита `git status --short` может показывать оставшиеся локальные
-материалы: они не должны автоматически попадать в следующий коммит.
-Если отправка отклонена из-за новых удалённых коммитов, сначала выполните
-`git fetch origin`, затем `git log --oneline --left-right HEAD...origin/main`.
-Перед повторной отправкой согласуйте обе истории; принудительная отправка
-для обычного обновления не нужна.
-
 ## Проверки и дальнейшая разработка
 
 ```powershell
 python tools/check.py full
 python tools/check.py smoke
+git diff --check
 ```
 
 Первая команда выполняет все тесты. Вторая запускает модель в отдельной
-копии и проверяет созданные файлы. Журналы лежат в `output/verification/`.
+копии и проверяет созданные файлы. Третья проверяет оформление изменений. Журналы лежат в `output/verification/`.
 Для быстрой проверки есть `quick`, для проверки библиотек — `doctor`.
 
 Для содержательной проверки эксперимента сначала выполните исправный прогон

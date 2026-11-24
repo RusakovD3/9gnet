@@ -12,7 +12,6 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, TextIO
 
-from src.gnet9.address_visualizer import draw_ip_address_map, export_ip_address_plan
 from src.gnet9.attack_signatures import signature_catalog
 from src.gnet9.attacks import (
     MITRE_DEMO_STEP_COUNT,
@@ -24,23 +23,14 @@ from src.gnet9.attacks import (
     mitre_tensor_mapping_catalog,
     predictive_demo_minimum_steps,
 )
-from src.gnet9.debug_visualizer import DebugFlowWindow, RuntimeCallTracer, export_debug_artifacts
 from src.gnet9.decision_dialogue import export_algorithm_dialogue
 from src.gnet9.detection_rules import export_detection_rules
 from src.gnet9.constants import ATTACK_KIND_DISPLAY_NAMES, RESPONSE_STAGE_DISPLAY_NAMES
 from src.gnet9.dynamics import DynamicsConfig, simulate_stationary_dynamics
-from src.gnet9.dynamics_charts import export_dynamics_charts
-from src.gnet9.flow_visualizer import (
-    create_service_flow_window,
-    draw_service_flow_map,
-    draw_security_dashboard,
-    ensure_interactive_backend,
-    show_visualization_windows,
-)
 from src.gnet9.service_catalog import CODEC_CATALOG
 from src.gnet9.runtime_metrics import compact_runtime_state
 from src.gnet9.kalman import DEFAULT_PROCESS_VARIANCE, DEFAULT_MEASUREMENT_VARIANCE
-from src.gnet9.run_report import build_run_summary, export_run_summary
+from src.gnet9.run_report import build_run_summary, write_run_summary
 from src.gnet9.standards_audit import build_standards_and_equipment_audit
 from src.gnet9.telemetry_validation import (
     TelemetryValidationConfig,
@@ -51,7 +41,6 @@ from src.gnet9.telemetry_validation import (
     write_validation_report,
 )
 from src.gnet9.topology_builder import GNetBaselineBuilder
-from src.gnet9.visualizer import GNetVisualizer
 
 
 L1_MONITORING_FIELDS = [
@@ -272,7 +261,9 @@ def export_parsed_d0sl_catalog(model, path: Path) -> None:
     path.write_text(json.dumps(list(unique_policies.values()), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _dynamics_export_view(dynamics: dict[str, Any], packet_detail: str) -> dict[str, Any]:
+def _dynamics_export_view(
+    dynamics: dict[str, Any], packet_detail: str, *, include_charts: bool = True,
+) -> dict[str, Any]:
     """Build a shallow, non-mutating view with the requested packet detail.
 
     The visualizers need flow records in memory, but writing all detailed
@@ -316,7 +307,7 @@ def _dynamics_export_view(dynamics: dict[str, Any], packet_detail: str) -> dict[
         exported_snapshots.append(snapshot)
     exported["snapshots"] = exported_snapshots
     return {"export_metadata": exported.pop("export_metadata"),
-            "result_summary": build_run_summary(dynamics), **exported}
+            "result_summary": build_run_summary(dynamics, include_charts=include_charts), **exported}
 
 
 def _write_dynamics_json(path: Path, payload: dict[str, Any]) -> None:
@@ -346,14 +337,17 @@ def export_stationary_dynamics(
     config: DynamicsConfig | None = None,
     *,
     packet_detail: str | None = None,
+    include_charts: bool = True,
 ) -> dict[str, Any]:
     """Simulate once, export the selected detail and retain runtime flows."""
-    dynamics = simulate_stationary_dynamics(model, config)
+    dynamics = simulate_stationary_dynamics(
+        model, config, compact_traffic_history=not include_charts and packet_detail == "summary",
+    )
     export_detail = packet_detail or str(dynamics.get("config", {}).get("packet_detail", "sample"))
-    export_view = _dynamics_export_view(dynamics, export_detail)
+    export_view = _dynamics_export_view(dynamics, export_detail, include_charts=include_charts)
     _write_dynamics_json(path, export_view)
     export_step_log(dynamics, path.with_name("step_log.csv"))
-    export_run_summary(dynamics, path.parent)
+    write_run_summary(export_view["result_summary"], path.parent)
     export_detection_rules(model, dynamics["snapshots"], path.parent / "detection_rules")
     return dynamics
 
@@ -632,7 +626,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "с прогнозом по наблюдениям и рекомендациями человеку по защите услуг."
         ),
     )
+    parser.add_argument("--reports-only", action="store_true",
+                        help="Сохранить расчёты, рекомендации и правила в output/reports без карт и каталогов.")
     args = parser.parse_args(argv)
+    if args.reports_only and (args.validate_telemetry_csv or args.show_window or args.show_debug or args.debug_diagram):
+        parser.error("--reports-only предназначен для расчёта модели без графики и внешней проверки CSV")
     if args.attack_scenario == "predictive-demo" and args.attack_start_step is None:
         # Для обычной демонстрации оставляем 59 чистых переходов при такте 2 с.
         # Короткие явно заданные серии сохраняют исходное расписание.
@@ -663,10 +661,72 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _export_baseline(model, output_dir: Path, d0sl_policy_path: Path, dynamics_config: DynamicsConfig) -> None:
+    from src.gnet9.address_visualizer import draw_ip_address_map, export_ip_address_plan
+    from src.gnet9.visualizer import GNetVisualizer
+
+    # Артефакты ранних ручных прототипов больше не входят в контракт output/.
+    # Удаляем только известные имена, не затрагивая пользовательские файлы.
+    for legacy_preview in (
+        "service_flows_remapped.png",
+        "interactive_flow_preview.png",
+        "koopman_warning_window_test.png",
+    ):
+        (output_dir / legacy_preview).unlink(missing_ok=True)
+    visualizer = GNetVisualizer(model)
+    visualizer.draw_network_logic(output_dir / "network_logic.png")
+    visualizer.draw_layer_scheme(output_dir / "layer_scheme.png")
+    draw_ip_address_map(model, output_dir / "ip_address_map.png")
+
+    model.export_json(output_dir / "baseline_topology.json")
+    model.export_graphml(output_dir / "baseline_topology.graphml")
+    model.export_summary(output_dir / "baseline_summary.txt")
+    export_l1_profiles(model, output_dir / "l1_d0sl_profiles.json")
+    export_l1_monitoring(model, output_dir / "l1_monitoring.csv")
+    export_l2_equipment_profiles(model, output_dir / "l2_equipment_profiles.json")
+    export_l0_server_service_catalog(model, output_dir / "l0_server_service_catalog.json")
+    (output_dir / "standards_and_equipment_audit.json").write_text(
+        json.dumps(build_standards_and_equipment_audit(model), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    export_ip_address_plan(model, output_dir / "ip_address_plan.json")
+    export_attack_catalog(
+        model,
+        output_dir / "mitre_attack_catalog.json",
+        dynamics_config,
+    )
+    export_parsed_d0sl_catalog(model, output_dir / "l1_d0sl_parsed.json")
+    shutil.copyfile(d0sl_policy_path, output_dir / "l1_policies.d0sl")
+
+
+def _export_charts(model, dynamics, flow_snapshots, output_dir: Path) -> dict[str, Path]:
+    from src.gnet9.dynamics_charts import export_dynamics_charts
+    from src.gnet9.flow_visualizer import draw_security_dashboard, draw_service_flow_map
+
+    if flow_snapshots:
+        draw_service_flow_map(model, flow_snapshots[0]["traffic"]["flows"], output_dir / "service_flows.png")
+    else:
+        draw_service_flow_map(
+            model,
+            [],
+            output_dir / "service_flows.png",
+            title_suffix="пакетная модель отключена: показана только топология",
+        )
+    draw_security_dashboard(model, flow_snapshots, output_dir / "charts" / "security_dashboard.png")
+    return export_dynamics_charts(
+        dynamics,
+        output_dir / "charts",
+        model=model,
+        flow_snapshots=flow_snapshots,
+    )
+
+
 def main() -> None:
     args = parse_args()
     project_root = Path(__file__).resolve().parent
     output_dir = project_root / "output"
+    if args.reports_only:
+        output_dir = output_dir / "reports"
     output_dir.mkdir(parents=True, exist_ok=True)
     if args.validate_telemetry_csv:
         telemetry_config = TelemetryValidationConfig(
@@ -706,22 +766,15 @@ def main() -> None:
             calibration_profile = load_pilot_calibration(args.calibration_report)
         except TelemetryValidationError as error:
             raise SystemExit(f"Ошибка применения отчёта калибровки: {error}") from error
-    # Артефакты ранних ручных прототипов больше не входят в контракт output/.
-    # Удаляем только известные имена, не затрагивая пользовательские файлы.
-    for legacy_preview in (
-        "service_flows_remapped.png",
-        "interactive_flow_preview.png",
-        "koopman_warning_window_test.png",
-    ):
-        (output_dir / legacy_preview).unlink(missing_ok=True)
     debug_enabled = args.debug_diagram or args.show_debug
-    runtime_tracer = RuntimeCallTracer(project_root)
     if debug_enabled:
+        from src.gnet9.debug_visualizer import DebugFlowWindow, RuntimeCallTracer, export_debug_artifacts
+
+        runtime_tracer = RuntimeCallTracer(project_root)
         runtime_tracer.start()
 
     d0sl_policy_path = project_root / "policies" / "l1_policies.d0sl"
     model = GNetBaselineBuilder(d0sl_policy_path=d0sl_policy_path).build()
-    predictive_demo = args.attack_scenario == "predictive-demo"
     step_count, step_seconds = _simulation_timing(args)
     export_packet_detail = args.packet_detail
     runtime_packet_detail = (
@@ -753,86 +806,28 @@ def main() -> None:
             else "model_default_not_externally_validated"
         ),
     )
-    artifacts = {
-        "json": output_dir / "baseline_topology.json",
-        "graphml": output_dir / "baseline_topology.graphml",
-        "summary": output_dir / "baseline_summary.txt",
-        "l1_profiles": output_dir / "l1_d0sl_profiles.json",
-        "l1_monitoring": output_dir / "l1_monitoring.csv",
-        "l2_profiles": output_dir / "l2_equipment_profiles.json",
-        "l0_servers": output_dir / "l0_server_service_catalog.json",
-        "ip_plan": output_dir / "ip_address_plan.json",
-        "attacks": output_dir / "mitre_attack_catalog.json",
-        "d0sl_parsed": output_dir / "l1_d0sl_parsed.json",
-        "d0sl_source": output_dir / "l1_policies.d0sl",
-        "dynamics": output_dir / "network_dynamics.json",
-        "algorithm_dialogue_json": output_dir / "algorithm_dialogue.json",
-        "algorithm_dialogue_md": output_dir / "algorithm_dialogue.md",
-        "standards_audit": output_dir / "standards_and_equipment_audit.json",
-        "charts_dir": output_dir / "charts",
-        "network_png": output_dir / "network_logic.png",
-        "layers_png": output_dir / "layer_scheme.png",
-        "flows_png": output_dir / "service_flows.png",
-        "ip_map_png": output_dir / "ip_address_map.png",
-        "debug_dir": output_dir / "debug",
-    }
-
-    visualizer = GNetVisualizer(model)
-    visualizer.draw_network_logic(artifacts["network_png"])
-    visualizer.draw_layer_scheme(artifacts["layers_png"])
-    draw_ip_address_map(model, artifacts["ip_map_png"])
-
-    model.export_json(artifacts["json"])
-    model.export_graphml(artifacts["graphml"])
-    model.export_summary(artifacts["summary"])
-    export_l1_profiles(model, artifacts["l1_profiles"])
-    export_l1_monitoring(model, artifacts["l1_monitoring"])
-    export_l2_equipment_profiles(model, artifacts["l2_profiles"])
-    export_l0_server_service_catalog(model, artifacts["l0_servers"])
-    artifacts["standards_audit"].write_text(
-        json.dumps(build_standards_and_equipment_audit(model), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    export_ip_address_plan(model, artifacts["ip_plan"])
-    export_attack_catalog(
-        model,
-        artifacts["attacks"],
-        dynamics_config,
-    )
-    export_parsed_d0sl_catalog(model, artifacts["d0sl_parsed"])
+    if not args.reports_only:
+        _export_baseline(model, output_dir, d0sl_policy_path, dynamics_config)
     dynamics = export_stationary_dynamics(
         model,
-        artifacts["dynamics"],
+        output_dir / "network_dynamics.json",
         dynamics_config,
         packet_detail=export_packet_detail,
+        include_charts=not args.reports_only,
     )
     export_algorithm_dialogue(
         dynamics,
-        artifacts["algorithm_dialogue_json"],
-        artifacts["algorithm_dialogue_md"],
+        output_dir / "algorithm_dialogue.json",
+        output_dir / "algorithm_dialogue.md",
     )
     flow_snapshots = dynamics["snapshots"] if dynamics_config.include_packet_simulation else []
-    if flow_snapshots:
-        draw_service_flow_map(model, flow_snapshots[0]["traffic"]["flows"], artifacts["flows_png"])
-    else:
-        draw_service_flow_map(
-            model,
-            [],
-            artifacts["flows_png"],
-            title_suffix="пакетная модель отключена: показана только топология",
-        )
-    draw_security_dashboard(model, flow_snapshots, artifacts["charts_dir"] / "security_dashboard.png")
-    chart_paths = export_dynamics_charts(
-        dynamics,
-        artifacts["charts_dir"],
-        model=model,
-        flow_snapshots=flow_snapshots,
-    )
-    shutil.copyfile(d0sl_policy_path, artifacts["d0sl_source"])
+    chart_paths = {}
+    if not args.reports_only:
+        chart_paths = _export_charts(model, dynamics, flow_snapshots, output_dir)
     debug_paths: dict[str, Path] = {}
     if debug_enabled:
         runtime_tracer.stop()
-        debug_paths = export_debug_artifacts(runtime_tracer, artifacts["debug_dir"])
+        debug_paths = export_debug_artifacts(runtime_tracer, output_dir / "debug")
 
     print("Готово.")
     print(f"Результаты сохранены в: {output_dir}")
@@ -874,13 +869,15 @@ def main() -> None:
             f"{koopman_evaluation.get('attack_onset_count', 0)}; "
             f"статус={koopman_evaluation.get('prediction_slo_status_ru', '—')}."
         )
-    print("Графики динамики:")
-    for path in chart_paths.values():
-        print(f"  - {path}")
-    print(f"Карта сервисных потоков: {artifacts['flows_png']}")
-    print(f"Карта IP-адресации: {artifacts['ip_map_png']}")
-    print(f"Пояснения к решениям: {artifacts['algorithm_dialogue_md']}")
-    print(f"Аудит RFC и характеристик: {artifacts['standards_audit']}")
+    print(f"Пояснения к решениям: {output_dir / 'algorithm_dialogue.md'}")
+    print(f"Правила наблюдения: {output_dir / 'detection_rules' / 'manifest.json'}")
+    if chart_paths:
+        print("Графики динамики:")
+        for path in chart_paths.values():
+            print(f"  - {path}")
+        print(f"Карта сервисных потоков: {output_dir / 'service_flows.png'}")
+        print(f"Карта IP-адресации: {output_dir / 'ip_address_map.png'}")
+        print(f"Аудит RFC и характеристик: {output_dir / 'standards_and_equipment_audit.json'}")
     if debug_paths:
         print("Графическая диагностика:")
         for path in debug_paths.values():
@@ -888,6 +885,8 @@ def main() -> None:
 
     windows = []
     if args.show_window or args.show_debug:
+        from src.gnet9.flow_visualizer import create_service_flow_window, ensure_interactive_backend, show_visualization_windows
+
         # Backend выбирается до создания первой GUI-фигуры. Это важно и для
         # одиночного --show-debug: FigureCanvasAgg не умеет показывать окно.
         ensure_interactive_backend()

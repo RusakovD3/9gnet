@@ -12,6 +12,7 @@ from matplotlib.patches import Rectangle
 from matplotlib.ticker import MaxNLocator
 import numpy as np
 from .arbitrator import TRIGGER_BANDS
+from .constants import DYNAMICS_CHART_FILES
 from .flow_details import TRAFFIC_LABELS
 from .plot_style import (PANEL, TEXT, MUTED, BLUE, GREEN,
                          AMBER, RED, PURPLE, save_figure, style_axis)
@@ -23,20 +24,6 @@ NestedSeriesSpec = tuple[str, tuple[str, ...], float]
 
 ATTACK_KIND_COLORS = ATTACK_COLORS
 SLA_GRADES = {"gold": "золотой", "silver": "серебряный", "bronze": "бронзовый"}
-DYNAMICS_CHART_FILES = {
-    "koopman": "koopman_risk.png",
-    "lyapunov": "lyapunov_growth.png",
-    "native_traffic": "native_traffic.png",
-    "attack_traffic": "attack_traffic.png",
-    "sla": "sla_by_class.png",
-    "target_sla": "attacked_node_sla.png",
-    "service_forecast": "service_sla_forecast.png",
-    "timeline": "event_timeline.png",
-    "arbitrator": "arbitrator_signals.png",
-    "capacity": "capacity_bottlenecks.png",
-    "links": "link_utilization.png",
-    "resources": "resource_utilization.png",
-}
 
 AGGREGATE_SERIES: tuple[AggregateSeriesSpec, ...] = (
     ("sla_margin_min", "L1", "sla_margin", "min", 1.0),

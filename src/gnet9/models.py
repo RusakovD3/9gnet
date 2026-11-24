@@ -200,7 +200,7 @@ class NetworkModel:
         }
 
     def export_json(self, path: Path) -> None:
-        path.write_text(json.dumps(self.to_serializable(), ensure_ascii=False, indent=2), encoding="utf-8")
+        path.write_text(json.dumps(self.to_serializable(), ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 
     def export_graphml(self, path: Path) -> None:
         """Export graph to GraphML.

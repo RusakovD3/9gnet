@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 import textwrap
 from typing import Any
@@ -618,11 +618,10 @@ def ensure_interactive_backend() -> None:
 
 
 def _draw_topology(ax, model, pos, *, loads=None, max_bytes: int = 1) -> None:
-    for source, target in model.graph.edges():
-        x1, y1 = pos[source]
-        x2, y2 = pos[target]
+    # Сотни линий последней мили имеют один стиль и рисуются одной коллекцией.
+    segments = defaultdict(list)
+    for source, target, edge_attrs in model.graph.edges(data=True):
         load = None if loads is None else loads.get(frozenset((source, target)))
-        edge_attrs = model.graph.edges[source, target]
         standby = bool(edge_attrs.get("standby"))
         endpoint_attrs = (model.graph.nodes[source], model.graph.nodes[target])
         subscriber_role = next(
@@ -652,10 +651,12 @@ def _draw_topology(ax, model, pos, *, loads=None, max_bytes: int = 1) -> None:
             width, alpha, zorder = (0.65, 0.32, 2) if standby else (0.48, 0.36, 1)
         # Неактивная резервная связь отличается от исходного пути с трафиком.
         linestyle = ":" if standby else "-"
-        ax.plot(
-            [x1, x2], [y1, y2], color=color, linewidth=width,
-            alpha=alpha, zorder=zorder, linestyle=linestyle,
-        )
+        segments[color, width, alpha, zorder, linestyle].append((pos[source], pos[target]))
+
+    for (color, width, alpha, zorder, linestyle), edges in segments.items():
+        ax.add_collection(LineCollection(
+            edges, colors=color, linewidths=width, alpha=alpha, zorder=zorder, linestyles=linestyle,
+        ))
 
     levels: dict[str, list[str]] = {}
     for node_id, attrs in model.graph.nodes(data=True):

@@ -43,10 +43,6 @@ def prepare_state_hausdorff_reference(
     basis = tuple(_state_metric_basis(records))
     basis_index = {item: index for index, item in enumerate(basis)}
     scales = _state_metric_scales(records, records, list(basis))
-    vectors = _state_delta_vectors(
-        list(record_ids), records, records, basis_index, scales
-    )
-    vectors.setflags(write=False)
     coordinate_indices = tuple(
         index for index, (_, metric_name) in enumerate(basis)
         if metric_name in _COORDINATE_METRICS
@@ -57,7 +53,7 @@ def prepare_state_hausdorff_reference(
         basis=basis,
         basis_index=basis_index,
         scales=scales,
-        vectors=vectors,
+        vectors=np.broadcast_to(0.0, (len(record_ids), len(basis))),
         coordinate_indices=coordinate_indices,
     )
 
@@ -96,7 +92,6 @@ def state_tensor_hausdorff_view(
         basis = list(compiled_reference.basis)
         basis_index = compiled_reference.basis_index
         scales = compiled_reference.scales
-        reference_vectors = compiled_reference.vectors
         coordinate_indices = list(compiled_reference.coordinate_indices)
     else:
         # Preserve the full metric if a later snapshot introduces a new
@@ -104,9 +99,6 @@ def state_tensor_hausdorff_view(
         basis = sorted(set(compiled_reference.basis) | set(current_basis))
         basis_index = {item: index for index, item in enumerate(basis)}
         scales = _state_metric_scales(reference, current, basis)
-        reference_vectors = _state_delta_vectors(
-            reference_ids, reference, reference, basis_index, scales
-        )
         coordinate_indices = [
             index for index, (_, metric_name) in enumerate(basis)
             if metric_name in _COORDINATE_METRICS
@@ -114,28 +106,23 @@ def state_tensor_hausdorff_view(
     current_vectors = _state_delta_vectors(
         current_ids, current, reference, basis_index, scales
     )
-    directed_reference, directed_current, reference_index, current_index = (
-        _labelled_state_hausdorff(
-            reference_ids,
-            reference_vectors,
-            current_ids,
-            current_vectors,
-        )
+    norms = np.linalg.norm(current_vectors, axis=1)
+    directed_reference, directed_current, reference_index, current_index = _hausdorff_from_t0(
+        reference_ids, current_ids, norms
     )
     distance = max(directed_reference, directed_current)
-    coordinate_distance = _projected_hausdorff_distance(
-        reference_ids,
-        reference_vectors,
-        current_ids,
-        current_vectors,
-        coordinate_indices,
-    )
+    coordinate_distance = 0.0
+    if coordinate_indices:
+        coordinate_norms = np.linalg.norm(current_vectors[:, coordinate_indices], axis=1)
+        forward, reverse, _, _ = _hausdorff_from_t0(reference_ids, current_ids, coordinate_norms)
+        coordinate_distance = max(forward, reverse)
     missing = sorted(set(reference_ids) - set(current_ids))
     added = sorted(set(current_ids) - set(reference_ids))
     contributors = _state_hausdorff_contributors(
         current_ids,
         current_vectors,
         basis,
+        norms,
         limit=8,
     )
     return {
@@ -278,95 +265,44 @@ def _state_delta_vectors(
     return vectors
 
 
-def _labelled_state_hausdorff(
-    ids_a: list[str],
-    vectors_a: np.ndarray,
-    ids_b: list[str],
-    vectors_b: np.ndarray,
+def _hausdorff_from_t0(
+    reference_ids: list[str], current_ids: list[str], norms: np.ndarray,
 ) -> tuple[float, float, int | None, int | None]:
-    """Exact labelled Hausdorff distance without an O(N²) allocation.
+    """Точные направленные расстояния между нулевыми векторами t0 и текущими.
 
-    The dense pairwise matrix is mathematically convenient but needlessly
-    allocates hundreds of megabytes for every dynamics tick.  Computing rows
-    in bounded chunks gives the same minima and witnesses while retaining the
-    sparse-state model's intended memory behaviour.
+    norms[j] — безразмерная норма отклонения объекта j от t0. Расстояние
+    от любой строки t0 до j равно norms[j] плюс 10 при разных метках.
+    Например, для тех же двух меток и норм [0, 25] расстояния равны 10 и 25.
     """
-    if not ids_a and not ids_b:
-        return 0.0, 0.0, None, None
-    if not ids_a or not ids_b:
-        return math.inf, math.inf, None, None
-    # In the normal dynamics path every tensor keeps its identity.  When the
-    # corresponding labelled distance is below the fixed mismatch cost, that
-    # same-label point is provably closer than any other label (whose distance
-    # is at least the mismatch cost).  This exact short path is O(N·K); the
-    # chunked all-pairs fallback below remains for a true structural change or
-    # an exceptionally large state excursion.
-    if len(ids_a) == len(ids_b) and set(ids_a) == set(ids_b):
-        b_index_by_id = {item_id: index for index, item_id in enumerate(ids_b)}
-        matching_b_indices = np.asarray(
-            [b_index_by_id[item_id] for item_id in ids_a], dtype=int
-        )
-        same_label_distances = np.linalg.norm(
-            vectors_a - vectors_b[matching_b_indices], axis=1
-        )
-        if float(np.max(same_label_distances)) < STATE_HAUSDORFF_LABEL_MISMATCH_COST:
-            a_index = int(np.argmax(same_label_distances))
-            return (
-                float(same_label_distances[a_index]),
-                float(same_label_distances[a_index]),
-                a_index,
-                int(matching_b_indices[a_index]),
-            )
-    b_min = np.full(len(ids_b), math.inf, dtype=float)
-    a_min = np.empty(len(ids_a), dtype=float)
-    b_ids = np.asarray(ids_b, dtype=object)
-    chunk_size = 32
-    for start in range(0, len(ids_a), chunk_size):
-        stop = min(len(ids_a), start + chunk_size)
-        euclidean = np.linalg.norm(
-            vectors_a[start:stop, None, :] - vectors_b[None, :, :], axis=2
-        )
-        penalty = np.not_equal(
-            np.asarray(ids_a[start:stop], dtype=object)[:, None], b_ids[None, :]
-        ).astype(float) * STATE_HAUSDORFF_LABEL_MISMATCH_COST
-        distances = euclidean + penalty
-        a_min[start:stop] = distances.min(axis=1)
-        b_min = np.minimum(b_min, distances.min(axis=0))
-    a_to_b = a_min
-    b_to_a = b_min
-    a_index = int(np.argmax(a_to_b))
-    b_index = int(np.argmax(b_to_a))
-    return float(a_to_b[a_index]), float(b_to_a[b_index]), a_index, b_index
+    if not reference_ids or not current_ids:
+        distance = math.inf if reference_ids or current_ids else 0.0
+        return distance, distance, None, None
 
+    penalty = STATE_HAUSDORFF_LABEL_MISMATCH_COST
+    other = norms.min() + penalty
+    if reference_ids == current_ids:
+        from_reference = np.minimum(norms, other)
+        from_current = norms
+    else:
+        by_id = dict(zip(current_ids, norms))
+        reference_set = set(reference_ids)
+        from_reference = np.array([min(by_id.get(label, math.inf), other) for label in reference_ids])
+        from_current = norms + np.array([0.0 if label in reference_set else penalty for label in current_ids])
 
-def _projected_hausdorff_distance(
-    reference_ids: list[str],
-    reference_vectors: np.ndarray,
-    current_ids: list[str],
-    current_vectors: np.ndarray,
-    indices: list[int],
-) -> float:
-    if not indices:
-        return 0.0
-    first, second, _, _ = _labelled_state_hausdorff(
-        reference_ids,
-        reference_vectors[:, indices],
-        current_ids,
-        current_vectors[:, indices],
-    )
-    return max(first, second)
+    i, j = int(np.argmax(from_reference)), int(np.argmax(from_current))
+    return float(from_reference[i]), float(from_current[j]), i, j
 
 
 def _state_hausdorff_contributors(
     current_ids: list[str],
     current_vectors: np.ndarray,
     basis: list[tuple[str, str]],
+    scores: np.ndarray,
     *,
     limit: int,
 ) -> list[dict[str, Any]]:
     if not current_ids:
         return []
-    scores = np.linalg.norm(current_vectors, axis=1)
     result: list[dict[str, Any]] = []
     for index in np.argsort(scores)[::-1][:limit]:
         score = float(scores[int(index)])
