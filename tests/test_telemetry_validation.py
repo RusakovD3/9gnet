@@ -17,6 +17,7 @@ from src.gnet9.telemetry_validation import (
     read_telemetry_csv,
     validate_external_telemetry,
     write_validation_report,
+    _evaluate_threshold,
 )
 
 
@@ -35,6 +36,29 @@ def test_overlapping_lead_windows_can_match_two_distinct_episodes():
     assert metrics["false_warning_episode_count"] == 0
     assert metrics["minimum_observed_lead_seconds"] == 17
     assert report["deployment_gate"]["passed"]
+
+
+def test_lead_uses_first_correct_sample_within_required_window():
+    points = [TelemetryPoint(t, float(2 <= t <= 12), t == 23, "", "") for t in range(40)]
+    metrics = _evaluate_threshold(points, 0.5, TelemetryValidationConfig(), max_gap=1.5)
+    # Окно 3–13 с. Первый подходящий отсчёт — в 3 с, упреждение — 20 с.
+    assert metrics["minimum_observed_lead_seconds"] == 20
+
+
+@pytest.mark.parametrize("gap, expected_matches, left_censored", [(0, 1, 1), (100, 2, 0)])
+def test_continuing_warning_across_holdout_boundary_counts_only_exposure(gap, expected_matches, left_censored):
+    config = TelemetryValidationConfig(training_fraction=0.5, minimum_events_per_partition=2)
+    points = [TelemetryPoint(t + (gap if t >= 50 else 0), float(t in {5, 75} or 25 <= t <= 55),
+                             t in {20, 45, 65, 90}, "", "") for t in range(100)]
+    report = validate_external_telemetry(points, config)
+    assert report["threshold_selection"]["selected_warning_risk_threshold"] == 1
+    assert report["threshold_selection"]["training_metrics"]["predicted_onset_count"] == 2
+    metrics = report["independent_holdout"]["metrics"]
+    assert metrics["predicted_onset_count"] == expected_matches
+    assert metrics["left_censored_warning_count"] == left_censored
+    assert metrics["false_warning_episode_count"] == 0
+    assert metrics["warning_duration_seconds"] == 7
+    assert metrics["observed_duration_seconds"] == 49
 
 
 def test_recall_limit_controls_allowed_misses_in_both_partitions():
@@ -65,9 +89,36 @@ def test_programmatic_telemetry_requires_chronological_samples():
 def test_subsecond_exposure_and_single_sample_partition():
     points = [TelemetryPoint(t, 0.5, False, "", "") for t in (0, 0.25, 0.5)]
     report = validate_external_telemetry(points)
-    assert report["threshold_selection"]["training_metrics"]["false_warnings_per_hour"] == 14400
+    training = report["threshold_selection"]["training_metrics"]
+    assert training["observed_duration_seconds"] == 0.25
+    assert training["right_censored_warning_count"] == 1
+    assert training["false_warning_episode_count"] == 0
     assert report["independent_holdout"]["metrics"]["false_warnings_per_hour"] is None
     assert not report["deployment_gate"]["passed"]
+
+
+def test_ten_hour_gap_does_not_dilute_false_warnings_or_alarm_occupancy():
+    config = TelemetryValidationConfig(minimum_lead_seconds=1, maximum_lead_seconds=2)
+    def evaluate(times):
+        points = [TelemetryPoint(t, float(t == 1), False, "", "") for t in times]
+        return _evaluate_threshold(points, 0.5, config, max_gap=1.5)
+    regular = evaluate(range(7))
+    interrupted = evaluate([0, 1, 2, 3, 36003, 36004, 36005, 36006])
+    for metrics in (regular, interrupted):
+        assert metrics["false_warnings_per_hour"] == 600
+        assert metrics["observed_duration_seconds"] == 6
+        assert metrics["warning_duration_seconds"] == 1
+        assert metrics["warning_occupancy_ratio"] == 1 / 6
+    assert interrupted["gap_duration_seconds"] == 36000
+
+
+def test_warning_cannot_match_onset_across_gap_and_is_censored_at_trace_end():
+    config = TelemetryValidationConfig(minimum_lead_seconds=1, maximum_lead_seconds=3)
+    points = [TelemetryPoint(t, float(t in (1, 5)), t == 4, "", "") for t in [0, 1, 4, 5, 6]]
+    metrics = _evaluate_threshold(points, 0.5, config, max_gap=1.5)
+    assert metrics["predicted_onset_count"] == 0
+    assert metrics["right_censored_warning_count"] == 2
+    assert metrics["false_warning_episode_count"] == 0
 
 
 @pytest.mark.parametrize("rows", [
@@ -142,6 +193,7 @@ def test_external_telemetry_uses_chronological_holdout_without_leakage(tmp_path:
     )
 
     assert report["threshold_selection"]["selection_uses_holdout"] is False
+    assert report["validation_scope"] == "threshold_only_on_supplied_risk_scores"
     assert report["independent_holdout"]["performed"] is True
     assert report["deployment_gate"]["passed"] is True
     assert report["independent_holdout"]["metrics"]["recall"] == 1.0

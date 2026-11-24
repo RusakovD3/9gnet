@@ -520,9 +520,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         metavar="CSV",
         help=(
-            "Проверить обезличенную внешнюю телеметрию: хронологически подобрать "
-            "порог по ранней части ряда и проверить его на независимой проверочной "
-            "части. "
+            "Подобрать порог по ранней части готового ряда риска и проверить "
+            "его на более позднем отложенном участке. "
             "Создаёт output/telemetry_validation_report.json и не запускает сеть."
         ),
     )
@@ -532,9 +531,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         metavar="JSON",
         help=(
-            "Применить только прошедший независимую проверку отчёт внешней "
-            "телеметрии как порог "
-            "предупреждения для симуляции. Автоматических изменений реальной сети не выполняет."
+            "Применить в симуляции порог готового ряда риска из отчёта, "
+            "прошедшего проверку на отложенном участке."
         ),
     )
     parser.add_argument(
@@ -693,9 +691,9 @@ def main() -> None:
         metrics = report["independent_holdout"]["metrics"]
         rate = metrics["false_warnings_per_hour"]
         rate_text = f"{rate:.3f}" if rate is not None else "нет данных"
-        print(f"Отчёт валидации телеметрии: {report_path}")
+        print(f"Отчёт проверки порога готового ряда риска: {report_path}")
         print(
-            "Независимый holdout: "
+            "Порог на отложенном участке: "
             f"precision={metrics['precision'] * 100:.1f}%, "
             f"recall={metrics['recall'] * 100:.1f}%, "
             f"ложных эпизодов/ч={rate_text}; "

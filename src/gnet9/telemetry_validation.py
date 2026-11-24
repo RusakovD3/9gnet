@@ -1,15 +1,13 @@
 """Офлайн-валидация порога предупреждений по внешней телеметрии.
 
-Модуль намеренно не подключается к оборудованию и не отправляет команды в
-сеть. Он принимает уже обезличенную временную таблицу с риском, рассчитанным
-тем же экземпляром модели Купмана, и с подтверждёнными началами инцидентов.
-Так можно получить воспроизводимый профиль порога без утечки будущих меток в
-обучающую часть и проверить его на более позднем, независимом участке ряда.
+На входе готовый обезличенный ряд риска и подтверждённые начала инцидентов.
+Порог выбирается на ранних данных и проверяется на позднем участке того же ряда.
+Источник численных оценок устанавливает поставщик CSV.
 """
 
 from __future__ import annotations
 
-from bisect import bisect_right
+from bisect import bisect_left
 import csv
 from dataclasses import asdict, dataclass
 from hashlib import sha256
@@ -20,7 +18,7 @@ from statistics import median
 from typing import Any, Iterable
 
 
-REPORT_VERSION = 1
+REPORT_VERSION = 2
 REQUIRED_COLUMNS = ("timestamp_seconds", "risk_score", "attack_onset")
 
 
@@ -168,7 +166,12 @@ def validate_external_telemetry(
         ),
     )
     threshold = float(selected["warning_risk_threshold"])
-    holdout = _evaluate_threshold(holdout_points, threshold, config, _maximum_sample_gap(holdout_points))
+    previous = training_points[-1]
+    first = holdout_points[0]
+    continuing_warning = (first.timestamp_seconds - previous.timestamp_seconds <= training_gap
+                          and min(previous.risk_score, first.risk_score) >= threshold)
+    holdout = _evaluate_threshold(holdout_points, threshold, config, training_gap,
+                                  continuing_warning=continuing_warning)
     training_gate = _meets_quality_gate(selected, config)
     holdout_gate = _meets_quality_gate(holdout, config)
     eligible = bool(training_gate and holdout_gate)
@@ -177,16 +180,20 @@ def validate_external_telemetry(
     return {
         "report_version": REPORT_VERSION,
         "report_kind": "external_telemetry_chronological_holdout_validation",
+        "validation_scope": "threshold_only_on_supplied_risk_scores",
         "data_contract": {
             "required_columns": list(REQUIRED_COLUMNS),
             "optional_columns": ["attack_id", "attack_kind"],
-            "risk_score_semantics": "risk score of the same Koopman model revision, not a probability",
+            "risk_score_semantics": "supplied scalar score, model provenance unverified",
             "raw_payloads_or_personal_data_expected": False,
             "source_sha256": source_digest,
         },
         "validation_protocol_ru": (
             "Хронологическое разделение без перемешивания: порог выбирается только на раннем "
-            "участке, затем фиксируется и проверяется на последующем независимом holdout-участке."
+            "участке, затем фиксируется и проверяется на последующем отложенном участке. "
+            "Проверяется только порог готового ряда риска. Цель и вид угрозы в прогнозе "
+            "CSV отсутствуют. Совпадение оценивается по времени в одном непрерывном участке. "
+            "Разрыв более 1,5 медианного интервала обучающей части завершает участок."
         ),
         "configuration": asdict(config),
         "partition": {
@@ -195,6 +202,7 @@ def validate_external_telemetry(
             "training_time_range_seconds": _time_range(training_points),
             "holdout_time_range_seconds": _time_range(holdout_points),
             "split_timestamp_seconds": holdout_points[0].timestamp_seconds,
+            "maximum_contiguous_sample_gap_seconds": training_gap,
         },
         "threshold_selection": {
             "candidate_count": len(candidates),
@@ -220,8 +228,8 @@ def validate_external_telemetry(
             "status": "PASSED_FOR_SUPERVISED_PILOT" if eligible else "FAILED",
             "passed": eligible,
             "semantics_ru": (
-                "Прохождение допускает только наблюдаемый пилот с рекомендациями человеку; "
-                "оно не является гарантией отсутствия ошибок и не разрешает автоматически менять реальную сеть."
+                "Допуск относится к порогу предоставленного ряда риска. "
+                "Происхождение ряда, прогноз показателей услуг и перенос на другие сети требуют отдельной проверки."
             ),
             "training_quality_gate_passed": training_gate,
             "holdout_quality_gate_passed": holdout_gate,
@@ -248,7 +256,7 @@ def load_pilot_calibration(path: Path) -> dict[str, Any]:
     if not isinstance(report, dict):
         raise TelemetryValidationError("Отчёт калибровки должен быть объектом JSON")
     if type(report.get("report_version")) is not int or report["report_version"] != REPORT_VERSION:
-        raise TelemetryValidationError("Неподдерживаемая версия отчёта калибровки")
+        raise TelemetryValidationError("Неподдерживаемая версия отчёта. Повторите проверку порога по исходному CSV.")
     if report.get("report_kind") != "external_telemetry_chronological_holdout_validation":
         raise TelemetryValidationError("Требуется отчёт хронологической проверки телеметрии")
     profile = _report_section(report, "deployment_profile")
@@ -308,29 +316,56 @@ def _evaluate_threshold(
     threshold: float,
     config: TelemetryValidationConfig,
     max_gap: float,
+    *,
+    continuing_warning: bool = False,
 ) -> dict[str, Any]:
-    episodes = _warning_episodes(points, threshold, max_gap)
-    next_episode = 0
-    onset_count = 0
-    leads: list[float] = []
-    for onset in points:
-        if not onset.attack_onset:
-            continue
-        onset_count += 1
-        earliest = onset.timestamp_seconds - config.maximum_lead_seconds
-        latest = onset.timestamp_seconds - config.minimum_lead_seconds
-        # Окна движутся вперёд. Самый ранний подходящий эпизод оставляет
-        # следующие эпизоды доступными для соседних начал инцидентов.
-        while next_episode < len(episodes) and episodes[next_episode][-1] < earliest:
-            next_episode += 1
-        if next_episode < len(episodes):
-            samples = episodes[next_episode]
-            stop = bisect_right(samples, latest)
-            if stop and samples[stop - 1] >= earliest:
-                leads.append(onset.timestamp_seconds - samples[stop - 1])
+    leads = []
+    episode_count = onset_count = censored_count = 0
+    left_censored_count = 0
+    observed_seconds = warning_seconds = 0.0
+    boundaries = [0]
+    for index, (left, right) in enumerate(zip(points, points[1:]), 1):
+        interval = right.timestamp_seconds - left.timestamp_seconds
+        if interval > max_gap:
+            boundaries.append(index)
+        else:
+            observed_seconds += interval
+            if left.risk_score >= threshold:
+                warning_seconds += interval
+    boundaries.append(len(points))
+    for start, stop in zip(boundaries, boundaries[1:]):
+        segment = points[start:stop]
+        episodes = _warning_episodes(segment, threshold)
+        episode_count += len(episodes)
+        if start == 0 and continuing_warning and episodes and segment[0].risk_score >= threshold:
+            # Первая тревога уже действовала при выборе границы участков.
+            # Её длительность входит в экспозицию, но новый эпизод не начался.
+            left_censored_count = 1
+            episodes = episodes[1:]
+        next_episode = 0
+        matched = set()
+        for onset in segment:
+            if not onset.attack_onset:
+                continue
+            onset_count += 1
+            earliest = onset.timestamp_seconds - config.maximum_lead_seconds
+            latest = onset.timestamp_seconds - config.minimum_lead_seconds
+            # Окна упорядочены по времени. Берём первый подходящий свободный эпизод.
+            while next_episode < len(episodes) and episodes[next_episode][-1] < earliest:
                 next_episode += 1
+            if next_episode == len(episodes):
+                continue
+            samples = episodes[next_episode]
+            first_valid = bisect_left(samples, earliest)
+            if first_valid < len(samples) and samples[first_valid] <= latest:
+                leads.append(onset.timestamp_seconds - samples[first_valid])
+                matched.add(next_episode)
+                next_episode += 1
+        segment_end = segment[-1].timestamp_seconds
+        censored_count += sum(index not in matched and samples[-1] + config.maximum_lead_seconds > segment_end
+                              for index, samples in enumerate(episodes))
     predicted = len(leads)
-    false_episodes = len(episodes) - predicted
+    false_episodes = episode_count - predicted - censored_count - left_censored_count
     duration_seconds = points[-1].timestamp_seconds - points[0].timestamp_seconds
     precision = predicted / max(predicted + false_episodes, 1)
     recall = predicted / max(onset_count, 1)
@@ -343,9 +378,15 @@ def _evaluate_threshold(
         "attack_onset_count": onset_count,
         "predicted_onset_count": predicted,
         "missed_attack_count": onset_count - predicted,
-        "warning_episode_count": len(episodes),
+        "observed_duration_seconds": observed_seconds,
+        "gap_duration_seconds": duration_seconds - observed_seconds,
+        "warning_duration_seconds": warning_seconds,
+        "warning_occupancy_ratio": warning_seconds / observed_seconds if observed_seconds else None,
+        "warning_episode_count": episode_count,
+        "left_censored_warning_count": left_censored_count,
+        "right_censored_warning_count": censored_count,
         "false_warning_episode_count": false_episodes,
-        "false_warnings_per_hour": false_episodes * 3600.0 / duration_seconds if duration_seconds else None,
+        "false_warnings_per_hour": false_episodes * 3600.0 / observed_seconds if observed_seconds else None,
         "precision": precision,
         "recall": recall,
         "f1": 2.0 * precision * recall / max(precision + recall, 1e-12),
@@ -359,14 +400,14 @@ def _maximum_sample_gap(points: list[TelemetryPoint]) -> float:
     return 1.5 * median(intervals) if intervals else 0.0
 
 
-def _warning_episodes(points: list[TelemetryPoint], threshold: float, max_gap: float) -> list[list[float]]:
+def _warning_episodes(points: list[TelemetryPoint], threshold: float) -> list[list[float]]:
     episodes: list[list[float]] = []
     active = False
     for point in points:
         if point.risk_score < threshold:
             active = False
             continue
-        if not active or point.timestamp_seconds - episodes[-1][-1] > max_gap:
+        if not active:
             episodes.append([])
         episodes[-1].append(point.timestamp_seconds)
         active = True
@@ -376,6 +417,7 @@ def _warning_episodes(points: list[TelemetryPoint], threshold: float, max_gap: f
 def _meets_quality_gate(metrics: dict[str, Any], config: TelemetryValidationConfig) -> bool:
     return bool(
         int(metrics["attack_onset_count"]) >= config.minimum_events_per_partition
+        and metrics["right_censored_warning_count"] == 0
         and float(metrics["precision"]) >= config.minimum_precision
         and float(metrics["recall"]) >= config.minimum_recall
         and metrics["false_warnings_per_hour"] is not None
