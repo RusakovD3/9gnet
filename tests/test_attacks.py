@@ -1,6 +1,8 @@
 from src.gnet9.attacks import (
     MITRE_DEMO_ATTACKS,
     MITRE_T1110_001_ATTEMPTS_PER_SECOND,
+    active_attack_events,
+    apply_attack_effects,
     attack_catalog,
     mitre_tensor_mapping_catalog,
 )
@@ -11,6 +13,52 @@ from src.gnet9.topology_builder import GNetBaselineBuilder
 
 
 MODEL = GNetBaselineBuilder().build()
+
+
+def test_short_flow_drops_follow_the_expected_rate_and_replay_by_flow():
+    def event_at(seed=42):
+        event = active_attack_events(
+            MODEL, "mitre-demo", step_index=2, time_seconds=10, step_seconds=5, seed=seed,
+        )[0]
+        return dict(event, legitimate_loss_ratio=0.125, intensity_ratio=1.0,
+                    target_resource_pressure=1.0)
+
+    event = event_at()
+    flows = [
+        {"flow_id": f"short-{i}", "packet_count": 1, "observed_dropped_packets": 0,
+         "route": [event["target_id"]]}
+        for i in range(2048)
+    ]
+
+    def loss_by_flow(inputs, event):
+        results, _ = apply_attack_effects(MODEL, inputs, [event], prepared_attack_flows=[])
+        return {flow["flow_id"]: flow["observed_dropped_packets"] for flow in results}
+
+    losses = loss_by_flow(flows, event)
+    # Для 2048 однопакетных потоков при p = 1/8 ожидается 256 потерь, σ ≈ 15 пакетов.
+    assert abs(sum(losses.values()) - 256) <= 60
+    assert set(losses.values()) == {0, 1}
+    assert loss_by_flow(flows[::-1], event) == losses
+    assert loss_by_flow(flows, event_at(seed=7)) != losses
+    assert loss_by_flow(flows, dict(event, step_index=3)) != losses
+    assert loss_by_flow(flows, dict(event, attack_id="another-event")) != losses
+
+
+def test_overlapping_events_share_remaining_packets_with_existing_losses():
+    event = active_attack_events(
+        MODEL, "mitre-demo", step_index=2, time_seconds=10, step_seconds=5, seed=42,
+    )[0]
+    event.update(legitimate_loss_ratio=0.5, intensity_ratio=1.0, target_resource_pressure=1.0)
+    flow = {"flow_id": "short", "packet_count": 4, "observed_dropped_packets": 1,
+            "route": [event["target_id"]], "transport": "TCP", "observed_retransmissions": 1}
+    (result,), summary = apply_attack_effects(
+        MODEL, [flow], [event, dict(event, attack_id="second")], prepared_attack_flows=[],
+    )
+    assert result["observed_dropped_packets"] == result["observed_retransmissions"] == 4
+    assert result["raw_attack_dropped_packets"] == 3
+    assert summary["non_attack_legitimate_dropped_packets"] == 1
+    assert summary["observed_attack_induced_legitimate_dropped_packets"] == 3
+    assert summary["raw_legitimate_dropped_packets"] == summary["legitimate_dropped_packets"] == 4
 
 
 def test_warning_episode_can_only_predict_one_onset():

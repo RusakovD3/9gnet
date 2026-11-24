@@ -16,7 +16,7 @@ from .addressing import NetworkIdentity, build_network_identities
 from .attacks import apply_attack_effects, build_current_attack_flows
 from .models import NetworkModel, StateTensor
 from .normal_traffic import poisson_arrivals
-from .runtime_metrics import network_runtime_metrics
+from .runtime_metrics import OFFERED_LINK_RATE_ORIGIN, network_runtime_metrics
 from .metrics import gold_route_hausdorff_view
 from .routing import FixedTopologyRoutes
 
@@ -1115,7 +1115,7 @@ def _traffic_summary(flows: list[dict[str, Any]], model: NetworkModel) -> dict[s
     legitimate_latencies = [
         float(flow["one_way_latency_ms"]) for flow in legitimate if not flow.get("isolated")
     ]
-    link_rates: dict[tuple[str, str], float] = {}
+    link_offered_rates: dict[tuple[str, str], float] = {}
     link_packets: dict[tuple[str, str], int] = {}
     link_exposed_drops: dict[tuple[str, str], int] = {}
     for flow in flows:
@@ -1124,7 +1124,7 @@ def _traffic_summary(flows: list[dict[str, Any]], model: NetworkModel) -> dict[s
         route = [str(node) for node in flow.get("route", [])]
         for source, target in zip(route, route[1:]):
             edge = tuple(sorted((source, target)))
-            link_rates[edge] = link_rates.get(edge, 0.0) + rate_mbps
+            link_offered_rates[edge] = link_offered_rates.get(edge, 0.0) + rate_mbps
             link_packets[edge] = link_packets.get(edge, 0) + int(flow.get("packet_count", 0))
             # Потеря известна на уровне потока, а не конкретного порта. Поэтому
             # это честно названная экспозиция ребра к end-to-end loss, а не
@@ -1133,14 +1133,14 @@ def _traffic_summary(flows: list[dict[str, Any]], model: NetworkModel) -> dict[s
                 flow.get("observed_dropped_packets", 0)
             )
     link_rows = []
-    for (source, target), rate_mbps in link_rates.items():
+    for (source, target), offered_rate_mbps in link_offered_rates.items():
         capacity = float(model.graph.edges[source, target].get("capacity_mbps", 0.0))
-        utilization = rate_mbps / max(capacity, 1e-9) * 100.0
+        utilization = offered_rate_mbps / max(capacity, 1e-9) * 100.0
         link_rows.append(
             {
                 "source": source,
                 "target": target,
-                "rate_mbps": round(rate_mbps, 6),
+                "rate_mbps": round(offered_rate_mbps, 6),
                 "capacity_mbps": round(capacity, 6),
                 "utilization_percent": round(utilization, 6),
                 "end_to_end_flow_loss_exposure_ratio": round(
@@ -1186,6 +1186,7 @@ def _traffic_summary(flows: list[dict[str, Any]], model: NetworkModel) -> dict[s
         ),
         "observed_link_count": len(link_rows),
         "observed_links": link_rows,
+        "observed_link_rate_semantics": OFFERED_LINK_RATE_ORIGIN,
         "observed_link_loss_semantics": (
             "flow_weighted_end_to_end_loss_exposure_not_physical_drop_location"
         ),

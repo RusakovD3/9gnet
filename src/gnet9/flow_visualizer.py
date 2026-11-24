@@ -20,9 +20,9 @@ from .flow_details import (FLOW_SHORT_LABELS, _flow_summary, _flow_is_visible,
                            _interactive_snapshot_summary, _interactive_status_sections,
                            _node_hover_text)
 from .network_layout import network_positions as _positions
-from .plot_style import BACKGROUND, PANEL, TEXT, BORDER, save_figure
+from .plot_style import BACKGROUND, BLUE, BORDER, MUTED, PANEL, TEXT, save_figure
 from .security_panel import SecurityPanel
-from .security_dashboard import ATTACK_COLORS
+from .security_dashboard import ATTACK_COLORS, build_security_dashboard, peak_security_step
 
 
 FLOW_COLORS = {
@@ -214,7 +214,7 @@ class ServiceFlowWindow:
             "КАК ЧИТАТЬ И УПРАВЛЯТЬ\n"
             "Точки — условная выборка потоков, не отдельные пакеты.\n"
             "Цвет контура и пути атаки — её тип; квадрат — точка входа.\n"
-            "Цвет обычной линии — услуга; толщина — объём за шаг.\n"
+            "Цвет линии — услуга, толщина — предложенный объём за шаг.\n"
             "← / → — шаг; пробел — воспроизведение / пауза.\n"
             "Наведение — показатели выбранного шага.",
             transform=self.help_ax.transAxes, va="top", fontsize=9.2, color="#dbeafe",
@@ -568,19 +568,96 @@ def draw_security_dashboard(model, snapshots: list[dict[str, Any]], path: Path) 
     if not snapshots:
         path.unlink(missing_ok=True)
         return
-    ranks = {"observe": 0, "confirm_observation": 1, "prepare": 2, "protect": 3, "emergency": 4}
-    index = max(range(len(snapshots)), key=lambda i: (
-        ranks.get(snapshots[i].get("arbitrator", {}).get("recommendation", {}).get("response_stage"), 0),
-        bool(snapshots[i].get("attacks", {}).get("events")), -i,
-    ))
-    window = ServiceFlowWindow(model, snapshots)
-    try:
-        window.animation.event_source.stop()
-        window._select_step(index)
-        window.fig.canvas.draw()
-        save_figure(window.fig, path, dpi=110)
-    finally:
-        plt.close(window.fig)
+    index = peak_security_step(snapshots)
+    snapshot = snapshots[index]
+    dashboard = build_security_dashboard(snapshots, index)
+
+    # Координаты в типографских пунктах; высота зависит от числа строк.
+    width = 792
+    fig = plt.figure(facecolor=BACKGROUND)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_axis_off()
+    ax.set_xlim(0, width)
+
+    _dashboard_text(ax, 24, 22, "Безопасность сети", 26, bold=True)
+    step = snapshot.get("step_index", index)
+    time = snapshot.get("time_seconds")
+    when = f"Шаг {step}" + (f"  ·  {time:g} с от начала прогона" if time is not None else "")
+    _dashboard_text(ax, 24, 65, when, 13, color=MUTED)
+    _dashboard_text(ax, 768, 26, "Максимальный уровень срочности за прогон", 11, color=MUTED, align="right")
+    severity = dashboard["severity_label"] if dashboard["severity_available"] else "Нет данных о срочности"
+    _dashboard_text(ax, 768, 48, severity, 19, color=dashboard["severity_color"], bold=True, align="right")
+    ax.hlines(103, 24, 768, colors=BORDER)
+
+    attacks = snapshot.get("attacks", {})
+    current = [alarm for alarm in dashboard["alarms"] if alarm["phase"] != "history"]
+    current.sort(key=lambda alarm: alarm["phase"] != "active")
+    observations_end = _draw_security_observations(ax, current, attacks)
+    quality_end = _draw_security_quality(ax, attacks.get("sla_restoration", {}).get("tiers", []))
+    divider = max(observations_end, quality_end) + 10
+    ax.hlines(divider, 24, 768, colors=BORDER)
+    y = _dashboard_text(ax, 24, divider + 21, "Первое действие оператора", 17, bold=True)
+    recommendation = dashboard["recommendation"]
+    steps = recommendation.get("steps_ru", [])
+    action = recommendation.get("primary_action_ru") or (steps[0] if steps else "Рекомендация не сохранена")
+    height = _dashboard_text(ax, 24, y + 10, action, 15, wrap=79) + 22
+    ax.set_ylim(height, 0)
+    fig.set_size_inches(width / 72, height / 72)
+    save_figure(fig, path, dpi=135)
+
+
+def _dashboard_text(ax, x, y, value, size, *, color=TEXT, bold=False, wrap=0, align="left"):
+    value = textwrap.fill(value, width=wrap) if wrap else value
+    ax.text(x, y, value, fontsize=size, color=color, fontweight="bold" if bold else "normal",
+            va="top", ha=align, linespacing=1.25)
+    return y + (1 + value.count("\n")) * size * 1.48
+
+
+def _draw_security_observations(ax, current, attacks):
+    _dashboard_text(ax, 24, 125, "Наблюдения", 17, bold=True)
+    y = 163
+    for alarm in current[:2]:
+        y = _dashboard_text(ax, 24, y, f"{alarm['phase_label']}  ·  {alarm['target_id']}", 11,
+                            color=MUTED, wrap=50)
+        y = _dashboard_text(ax, 24, y + 2, alarm["kind_label"], 15, bold=True, wrap=34)
+        routes = alarm["routes"]
+        if routes:
+            y = _dashboard_text(ax, 24, y + 2, "Маршрут: " + " → ".join(routes[0]), 11, color=BLUE, wrap=50)
+        elif alarm["phase"] != "precursor" and alarm["evidence_lines"]:
+            y = _dashboard_text(ax, 24, y + 2, alarm["evidence_lines"][0], 11, color=MUTED, wrap=50)
+        y += 13
+    if len(current) > 2:
+        y = _dashboard_text(ax, 24, y, f"Другие наблюдения на шаге: {len(current) - 2}", 11, color=MUTED)
+
+    if not current:
+        observed = "events" in attacks and "precursors" in attacks
+        if attacks.get("active") or attacks.get("precursor_active"):
+            empty = "Есть сигнал. Подробности не сохранены."
+        else:
+            empty = "Признаков угрозы нет" if observed else "Наблюдения не сохранены"
+        y = _dashboard_text(ax, 24, y, empty, 14, wrap=35)
+    return y
+
+
+def _draw_security_quality(ax, tier_rows):
+    _dashboard_text(ax, 435, 125, "Качество услуг", 17, bold=True)
+    tiers = {t.get("sla_grade"): t for t in tier_rows}
+    if not tiers:
+        return _dashboard_text(ax, 435, 163, "Нет данных о качестве", 14)
+    y = _dashboard_text(ax, 435, 163, "Потоки, выполнившие проверенные требования", 11, color=MUTED) + 9
+    for grade, label in (("gold", "Золотой"), ("silver", "Серебряный"), ("bronze", "Бронзовый")):
+        tier = tiers.get(grade, {})
+        total = tier.get("flow_count")
+        compliant = tier.get("sla_compliant_flow_count")
+        count = "нет потоков" if total == 0 else "нет данных"
+        if total and compliant is not None:
+            count = f"{compliant} из {total}"
+            ax.hlines(y + 19, 435, 768, colors=BORDER, linewidth=3)
+            ax.hlines(y + 19, 435, 435 + 333 * compliant / total, colors=BLUE, linewidth=3)
+        _dashboard_text(ax, 435, y, label, 12)
+        _dashboard_text(ax, 768, y, count, 12, align="right")
+        y += 36
+    return y
 
 
 def create_service_flow_window(model, snapshots: list[dict[str, Any]]) -> ServiceFlowWindow:

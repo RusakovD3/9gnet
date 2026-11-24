@@ -83,3 +83,20 @@ def test_recommendation_text_cannot_change_future_observations(observed_run, mon
 def test_packet_model_has_no_control_plan_input():
     for function in (simulate_packet_snapshot, apply_attack_effects, build_current_attack_flows):
         assert "defense_plan" not in inspect.signature(function).parameters
+
+
+def test_primary_action_identifies_the_power_check_from_the_operator_plan():
+    from src.gnet9.koopman import _recommendation
+
+    advice = _recommendation(0.8, "power_attack", attack_state={}, warning_confirmed=True,
+                             lyapunov_remap_pressure=0.)
+    assert "напряжение" in advice.get("primary_action_ru", "")
+    assert advice["primary_action_ru"] in advice["steps_ru"]
+
+
+def test_healthy_step_recommends_routine_monitoring_without_a_target():
+    advice = koopman._recommendation(0., "none", attack_state={"events": [], "precursors": []},
+                                     warning_confirmed=False, lyapunov_remap_pressure=0.)
+    assert advice["requires_human_action"] is False
+    assert "штатное наблюдение" in advice["primary_action_ru"]
+    assert advice["primary_action_ru"] in advice["steps_ru"]

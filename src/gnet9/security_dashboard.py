@@ -44,6 +44,20 @@ PHASE_LABELS = {
 FLOOD_KINDS = {"dos", "ddos", "syn_flood", "dns_flood", "application_flood"}
 
 
+def peak_security_step(snapshots: list[dict[str, Any]]) -> int:
+    """Выбрать индекс самого срочного снимка для иллюстрации после прогона.
+
+    При равной срочности предпочтителен шаг с событием, затем более ранний.
+    """
+    if not snapshots:
+        raise ValueError("Для выбора шага нужен хотя бы один снимок")
+    ranks = {stage: rank for rank, stage in enumerate(STAGE_LEVELS)}
+    return max(range(len(snapshots)), key=lambda i: (
+        ranks.get(_response_stage(snapshots[i]), -1),
+        bool(snapshots[i].get("attacks", {}).get("events")), -i,
+    ))
+
+
 def build_security_dashboard(snapshots: list[dict[str, Any]], step_index: int) -> dict[str, Any]:
     """Подготовить тревоги до выбранного индекса включительно.
 
@@ -137,18 +151,23 @@ def build_security_dashboard(snapshots: list[dict[str, Any]], step_index: int) -
         },
         "history_count": sum(alarm["phase"] == "history" for alarm in alarms),
         "recommendation": recommendation,
+        "severity_available": _response_stage(current) in STAGE_LEVELS,
         "severity": severity, "severity_label": LEVEL_LABELS[severity],
         "severity_color": LEVEL_COLORS[severity], "severity_scope": "network",
         "level_labels": dict(LEVEL_LABELS), "level_colors": dict(LEVEL_COLORS),
     }
 
 
-def _severity(snapshot: dict[str, Any]) -> str:
+def _response_stage(snapshot: dict[str, Any]) -> str | None:
     arbitrator = snapshot.get("arbitrator", {})
     stage = arbitrator.get("recommendation", {}).get("response_stage")
     if stage is None:
         stage = arbitrator.get("trigger_card", {}).get("response_stage")
-    return STAGE_LEVELS.get(stage, "info")
+    return stage
+
+
+def _severity(snapshot: dict[str, Any]) -> str:
+    return STAGE_LEVELS.get(_response_stage(snapshot), "info")
 
 
 def _sensor_key(target: str, kind: str) -> str:

@@ -22,6 +22,8 @@ EDGE_METRICS = (
     "file_drop_fraction",
 )
 EDGE_UNITS = ("Mbit/s", "ms", "ms", "ratio", "ratio", "ratio", "Mbit/s", "ratio", "ratio")
+OFFERED_LINK_RATE_ORIGIN = "offered_wire_load_on_route_before_end_to_end_losses"
+LINK_LOAD_RATIO_ORIGIN = "offered_wire_rate_divided_by_link_capacity"
 ATTACK_PROFILES = {"normal": 0, "dos": 1, "ddos": 2, "syn_flood": 3,
                    "brute_force": 4, "power_attack": 5, "mixed": 6,
                    "dns_flood": 7, "application_flood": 8,
@@ -68,7 +70,8 @@ def network_runtime_metrics(model, flows: list[dict[str, Any]], events=(), *, de
     Сквозные потери принадлежат одной учётной точке у абонента, у атак —
     получателю. Физическое место потери не наблюдается. Нагрузка, память
     и очереди — оценки модели, а не данные оборудования.
-    speed_mbps означает фактическую скорость потока, capacity_mbps — предел.
+    speed_mbps хранит предложенную нагрузку линии в Мбит/с до учёта потерь.
+    При нагрузке 15 Мбит/с и ёмкости 10 Мбит/с utilization_ratio равен 1,5.
     file_drop_fraction относится к пакетам передачи файлов, не числу файлов.
     """
     node_flows, edge_flows = defaultdict(list), defaultdict(list)
@@ -139,26 +142,28 @@ def network_runtime_metrics(model, flows: list[dict[str, Any]], events=(), *, de
                       "queue_capacity_packets": int(declared.get("capacity_packets", 128))})
     edges = []
     for source, target, attrs in sorted(model.graph.edges(data=True)):
-        carried = edge_flows[tuple(sorted((source, target)))]
+        routed_flows = edge_flows[tuple(sorted((source, target)))]
         accounted = edge_losses[tuple(sorted((source, target)))]
-        packets = sum(int(f["packet_count"]) for f in carried)
+        packets = sum(int(f["packet_count"]) for f in routed_flows)
         drops = sum(int(f.get("observed_dropped_packets", 0)) for f in accounted)
-        speed = sum(int(f["wire_bytes"]) * 8.0 / max(float(f["interval_seconds"]), 1e-9) / 1e6 for f in carried)
+        offered_rate_mbps = sum(
+            int(f["wire_bytes"]) * 8.0 / max(float(f["interval_seconds"]), 1e-9) / 1e6 for f in routed_flows
+        )
         capacity = float(attrs.get("capacity_mbps", 0.0))
-        files = [f for f in carried if f.get("traffic_kind") == "ftp"]
+        files = [f for f in routed_flows if f.get("traffic_kind") == "ftp"]
         file_packets = sum(int(f["packet_count"]) for f in files)
         file_drops = sum(int(f.get("observed_dropped_packets", 0)) for f in accounted if f.get("traffic_kind") == "ftp")
         # В штатном рукопожатии один SYN-ACK из трёх пакетов.
-        syn_ack = sum(int(f.get("handshake_packets", 0)) // 3 for f in carried)
+        syn_ack = sum(int(f.get("handshake_packets", 0)) // 3 for f in routed_flows)
         loss = max(_tensor_value(attrs, "loss_probability"), drops / max(packets, 1))
         reliability = float(attrs.get("reliability_ratio", 1.0 - loss))
         values = (capacity, float(attrs.get("latency_ms", 0.0)), float(attrs.get("jitter_ms", 0.0)),
                   loss,
-                  max(0.0, min(1.0, reliability)), speed / max(capacity, 1e-9), speed,
+                  max(0.0, min(1.0, reliability)), offered_rate_mbps / max(capacity, 1e-9), offered_rate_mbps,
                   syn_ack / max(packets, 1), file_drops / max(file_packets, 1))
         edges.append({"source": source, "target": target, "metrics": dict(zip(EDGE_METRICS, values)),
                       "packet_count": packets, "observed_flow_drops": drops,
-                      "exposed_end_to_end_flow_drops": sum(int(f.get("observed_dropped_packets", 0)) for f in carried),
+                      "exposed_end_to_end_flow_drops": sum(int(f.get("observed_dropped_packets", 0)) for f in routed_flows),
                       "jitter_origin": "configured" if "jitter_ms" in attrs else "not_configured",
                       "reliability_origin": "configured" if "reliability_ratio" in attrs else "observed_flow_survival_proxy",
                       "loss_origin": "configured_and_single_endpoint_accounting_proxy_not_physical_loss_location",
@@ -167,6 +172,7 @@ def network_runtime_metrics(model, flows: list[dict[str, Any]], events=(), *, de
             "loss_accounting_semantics": "single_endpoint_proxy_not_physical_loss_localization",
             "attack_arrival_semantics": "positive_competing_packet_load_not_negative_cancellation",
             "file_drop_semantics": "file_transfer_packet_loss_not_complete_file_count",
+            "edge_metric_semantics": {"speed_mbps": OFFERED_LINK_RATE_ORIGIN, "utilization_ratio": LINK_LOAD_RATIO_ORIGIN},
             "vertex_metric_names": list(VERTEX_METRICS), "vertex_units": list(VERTEX_UNITS),
             "edge_metric_names": list(EDGE_METRICS), "edge_units": list(EDGE_UNITS),
             "attack_profiles": ATTACK_PROFILES, "nodes": nodes, "edges": edges}

@@ -7,6 +7,7 @@ import networkx as nx
 import pytest
 
 from src.gnet9.gelenbe import gelenbe_queue
+from src.gnet9.packet_simulator import _traffic_summary
 from src.gnet9.runtime_metrics import EDGE_METRICS, VERTEX_METRICS, network_runtime_metrics
 from src.gnet9.transport_queue import apply_transport_queues
 
@@ -111,6 +112,30 @@ def test_attack_arrivals_remain_positive_competing_load_in_both_export_formats()
     index = compact["node_ids"].index("router")
     assert compact["node_attack_arrival_rates_pps"][index] == 5
     assert sum(compact["edge_observed_flow_drops"]) == 4
+
+
+def test_link_load_above_capacity_remains_offered_in_both_exports():
+    model = _model()
+    flow = _flow(wire_bytes=3_750_000, packet_count=2500, observed_dropped_packets=1250,
+                 observed_retransmissions=0, application="ftp")
+    # За 2 с предложено 30 Мбит. Половина пакетов потеряна на маршруте.
+    summary = _traffic_summary([flow], model)
+    assert summary["delivered_rate_mbps"] == 7.5
+    assert len(summary["observed_links"]) == 2
+    for row in summary["observed_links"]:
+        assert (row["rate_mbps"], row["capacity_mbps"], row["utilization_percent"]) == (15, 10, 150)
+    detailed = network_runtime_metrics(model, [flow], detail="flows")
+    compact = network_runtime_metrics(model, [flow])
+    assert len(detailed["edges"]) == len(compact["edge_vectors"]) == 2
+    for i, edge in enumerate(detailed["edges"]):
+        values = dict(zip(compact["edge_metric_names"], compact["edge_vectors"][i]))
+        assert values == edge["metrics"]
+        assert values["speed_mbps"] == 15
+        assert values["utilization_ratio"] == 1.5
+    for state in (detailed, compact):
+        assert "offered" in state["edge_metric_semantics"]["speed_mbps"]
+        assert "offered" in state["edge_metric_semantics"]["utilization_ratio"]
+        assert state["edge_metric_semantics"]["speed_mbps"] == summary["observed_link_rate_semantics"]
 
 
 def test_transport_attack_delay_is_credited_once_across_queue_and_recovery():

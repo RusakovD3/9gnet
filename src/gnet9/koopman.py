@@ -1675,11 +1675,16 @@ def _recommendation(
     lyapunov_remap_pressure: float,
 ) -> dict[str, Any]:
     """Описать человеку проверку и возможные меры без исполнения в модели."""
-    steps = ["Проверьте показатели и журналы наблюдаемого узла; сопоставьте соседние отсчёты."]
+    steps = []
+    if warning_confirmed or attack_state.get("precursors"):
+        steps.append("Проверьте показатели и журналы наблюдаемого узла. Сопоставьте соседние отсчёты.")
+    primary_index = 0
     if warning_confirmed:
-        steps.append("Оцените влияние на услуги: сначала золотой, затем серебряный и бронзовый классы.")
+        class_review = "Оцените влияние на услуги: сначала золотой, затем серебряный и бронзовый классы."
+        steps.append(class_review)
+        specific_start = len(steps)
         if any(kind in predicted_attack.split("+") for kind in ("dos", "ddos")):
-            steps.append("Проверьте источники и рост входящего трафика; подготовьте согласованное ограничение вредоносного потока.")
+            steps.append("Сверьте рост входящего трафика с журналами узла и подтвердите источник до решения об ограничении.")
         if "ddos" in predicted_attack:
             steps.append("Согласуйте с оператором вышестоящей сети очистку атакующего трафика.")
         if "syn_flood" in predicted_attack:
@@ -1704,14 +1709,18 @@ def _recommendation(
         }.items():
             if kind in predicted_attack.split("+"):
                 steps.append(instruction)
+        primary_index = specific_start if len(steps) > specific_start else specific_start - 1
         steps.append("Подтвердите источник по журналам до решения об ограничении доступа; решение и выполнение остаются за человеком.")
     if lyapunov_remap_pressure > 0.0:
         steps.append("Проверьте рост отклонения состояния по Ляпунову на следующих наблюдениях.")
+    if not steps:
+        steps.append("Продолжайте штатное наблюдение за качеством услуг.")
     return {
         "decision": "review_threat" if warning_confirmed else "observe",
         "decision_pressure": round(max(risk, lyapunov_remap_pressure), 6),
         "execution_mode": "human_only",
         "requires_human_action": warning_confirmed,
+        "primary_action_ru": steps[primary_index],
         "steps_ru": steps,
         "sla_priority_order": ["gold", "silver", "bronze"],
         "sla_observation": _sla_restoration_plan(attack_state),

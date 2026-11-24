@@ -79,7 +79,7 @@ def _flow_summary(flows: list[dict[str, Any]]) -> str:
     interval = int(flows[0].get("interval_seconds", 0)) if flows else 0
     megabytes = wire_bytes / 1_000_000
     offered_rate_mbps = wire_bytes * 8.0 / max(interval, 1) / 1_000_000
-    carried_rate_mbps = routed_wire_bytes * 8.0 / max(interval, 1) / 1_000_000
+    routed_offered_mbps = routed_wire_bytes * 8.0 / max(interval, 1) / 1_000_000
     lines = [
         f"Обычные потоки: {legitimate_count}",
         "По одному потоку на абонента",
@@ -87,11 +87,11 @@ def _flow_summary(flows: list[dict[str, Any]]) -> str:
         f"Сформировано пакетов за {interval} с: {packets:,}",
         f"Доставлено пакетов: {delivered_packets:,}",
         f"Предложено: {megabytes:,.1f} МБ · {offered_rate_mbps:,.1f} Мбит/с",
-        f"Передано по маршрутам: {routed_wire_bytes / 1_000_000:,.1f} МБ · {carried_rate_mbps:,.1f} Мбит/с",
+        f"Предложено потоками с маршрутом: {routed_wire_bytes / 1_000_000:,.1f} МБ · {routed_offered_mbps:,.1f} Мбит/с",
         "Приложения:",
     ]
     lines.extend(f"  {FLOW_SHORT_LABELS.get(name, name)}: {count}" for name, count in sorted(apps.items()))
-    lines.extend(["", "Цвет линии — основная услуга.", "Толщина — общий объём на линии."])
+    lines.extend(["", "Цвет линии — основная услуга.", "Толщина — предложенный объём за шаг."])
     return "\n".join(lines)
 
 

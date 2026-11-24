@@ -57,18 +57,24 @@ def test_observed_windows_preserve_gaps_and_ignore_future_schedule():
 def test_capacity_separates_resources_keeps_outliers_and_saved_admission_limit(tmp_path, monkeypatch):
     captured = []
     monkeypatch.setattr(charts, "save_figure", lambda figure, path: captured.append(figure))
-    charts._plot_capacity_bottlenecks(None, _snapshots(), tmp_path / "capacity.png")
+    snapshots = _snapshots()
+    snapshots[2]["traffic"]["network_state"]["edge_vectors"] = [[10, 15]]
+    charts._plot_capacity_bottlenecks(None, snapshots, tmp_path / "capacity.png")
     figure = captured[0]
     try:
         assert len(figure.axes) == 1
-        charts._plot_link_utilization(None, _snapshots(), tmp_path / "links.png")
+        charts._plot_link_utilization(None, snapshots, tmp_path / "links.png")
         charts._plot_resource_utilization(_snapshots(), tmp_path / "resources.png")
         network, servers = captured[1].axes[0], captured[2].axes[0]
-        assert network.get_ylim()[1] >= 100
+        assert figure.axes[0].patches[0].get_width() == 150
+        assert figure.axes[0].get_xlim()[1] >= 150
+        assert "предложенная нагрузка" in figure.axes[0].get_xlabel().lower()
+        assert network.get_ylim()[1] >= 150
         assert servers.get_ylim()[1] > 240
         network_lines = {line.get_label(): np.asarray(line.get_ydata()) for line in network.lines}
         server_lines = {line.get_label(): np.asarray(line.get_ydata()) for line in servers.lines}
-        np.testing.assert_array_equal(network_lines["максимальная нагрузка линии"], [20] * 4)
+        np.testing.assert_array_equal(network_lines["максимальная предложенная нагрузка"], [20, 20, 150, 20])
+        np.testing.assert_array_equal(network_lines["пропускная способность линии"], [100, 100])
         np.testing.assert_array_equal(server_lines["CPU (процессор)"], [240] * 4)
         assert "сохранённый допуск нового маршрута" not in network_lines
         assert not any(999 in values for values in (*network_lines.values(), *server_lines.values()))

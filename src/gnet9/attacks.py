@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from functools import lru_cache
+import hashlib
 import math
 import random
 from typing import Any
@@ -1844,6 +1845,7 @@ def active_attack_events(
         target_criticality = model.graph.nodes[profile.target_id].get("critical_protection", {})
         event = {
             **profile.to_dict(),
+            "scenario_seed": resolved_seed,
             "step_index": step_index,
             "time_seconds": time_seconds,
             "interval_seconds": resolved_step_seconds,
@@ -1900,7 +1902,6 @@ def active_attack_events(
             event["scenario_weight_semantics"] = "realized_event_mass"
             event["kind_weight"] = PREDICTIVE_DEMO_KIND_WEIGHTS[profile.kind.value]
             event["scenario_weight_origin"] = "scenario_assumption"
-            event["scenario_seed"] = resolved_seed
             event["time_scale_semantics"] = "accelerated_demo_not_real_incident_duration"
             if arrival_schedule is not None:
                 # В рабочем состоянии публикуется только уже состоявшийся
@@ -2309,6 +2310,21 @@ def build_current_attack_flows(
     return [flow for event in events for flow in _build_attack_flows(event, identities=identities)]
 
 
+def _sample_packet_drops(expected: float, flow_id: str, event: Mapping[str, Any]) -> int:
+    """Округлить неотрицательное ожидание в пакетах. При 2,25 результат равен 3 с вероятностью ¼."""
+    whole = int(expected)
+    fraction = expected - whole
+    if fraction == 0:
+        return whole
+    # Отдельная выборка для потока, события и шага. Порядок обхода не важен.
+    key = (
+        event.get("scenario_seed", PREDICTIVE_DEMO_DEFAULT_SEED),
+        event["step_index"], event["attack_id"], flow_id,
+    )
+    digest = hashlib.blake2b(repr(key).encode("utf-8"), digest_size=8, person=b"packet-loss").digest()
+    return whole + (int.from_bytes(digest, "big") < fraction * 2**64)
+
+
 def apply_attack_effects(
     model: NetworkModel,
     legitimate_flows: list[dict[str, Any]],
@@ -2346,24 +2362,14 @@ def apply_attack_effects(
                 continue
             intensity = float(event["intensity_ratio"])
             resource_pressure = float(event["target_resource_pressure"])
-            raw_loss_ratio = min(
-                0.95,
-                float(event["legitimate_loss_ratio"]) * intensity * resource_pressure,
-            )
-            loss_ratio = raw_loss_ratio
-            raw_dropped = min(int(flow["packet_count"]), math.ceil(int(flow["packet_count"]) * raw_loss_ratio))
-            raw_already_dropped = int(flow.get("raw_attack_dropped_packets", 0))
-            raw_increment = min(
-                max(0, int(flow["packet_count"]) - raw_already_dropped),
-                raw_dropped,
-            )
+            loss_ratio = float(event["legitimate_loss_ratio"]) * intensity * resource_pressure
+            loss_ratio = max(0.0, min(0.95, loss_ratio))
+            packet_count = int(flow["packet_count"])
             already_dropped = int(flow.get("observed_dropped_packets", 0))
-            dropped = min(
-                max(0, int(flow["packet_count"]) - already_dropped),
-                math.ceil(int(flow["packet_count"]) * loss_ratio),
-            )
+            expected = min(packet_count * loss_ratio, max(0, packet_count - already_dropped))
+            dropped = _sample_packet_drops(expected, flow["flow_id"], event)
             flow["observed_dropped_packets"] = already_dropped + dropped
-            flow["raw_attack_dropped_packets"] = raw_already_dropped + raw_increment
+            flow["raw_attack_dropped_packets"] += dropped
             if flow.get("transport") == "TCP":
                 flow["observed_retransmissions"] = int(flow.get("observed_retransmissions", 0)) + dropped
             latency_penalty_ms = (

@@ -45,7 +45,7 @@ from .hypernetwork import hypernetwork_embedding
 from .l1_d0sl import SLA_GRADE_WEIGHTS, weighted_sla_compliance
 from .packet_simulator import TRAFFIC_APPS, simulate_packet_snapshot
 from .routing import FixedTopologyRoutes
-from .runtime_metrics import compact_runtime_state
+from .runtime_metrics import LINK_LOAD_RATIO_ORIGIN, compact_runtime_state
 from .service_forecast import ServiceSLAForecaster, _score_window, evaluate_service_forecasts, operator_warnings
 from .route_stress import RouteStressMonitor, evaluate_route_stress
 from .tensor_matrix import (
@@ -1102,7 +1102,7 @@ def _apply_observed_tensor_overlay(
             0.0,
             float(row.get("end_to_end_flow_loss_exposure_ratio", 0.0)),
         )
-        set_metric(item, "utilization", utilization, "observed_carried_rate_divided_by_link_capacity")
+        set_metric(item, "utilization", utilization, LINK_LOAD_RATIO_ORIGIN)
         set_metric(
             item,
             "stability_margin",
@@ -1465,19 +1465,31 @@ def _resilience_evaluation(
         for snapshot in snapshots
         if snapshot.get("attacks", {}).get("active")
     ]
-    minimum_sla_compliance = {grade: 1.0 for grade in ("gold", "silver", "bronze")}
+    grades = ("gold", "silver", "bronze")
+    minimum_sla_compliance: dict[str, float] = {}
+    first_gold_disadvantage = None
+    complete_steps = 0
+    gold_steps = 0
     for snapshot in attack_snapshots:
         tiers = snapshot.get("attacks", {}).get("sla_restoration", {}).get("tiers", [])
-        for tier in tiers:
-            grade = str(tier.get("sla_grade", ""))
-            if grade not in minimum_sla_compliance:
-                continue
-            flow_count = max(int(tier.get("flow_count", 0)), 1)
-            compliance = int(tier.get("sla_compliant_flow_count", 0)) / flow_count
-            minimum_sla_compliance[grade] = min(
-                minimum_sla_compliance[grade],
-                compliance,
-            )
+        ratios = {tier["sla_grade"]: tier["sla_compliant_flow_count"] / tier["flow_count"]
+                  for tier in tiers if tier.get("sla_grade") in grades
+                  and tier.get("flow_count", 0) > 0 and tier.get("sla_compliant_flow_count") is not None}
+        for grade, ratio in ratios.items():
+            minimum_sla_compliance[grade] = min(minimum_sla_compliance.get(grade, ratio), ratio)
+        complete_steps += len(ratios) == len(grades)
+        if "gold" in ratios:
+            gold_steps += 1
+            if first_gold_disadvantage is None and ratios["gold"] < max(ratios.values()):
+                first_gold_disadvantage = {"step_index": snapshot["step_index"],
+                                           "time_seconds": snapshot["time_seconds"],
+                                           "compliance_ratio_by_grade": ratios}
+
+    gold_never_worse = None
+    if first_gold_disadvantage is not None:
+        gold_never_worse = False
+    elif attack_snapshots and complete_steps == len(attack_snapshots):
+        gold_never_worse = True
 
     episodes: list[list[dict[str, Any]]] = []
     for snapshot in attack_snapshots:
@@ -1566,6 +1578,8 @@ def _resilience_evaluation(
     )
     if not attack_snapshots:
         status = "NOT_APPLICABLE_NO_ATTACKS"
+    elif final_recovered and gold_steps < len(attack_snapshots):
+        status = "RECOVERED_GOLD_CONTINUITY_UNASSESSED"
     elif final_recovered and minimum_sla_compliance["gold"] >= 0.95:
         status = "RESILIENT_GOLD_CONTINUITY_AND_RECOVERY"
     elif final_recovered:
@@ -1579,15 +1593,13 @@ def _resilience_evaluation(
         "attack_episode_count": len(episodes),
         "minimum_legitimate_delivery_ratio": round(minimum_delivery, 6),
         "minimum_sla_compliance_ratio": {
-            grade: round(value, 6)
-            for grade, value in minimum_sla_compliance.items()
+            grade: round(minimum_sla_compliance[grade], 6) if grade in minimum_sla_compliance else None
+            for grade in grades
         },
         "gold_continuity_target_ratio": 0.95,
         "gold_continuity_target_origin": "explicit_showcase_engineering_assumption",
-        "gold_never_worse_than_silver_or_bronze": (
-            minimum_sla_compliance["gold"] >= minimum_sla_compliance["silver"]
-            and minimum_sla_compliance["gold"] >= minimum_sla_compliance["bronze"]
-        ),
+        "gold_never_worse_than_silver_or_bronze": gold_never_worse,
+        "first_gold_disadvantage": first_gold_disadvantage,
         "final_state_recovered": final_recovered,
         "sampling_interval_seconds": step_seconds,
         "episodes": recovery_records,

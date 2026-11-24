@@ -8,6 +8,7 @@ import pytest
 
 from main import _dynamics_export_view, export_step_log, export_stationary_dynamics
 from src.gnet9.decision_dialogue import build_algorithm_dialogue
+from src.gnet9.dynamics import _resilience_evaluation
 from src.gnet9.run_report import build_run_summary, export_run_summary
 
 
@@ -17,6 +18,45 @@ def _snapshot(step, accepted, compliant=9, total=10):
             "koopman": {"nominal_training": {"transition_accepted": accepted}},
             "attacks": {"sla_restoration": {"tiers": [
                 {"sla_grade": "gold", "flow_count": total, "sla_compliant_flow_count": compliant}]}}}
+
+
+def _attack_step(step, gold, silver, bronze):
+    tiers = [{"sla_grade": grade, "flow_count": 100, "sla_compliant_flow_count": value}
+             for grade, value in zip(("gold", "silver", "bronze"), (gold, silver, bronze))
+             if value is not None]
+    return {"step_index": step, "time_seconds": step * 2,
+            "attacks": {"active": True, "sla_restoration": {"tiers": tiers}}}
+
+
+def test_gold_priority_compares_concurrent_classes_and_records_first_exception():
+    steps = [_attack_step(1, 90, 100, 85), _attack_step(2, 100, 80, 80)]
+    result = _resilience_evaluation(steps, step_seconds=2)
+    assert result["gold_never_worse_than_silver_or_bronze"] is False
+    assert result["first_gold_disadvantage"] == {
+        "step_index": 1, "time_seconds": 2, "compliance_ratio_by_grade": {
+            "gold": .9, "silver": 1., "bronze": .85}}
+
+
+@pytest.mark.parametrize(("levels", "expected"), [
+    ([], None), ([(100, 100, 100)], True), ([(90, None, 80)], None),
+    ([(90, None, 100)], False), ([(100, 100, 100), (90, None, 80)], None),
+])
+def test_gold_priority_requires_evidence(levels, expected):
+    steps = [_attack_step(i, *values) for i, values in enumerate(levels, 1)]
+    assert _resilience_evaluation(steps, step_seconds=2)["gold_never_worse_than_silver_or_bronze"] is expected
+
+
+def test_brief_report_highlights_urgent_step_and_preserves_full_history(tmp_path):
+    steps = [_snapshot(i, False) for i in (1, 2, 3)]
+    for step, stage in zip(steps, ("prepare", "emergency", "emergency")):
+        step["arbitrator"] = {"recommendation": {"response_stage": stage, "requires_human_action": True,
+            "target_ids": ["A6"], "steps_ru": ["Проверьте питание узла."],
+            "forecast_window_start_seconds": 8, "forecast_window_end_seconds": 10}}
+    report = export_run_summary({"snapshots": steps}, tmp_path)
+    text = (tmp_path / "run_summary.md").read_text(encoding="utf8")
+    assert text.count("Проверьте питание узла.") == 1
+    assert "Шаг 2" in text and "срочная защита" in text
+    assert len(report["recommendations"]) == 3
 
 
 def test_planned_training_is_distinct_from_accepted_and_sla_uses_denominator(tmp_path):

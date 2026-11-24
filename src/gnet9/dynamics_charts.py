@@ -471,7 +471,7 @@ def _plot_capacity_bottlenecks(model, snapshots, path: Path) -> None:
     if not top:
         ax.text(.5, .5, "Нет данных о нагрузке линий", transform=ax.transAxes, color=MUTED, ha="center")
     _style_axes(ax, "Восемь линий с наибольшей нагрузкой", "", legend=False)
-    ax.set_xlabel("% пропускной способности линии", color=MUTED, fontsize=9)
+    ax.set_xlabel("Предложенная нагрузка, % пропускной способности линии", color=MUTED, fontsize=9)
     ax.set_xlim(0, max([100, *(row["utilization_percent"] * 1.3 for row in top)]))
     ax.grid(False, axis="y")
     ax.grid(axis="x", color=MUTED, linewidth=.5, alpha=.18)
@@ -482,9 +482,10 @@ def _plot_link_utilization(model, snapshots, path):
     fig, ax = plt.subplots(figsize=(11.5, 4.7))
     steps = _steps(snapshots)
     peak_series = [_snapshot_peak_load(model, snapshot) for snapshot in snapshots]
-    _plot_line(ax, steps, peak_series, "максимальная нагрузка линии", BLUE)
+    _plot_line(ax, steps, peak_series, "максимальная предложенная нагрузка", BLUE)
+    ax.axhline(100, color=MUTED, linestyle="--", linewidth=1.1, label="пропускная способность линии")
     _step_axis(ax, steps)
-    _style_axes(ax, "Максимальная нагрузка линий на каждом шаге", "% пропускной способности",
+    _style_axes(ax, "Максимальная предложенная нагрузка линий на каждом шаге", "% пропускной способности",
                 _positive_limits(peak_series, minimum=100))
     _save(fig, path, bottom=.30, left=.095)
 
@@ -638,15 +639,15 @@ def _attack_windows(dynamics: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _snapshot_link_loads(model, snapshot):
-    """Скорости линий в Мбит/с из сохранённых показателей или полных потоков."""
+    """Предложенная нагрузка линий в Мбит/с из снимка или потоков."""
     state = snapshot.get("traffic", {}).get("network_state", {})
     if "edge_vectors" in state:
         names = state.get("edge_metric_names", [])
         if "speed_mbps" in names and "capacity_mbps" in names:
-            speed, capacity = names.index("speed_mbps"), names.index("capacity_mbps")
-            return [(tuple(edge), values[speed], values[capacity])
+            offered, capacity = names.index("speed_mbps"), names.index("capacity_mbps")
+            return [(tuple(edge), values[offered], values[capacity])
                     for edge, values in zip(state.get("edge_ids", []), state["edge_vectors"])
-                    if len(values) > max(speed, capacity)]
+                    if len(values) > max(offered, capacity)]
     if "edges" in state:
         return [((e["source"], e["target"]), e["metrics"]["speed_mbps"], e["metrics"]["capacity_mbps"])
                 for e in state["edges"] if "speed_mbps" in e.get("metrics", {}) and "capacity_mbps" in e.get("metrics", {})]

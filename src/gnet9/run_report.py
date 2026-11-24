@@ -8,8 +8,9 @@ import platform
 from importlib import metadata
 from pathlib import Path
 
-from .constants import ATTACK_KIND_DISPLAY_NAMES, DYNAMICS_CHART_FILES
+from .constants import ATTACK_KIND_DISPLAY_NAMES, DYNAMICS_CHART_FILES, RESPONSE_STAGE_DISPLAY_NAMES
 from .flow_details import TRAFFIC_LABELS
+from .security_dashboard import peak_security_step
 
 
 def _number(value):
@@ -71,6 +72,8 @@ def build_run_summary(dynamics, *, include_charts=True):
     finite_times = [time for snapshot in snapshots
                     if (time := _number(snapshot.get("time_seconds"))) is not None]
     observed_attacks = [snapshot for snapshot in snapshots if snapshot.get("attacks", {}).get("events")]
+    action_snapshots = [s for s in snapshots
+                        if s.get("arbitrator", {}).get("recommendation", {}).get("requires_human_action")]
     return {
         "schema_version": 2,
         "scope": "offline_simulation_not_independent_external_validation",
@@ -99,15 +102,16 @@ def build_run_summary(dynamics, *, include_charts=True):
             "weighted_time_mean_ratio": _number(dynamics.get("sla_resilience", {}).get("time_mean")),
             "weighted_minimum_ratio": _number(dynamics.get("sla_resilience", {}).get("minimum")),
             "by_class": _sla_by_class(snapshots),
+            "first_gold_disadvantage": dynamics.get("resilience_evaluation", {}).get("first_gold_disadvantage"),
             "worst_service": dynamics.get("service_sla_evaluation", {}).get("worst_service"),
             "accounting": "all_legitimate_flows_on_fixed_routes",
         },
         "recommendations": [
             {"step_index": snapshot.get("step_index"), "time_seconds": snapshot.get("time_seconds"),
              **snapshot["arbitrator"]["recommendation"]}
-            for snapshot in snapshots
-            if snapshot.get("arbitrator", {}).get("recommendation", {}).get("requires_human_action")
+            for snapshot in action_snapshots
         ],
+        "highlighted_recommendation_index": peak_security_step(action_snapshots) if action_snapshots else None,
         "service_sla_forecast": {
             k: v for k, v in dynamics.get("service_sla_evaluation", {}).items()
             if k in {"maximum_horizon_seconds", "methods", "by_horizon_seconds", "by_service", "cases",
@@ -130,7 +134,9 @@ def build_run_summary(dynamics, *, include_charts=True):
         "files": {"step_log": "step_log.csv", "complete_result": "network_dynamics.json",
                   "decisions": "algorithm_dialogue.md",
                   "detection_rules": "detection_rules/manifest.json",
-                  **({key: f"charts/{name}" for key, name in DYNAMICS_CHART_FILES.items()} if include_charts else {})},
+                  **({key: f"charts/{name}" for key, name in DYNAMICS_CHART_FILES.items()} if include_charts else {}),
+                  **({"security_dashboard": "charts/security_dashboard.png"}
+                     if include_charts and any("traffic" in s for s in snapshots) else {})},
     }
 
 
@@ -244,10 +250,9 @@ def write_run_summary(summary, directory: Path):
     lines = ["# Итог прогона GNet9", "",
         f"Сценарий: `{summary['config'].get('attack_scenario', 'не указан')}`. "
         f"Период наблюдений: {_display(summary['observation']['first_time_seconds'])}–"
-        f"{_display(summary['observation']['last_time_seconds'])} с.", "",
-        f"В обучение принято переходов: {_display(training['accepted_transitions_total'])}; "
-        f"из них до первых предвестников — {_display(training['accepted_transitions_before_first_precursor'])}. "
-        f"Начальный участок по плану: {_display(training['planned_initial_clean_steps'])} шагов.", ""]
+        f"{_display(summary['observation']['last_time_seconds'])} с.", ""]
+    if "security_dashboard" in summary["files"]:
+        lines += ["[Открыть обзор ключевого шага](charts/security_dashboard.png)", ""]
     if prediction.get("attack_onset_count"):
         lines.append(f"Предупреждены {_display(prediction['predicted_before_onset_count'])} "
             f"из {_display(prediction['attack_onset_count'])} начал атак; "
@@ -265,24 +270,44 @@ def write_run_summary(summary, directory: Path):
     if prediction.get("right_censored_warning_count"):
         lines.append(f"Непроверенные предупреждения с окном за концом прогона — "
                      f"{prediction['right_censored_warning_count']}.")
+    at_issue_horizon = summary["service_sla_forecast"].get("operator_alert_evaluation", {}).get("2")
+    if at_issue_horizon:
+        lines += ["", "**Предупреждения о нарушении SLA (требований к качеству услуг) за 2 с.** "
+                  f"Подтверждено {at_issue_horizon['hits']} из {at_issue_horizon['onsets']} начал нарушений "
+                  f"по потокам. Ложных предупреждений — {at_issue_horizon['false_alarms']}, "
+                  f"с незавершённым окном проверки — {at_issue_horizon['censored']}."]
     lines += ["", f"Средняя взвешенная доля выполнения SLA: {_display(summary['sla']['weighted_time_mean_ratio'], percent=True)}.",
-              "", "| Класс | Худшее выполнение SLA | Шаг | Выполнили / учтены |", "|---|---:|---:|---:|"]
+              "", "| Класс | Худшее выполнение SLA | Шаг | Выполнили / учтены | Охват требований¹ |",
+              "|---|---:|---:|---:|---:|"]
     for grade, label in (("gold", "Золотой"), ("silver", "Серебряный"), ("bronze", "Бронзовый")):
         row = summary["sla"]["by_class"][grade]
         lines.append(f"| {label} | {_display(row['minimum_compliance_ratio'], percent=True)} "
             f"| {_display(row['worst_step'])} | {_display(row['compliant_flows_at_worst_step'])} / "
-            f"{_display(row['accounted_flows_at_worst_step'])} |")
-    lines += _service_forecast_text(summary)
-    lines += ["", "## Рекомендации человеку", "",
-              "Структура сети и маршруты фиксированы. Меры защиты программа не исполняет.", ""]
-    for item in summary["recommendations"]:
-        lines.append(f"### Шаг {item['step_index']} · t = {item['time_seconds']} с")
-        lines.append(f"Наблюдаемые цели: {', '.join(item['target_ids']) or 'не определены'}; "
-                     f"окно прогноза: {item['forecast_window_start_seconds']}–{item['forecast_window_end_seconds']} с.")
-        lines.extend(f"- {step}" for step in item["steps_ru"])
-        lines.append("")
-    if not summary["recommendations"]:
+            f"{_display(row['accounted_flows_at_worst_step'])} | "
+            f"{_display(row['assessment_coverage_ratio_at_worst_step'], percent=True)} |")
+    lines += ["", "¹ Средняя по потокам доля обязательных требований, которые удалось проверить на указанном шаге."]
+    exception = summary["sla"].get("first_gold_disadvantage")
+    if exception:
+        lines += ["", f"Впервые золотой класс уступил другому классу во время воздействия "
+                  f"на шаге {exception['step_index']} ({exception['time_seconds']} с)."]
+    lines += ["", "## Решение для оператора", ""]
+    if summary["recommendations"]:
+        item = summary["recommendations"][summary.get("highlighted_recommendation_index", 0)]
+        stage = RESPONSE_STAGE_DISPLAY_NAMES.get(item.get("response_stage"), "проверка")
+        targets = ", ".join(item.get("target_ids", ())) or "не определены"
+        lines += [f"**Шаг {item['step_index']} · {item['time_seconds']} с · {stage}.** "
+                  f"Наблюдаемые цели — {targets}.", ""]
+        primary_action = item.get("primary_action_ru") or next(iter(item.get("steps_ru", ())), None)
+        if primary_action:
+            lines.append(primary_action)
+        lines += ["", "Полный план действий для каждого шага доступен в [журнале](step_log.csv)."]
+    else:
         lines.append("Сигналов, требующих защитных действий человека, не было.")
+    lines += ["", "<details>", "<summary>Проверка прогноза, обучение и наблюдённые события</summary>", "",
+              f"В обучение принято переходов: {_display(training['accepted_transitions_total'])}; "
+              f"до первых предвестников — {_display(training['accepted_transitions_before_first_precursor'])}. "
+              f"Начальный участок по плану: {_display(training['planned_initial_clean_steps'])} шагов."]
+    lines += _service_forecast_text(summary)
     lines += ["", "## Наблюдённые события", ""]
     for event in summary["events"]:
         label = event["attack_label_ru"] or ATTACK_KIND_DISPLAY_NAMES.get(event["kind"], event["kind"])
@@ -290,6 +315,7 @@ def write_run_summary(summary, directory: Path):
             f"цель `{event['target_id']}`, шаги {_display(event['first_step'])}–{_display(event['last_step'])}.")
     if not summary["events"]:
         lines.append("События не наблюдались.")
+    lines += ["", "</details>"]
     lines += ["", "## Как читать результат", ""]
     lines += [f"- {text}" for text in summary["interpretation_ru"]]
     lines += ["", "Подробности в [журнале шагов](step_log.csv), [расчётах JSON](network_dynamics.json) "
@@ -300,7 +326,8 @@ def write_run_summary(summary, directory: Path):
                   "[Хронология](charts/event_timeline.png) · [Арбитр](charts/arbitrator_signals.png)", "",
                   "[Обычный трафик](charts/native_traffic.png) · [Трафик атак](charts/attack_traffic.png) · "
                   "[SLA сети](charts/sla_by_class.png) · [SLA атакованных узлов](charts/attacked_node_sla.png)", "",
-                  "[Пики линий](charts/capacity_bottlenecks.png) · [Нагрузка линий](charts/link_utilization.png) · "
+                  "[Линии с наибольшей предложенной нагрузкой](charts/capacity_bottlenecks.png) · "
+                  "[Предложенная нагрузка по шагам](charts/link_utilization.png) · "
                   "[Ресурсы](charts/resource_utilization.png).", ""]
     text_path.write_text("\n".join(lines), encoding="utf-8")
     return summary
