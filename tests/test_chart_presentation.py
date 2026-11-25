@@ -47,7 +47,6 @@ def test_observed_windows_preserve_gaps_and_ignore_future_schedule():
     dynamics = {"config": {"step_seconds": 2}, "snapshots": snapshots,
                 "training_summary": {"clean_training_steps": 17}}
     assert charts._accepted_transition_count(dynamics) == 1
-    assert charts._training_windows(dynamics) == [(0, 2)]
     windows = charts.RunTimeAxis.from_result(dynamics).windows
     assert [(w["start"], w["end"]) for w in windows] == [(0, 2), (6, 8)]
     # Плановый размер чистого участка не выдаётся за принятые переходы.
@@ -77,7 +76,7 @@ def test_capacity_separates_resources_keeps_outliers_and_saved_admission_limit(t
         server_lines = {line.get_label(): np.asarray(line.get_ydata()) for line in servers.lines}
         np.testing.assert_array_equal(network_lines["максимальная предложенная нагрузка"], [20, 20, 150, 20])
         np.testing.assert_array_equal(network_lines["пропускная способность линии"], [100, 100])
-        np.testing.assert_array_equal(server_lines["CPU (процессор)"], [240] * 4)
+        np.testing.assert_array_equal(server_lines["Максимум CPU по всем узлам"], [240] * 4)
         assert "сохранённый допуск нового маршрута" not in network_lines
         assert not any(999 in values for values in (*network_lines.values(), *server_lines.values()))
     finally:
@@ -96,36 +95,38 @@ def test_capacity_shows_target_work_when_packet_queue_cpu_is_low(tmp_path, monke
     figure = captured[0]
     try:
         lines = {line.get_label(): line.get_ydata() for line in figure.axes[0].lines}
-        np.testing.assert_array_equal(lines["CPU (процессор)"], [22] * 4)
+        np.testing.assert_array_equal(lines["Максимум CPU по всем узлам"], [22] * 4)
         np.testing.assert_array_equal(lines["ресурс атакованной цели"], [0, 75, 100, 0])
     finally:
         plt.close(figure)
 
 
-def test_timeline_labels_actual_training_and_prediction_issue_time(tmp_path, monkeypatch):
+def test_timeline_contains_only_training_native_traffic_and_observed_attacks(tmp_path, monkeypatch):
     captured = []
-    monkeypatch.setattr(charts, "save_figure", lambda figure, path, **kwargs: captured.append(figure))
-    dynamics = {"snapshots": _snapshots(), "config": {"step_count": 99, "step_seconds": 2},
-                "training_summary": {"clean_training_steps": 17}}
-    dynamics["snapshots"][2]["koopman"]["kalman_filter"] = {
-        "local_observation": {"window": {"global_reset_reasons": ["timer"]}},
-    }
-    dynamics["snapshots"][3]["koopman"]["kalman_filter"] = {
-        "local_observation": {"window": {"global_reset_reasons": []},
-                              "vertices": {"covariance_reset_entity_count": 1}},
-    }
+    monkeypatch.setattr(charts, "save_figure", lambda fig, *args, **kwargs: captured.append(fig))
+    snapshots = _snapshots()
+    event = {"attack_id": "one", "attack_label_ru": "DoS", "target_id": "A"}
+    for i in (0, 2):
+        snapshots[i]["traffic"]["summary"] = {"normal_arrival_rate_pps": 100}
+    snapshots[1]["traffic"]["summary"] = {"normal_arrival_rate_pps": 0, "attack_arrival_rate_pps": 100}
+    snapshots[2]["attacks"]["events"] = [event]
+    snapshots[3]["attacks"]["events"] = [dict(event, is_recovery_effect=True)]
+    snapshots[2]["koopman"]["kalman_filter"] = {
+        "local_observation": {"window": {"global_reset_reasons": ["timer"]}}}
+    dynamics = {"snapshots": snapshots, "resilience_evaluation": {"episodes": [{"recovered_step": 3}]}}
     charts._plot_timeline(dynamics, charts.RunTimeAxis.from_result(dynamics), tmp_path / "timeline.png")
-    figure = captured[0]
+    fig, = captured
     try:
-        text = " ".join(item.get_text() for item in figure.texts)
-        assert "Принято переходов в обучение: 1" in text
-        assert "момент выдачи прогноза" in text
-        assert len(figure.axes) == 1
-        assert "Сброс Калмана" in {tick.get_text() for tick in figure.axes[0].get_yticklabels()}
-        assert len(figure.axes[0].collections) == 3
-        assert len(figure.axes[0].collections[-1].get_paths()) == 2
+        ax, = fig.axes
+        assert [label.get_text() for label in ax.get_yticklabels()] == [
+            "Обучение Купмана", "Обычный трафик", "Атака · DoS · A"]
+        assert [t.get_text() for t in fig.legends[0].get_texts()] == ["Начало атаки", "Конец атаки"]
+        assert len(ax.collections) == 5
+        intervals = [[(p.vertices[:, 0].min(), p.vertices[:, 0].max()) for p in row.get_paths()]
+                     for row in ax.collections[:3]]
+        assert intervals == [[(0, 2)], [(0, 2), (4, 6)], [(4, 6)]]
     finally:
-        plt.close(figure)
+        plt.close(fig)
 
 
 def test_png_exports_render_for_empty_and_recorded_data(tmp_path):
@@ -202,6 +203,60 @@ def test_event_rates_and_target_sla_follow_observed_flows():
     assert np.isnan(expected[0])
 
 
+def test_timeline_merges_adjacent_samples_preserving_gaps(tmp_path, monkeypatch):
+    captured = []
+    monkeypatch.setattr(charts, "save_figure", lambda fig, *args, **kwargs: captured.append(fig))
+    snapshots = [{"time_seconds": t, "traffic": {"summary": {"legitimate_packet_count": 1}},
+                  "training": {"operator_updated": t > 0}} for t in (0, 2, 4, 10)]
+    dynamics = {"snapshots": snapshots, "config": {"step_seconds": 2}}
+    charts._plot_timeline(dynamics, charts.RunTimeAxis.from_result(dynamics), tmp_path / "timeline.png")
+    fig, = captured
+    try:
+        training, traffic = fig.axes[0].collections
+        assert [(p.vertices[:, 0].min(), p.vertices[:, 0].max()) for p in training.get_paths()] == [(0, 4)]
+        assert [(p.vertices[:, 0].min(), p.vertices[:, 0].max()) for p in traffic.get_paths()] == [(0, 6), (10, 12)]
+    finally:
+        plt.close(fig)
+
+
+def test_cpu_peak_rows_follow_winner_changes_and_ties(tmp_path, monkeypatch):
+    states = [{"nodes": [{"id": "A", "metrics": {"cpu_load_percent": 70}},
+                         {"id": "B", "metrics": {"cpu_load_percent": 30}}]},
+              {"vertex_metric_names": ["cpu_load_percent"], "node_ids": ["B", "A"],
+               "vertex_vectors": [[60], [60]]},
+              {"nodes": [{"id": "B", "metrics": {"cpu_load_percent": 80}}]},
+              {"node_metric_maxima": {"cpu_load_percent": 75}}]
+    snapshots = [{"traffic": {"network_state": state}, "time_seconds": i * 5}
+                 for i, state in enumerate(states)]
+    captured = []
+    monkeypatch.setattr(charts, "save_figure", lambda fig, *args, **kwargs: captured.append(fig))
+    run = charts.RunTimeAxis.from_result({"snapshots": snapshots})
+    charts._plot_resource_utilization(snapshots, run, tmp_path / "cpu.png")
+    fig, = captured
+    try:
+        main, lanes = fig.axes
+        np.testing.assert_array_equal(main.lines[0].get_ydata(), [70, 60, 80, 75])
+        assert [tick.get_text() for tick in lanes.get_yticklabels()] == ["A", "B", "Узел не указан"]
+        assert [[path.vertices[:, 0].min() for path in row.get_paths()]
+                for row in lanes.collections] == [[0, 5], [5, 10], [15]]
+    finally:
+        plt.close(fig)
+
+
+def test_sla_legend_counts_accounted_flows_per_step():
+    tiers = [{"sla_grade": "gold", "flow_count": n, "sla_compliant_flow_count": passed,
+              "subscriber_flow_count": 12} for n, passed in [(10, 5), (8, 6)]]
+    series = charts.extract_dynamics_chart_series({"snapshots": [
+        {"attacks": {"sla_restoration": {"tiers": [tier]}}} for tier in tiers]})
+    fig, ax = plt.subplots()
+    try:
+        charts._sla_lines(ax, series, [0, 2])
+        assert ax.lines[0].get_label() == "золотой · потоков: 8–10"
+        np.testing.assert_array_equal(ax.lines[0].get_ydata(), [50, 75])
+    finally:
+        plt.close(fig)
+
+
 def test_event_guides_use_observed_boundaries_and_saved_recovery():
     event = {"attack_id": "A"}
     states = [[], [event], [event, {"attack_id": "B"}],
@@ -233,6 +288,11 @@ def test_export_projects_same_second_to_same_pixel_across_time_charts(tmp_path, 
             for ax in fig.axes:
                 assert ax.get_xlim() == (0, 8)
                 projections.setdefault(path.name, []).append(ax.transData.transform((4, 0))[0])
+                if path.name == "event_timeline.png":
+                    start, end = [c.get_segments() for c in ax.collections[-2:]]
+                    np.testing.assert_allclose(start, [[[2, 0], [2, 1]]])
+                    np.testing.assert_allclose(end, [[[4, 0], [4, 1]]])
+                    continue
                 start, end, restored = [c.get_segments() for c in ax.collections[-3:]]
                 np.testing.assert_allclose(start, [[[2, 0], [2, 1]]])
                 np.testing.assert_allclose(end, [[[4, 0], [4, .5]]])

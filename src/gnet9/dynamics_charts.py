@@ -19,14 +19,13 @@ from .constants import DYNAMICS_CHART_FILES
 from .flow_details import TRAFFIC_LABELS
 from .plot_style import (PANEL, TEXT, MUTED, BLUE, GREEN,
                          AMBER, RED, PURPLE, save_figure, style_axis)
-from .security_dashboard import ATTACK_COLORS
 
 
 AggregateSeriesSpec = tuple[str, str, str, str, float]
 NestedSeriesSpec = tuple[str, tuple[str, ...], float]
 
-ATTACK_KIND_COLORS = ATTACK_COLORS
 SLA_GRADES = {"gold": "золотой", "silver": "серебряный", "bronze": "бронзовый"}
+SLA_SCOPE = "Доля учтённых абонентских потоков своего класса, выполнивших проверенные требования SLA на этом шаге."
 
 AGGREGATE_SERIES: tuple[AggregateSeriesSpec, ...] = (
     ("sla_margin_min", "L1", "sla_margin", "min", 1.0),
@@ -133,13 +132,16 @@ def extract_dynamics_chart_series(dynamics: dict[str, Any]) -> dict[str, list[fl
             series[name].append(_nested_float(snapshot, path, default=float("nan")) * multiplier)
     for grade in SLA_GRADES:
         values = []
+        counts = []
         for snapshot in snapshots:
             tiers = snapshot.get("attacks", {}).get("sla_restoration", {}).get("tiers", [])
             tier = next((t for t in tiers if t.get("sla_grade") == grade), {})
-            count = tier.get("flow_count", 0)
+            count = tier.get("flow_count")
+            counts.append(float(count) if count is not None else np.nan)
             compliant = tier.get("sla_compliant_flow_count")
             values.append(100 * compliant / count if count and compliant is not None else float("nan"))
         series[f"{grade}_sla_percent"] = values
+        series[f"{grade}_flow_count"] = counts
     series["kalman_applied"] = [bool(s.get("koopman", {}).get("kalman_filter", {}).get("applied_to_nominal_observation")) for s in snapshots]
     return series
 
@@ -203,14 +205,15 @@ class RunTimeAxis:
         return [self.by_step.get(step, np.nan) for step in steps]
 
 
-def _save_time(fig, axes, run, path, *, bottom=.28, top=.83, hspace=None):
+def _save_time(fig, axes, run, path, *, bottom=.28, top=.83, hspace=None, show_recovery=True):
     """Одинаковый прямоугольник проекции по X во всех PNG, включая карты."""
     fig.set_figwidth(14)
     fig.subplots_adjust(left=.24, right=.92, bottom=bottom, top=top, hspace=hspace)
     limits = (min(run.by_step.values()), max(run.by_step.values()) + run.period) if run.by_step else (0, run.period)
     guides = [(run.starts, RED, "-", "Начало атаки"),
-              (run.ends, AMBER, "--", "Конец атаки"),
-              (run.recoveries, GREEN, ":", "Доставка восстановлена")]
+              (run.ends, AMBER, "--", "Конец атаки")]
+    if show_recovery:
+        guides.append((run.recoveries, GREEN, ":", "Доставка восстановлена"))
     # У совпавших границ одна координата X. Делим высоту, чтобы видеть каждый тип.
     at_time = {}
     for index, (times, _, _, _) in enumerate(guides):
@@ -261,7 +264,7 @@ def _plot_overview(series, risk, threshold, run, path):
     panels = [
         ("Прогноз угрозы", "Оценка 0–1", (0, 1)),
         ("Доставка обычных пакетов", "% пакетов", None),
-        ("Выполнение SLA", "% потоков класса", (0, 100)),
+        ("Выполнение SLA по всей сети", "% потоков класса", (0, 100)),
     ]
     for ax, (title, unit, limits) in zip(axes, panels):
         _style_axes(ax, title, unit, limits, legend=False)
@@ -275,7 +278,8 @@ def _plot_overview(series, risk, threshold, run, path):
     if finite.size:
         # Один процентный пункт даёт читаемую шкалу и при постоянной доставке.
         axes[1].set_ylim(max(0, min(99, finite.min()) - .1), 100.1)
-    _save_time(fig, axes, run, path, bottom=.10, top=.90, hspace=.50)
+    fig.text(.24, .025, SLA_SCOPE, color=MUTED, fontsize=8)
+    _save_time(fig, axes, run, path, bottom=.13, top=.90, hspace=.50)
 
 
 def _plot_koopman(series, risk, threshold, run, path):
@@ -379,16 +383,27 @@ def _plot_attack_traffic(snapshots, run, path):
     )
 
 
+def _count_range(counts):
+    """Число потоков на шаге либо диапазон, если состав менялся."""
+    observed = [int(count) for count in counts if np.isfinite(count)]
+    if not observed:
+        return "?"
+    low, high = min(observed), max(observed)
+    return str(low) if low == high else f"{low}–{high}"
+
+
 def _sla_lines(ax, series, times):
     for grade, color, pattern in zip(SLA_GRADES, (AMBER, BLUE, PURPLE), ("-", "--", ":")):
+        count = _count_range(series[f"{grade}_flow_count"])
         _plot_line(ax, times, series[f"{grade}_sla_percent"],
-                   SLA_GRADES[grade], color, linestyle=pattern)
+                   f"{SLA_GRADES[grade]} · потоков: {count}", color, linestyle=pattern)
 
 
 def _plot_sla_by_class(series, run, path):
     fig, ax = plt.subplots(figsize=(14, 4.7))
     _sla_lines(ax, series, run.seconds(series["steps"]))
     _style_axes(ax, "Выполнение SLA по всей сети", "% потоков своего класса", (0, 100))
+    fig.text(.24, .035, SLA_SCOPE, color=MUTED, fontsize=8)
     _save_time(fig, [ax], run, path, bottom=.21)
 
 
@@ -473,7 +488,7 @@ def _plot_service_forecast(evaluation, path, run=None):
             actual = case["time_seconds"] if key == "miss" else case["actual_time_seconds"]
             ax.axvline(actual, color=RED, linestyle="--", label="Начало нарушения")
         service = TRAFFIC_LABELS.get(case["service"], case["service"])
-        _style_axes(ax, f"{label} · {service} · {case['flow_id']} · {case['label_ru']}",
+        _style_axes(ax, f"{label} · {service} · поток {case['flow_id']} · {case['label_ru']}",
                     case["unit"], legend=False)
         if run is None:
             ax.legend(loc="best", fontsize=7, ncol=2, facecolor=PANEL, labelcolor=TEXT)
@@ -501,7 +516,8 @@ def _plot_target_sla(snapshots, run, path):
     rows, highlights = [], []
     for (target, grade), values in counts.items():
         if values:
-            rows.append((f"{target} · {SLA_GRADES[grade]}",
+            count = _count_range(total for _, total in values.values())
+            rows.append((f"{target} · {SLA_GRADES[grade]} · потоков: {count}",
                          {step: 100 * passed / total for step, (passed, total) in values.items()}))
         elif target not in targets_with_data and grade == "gold":
             rows.append((f"{target} · нет данных", {}))
@@ -512,7 +528,8 @@ def _plot_target_sla(snapshots, run, path):
         run, rows, path,
         title="Выполнение SLA у атакованных узлов",
         colorbar_label="% оценённых потоков своего класса",
-        caption="Учтены связанные с узлом потоки. Рамка — воздействие на узел. Пустая клетка — нет оценённых потоков.",
+        caption=("Учтены оценённые абонентские потоки класса, связанные с узлом через маршрут, конечную точку или событие.\n"
+                 "Рамка — воздействие на узел. Пустая клетка — нет оценённых потоков."),
         norm=Normalize(0, 100),
         cmap="RdYlGn",
         highlights=highlights,
@@ -600,26 +617,59 @@ def _plot_link_utilization(steps, peak_series, run, path):
     _save_time(fig, [ax], run, path, bottom=.21)
 
 
+def _cpu_peak(state):
+    """Максимум CPU (%) и все узлы с таким измерением в этом снимке."""
+    metric = "cpu_load_percent"
+    if "nodes" in state:
+        samples = [(node.get("id"), node.get("metrics", {}).get(metric)) for node in state["nodes"]]
+    elif metric in state.get("vertex_metric_names", ()):
+        index = state["vertex_metric_names"].index(metric)
+        samples = [(node, row[index]) for node, row in zip(state.get("node_ids", ()), state.get("vertex_vectors", ()))
+                   if index < len(row)]
+    else:
+        samples = []
+    finite = [(node, value) for node, value in samples if value is not None and np.isfinite(value)]
+    peak = state.get("node_metric_maxima", {}).get(metric)
+    if peak is None:
+        peak = max((value for _, value in finite), default=np.nan)
+    return float(peak), tuple(sorted(str(node) for node, value in finite if node is not None and value == peak))
+
+
 def _plot_resource_utilization(snapshots, run, path):
-    fig, ax = plt.subplots(figsize=(11.5, 4.7))
-    steps = run.seconds(_steps(snapshots))
-    cpu = []
-    for snapshot in snapshots:
-        state = snapshot.get("traffic", {}).get("network_state", {})
-        value = state.get("node_metric_maxima", {}).get("cpu_load_percent")
-        if value is None:
-            value = max((node.get("metrics", {}).get("cpu_load_percent", np.nan)
-                         for node in state.get("nodes", [])), default=np.nan)
-        cpu.append(float(value))
+    times = run.seconds(_steps(snapshots))
+    peaks = [_cpu_peak(s.get("traffic", {}).get("network_state", {})) for s in snapshots]
+    cpu = [value for value, _ in peaks]
+    leaders = {}
+    for t, (value, names) in zip(times, peaks):
+        if np.isfinite(value):
+            for name in names or ("Узел не указан",):
+                leaders.setdefault(name, []).append((t, run.period))
+    if len(leaders) > 1:
+        lane_height = .35 + .27 * len(leaders)
+        fig, axes = plt.subplots(2, 1, figsize=(14, 4.9 + lane_height), sharex=True,
+                                 gridspec_kw={"height_ratios": (2.5, lane_height)})
+        ax, lane = axes
+        style_axis(lane, "Узлы с максимальной загрузкой CPU на каждом шаге")
+        for row, intervals in enumerate(leaders.values()):
+            lane.broken_barh(intervals, (row - .32, .64), color=BLUE)
+        lane.set_yticks(range(len(leaders)), list(leaders))
+        lane.set_ylim(len(leaders) - .5, -.5)
+        lane.grid(False)
+    else:
+        fig, ax = plt.subplots(figsize=(14, 4.7))
+        axes = [ax]
     target_resource = [_nested_float(snapshot, ("attacks", "maximum_target_utilization_percent"), default=np.nan)
                        for snapshot in snapshots]
-    _plot_line(ax, steps, cpu, "CPU (процессор)", BLUE)
-    _plot_line(ax, steps, target_resource, "ресурс атакованной цели", AMBER)
-    _style_axes(ax, "Оценки загрузки ресурсов", "% расчётной ёмкости",
+    _plot_line(ax, times, cpu, "Максимум CPU по всем узлам", BLUE)
+    _plot_line(ax, times, target_resource, "ресурс атакованной цели", AMBER)
+    title = "Максимальная загрузка процессора и ресурс атакованной цели"
+    if len(leaders) == 1:
+        title += f"  ·  CPU: {next(iter(leaders))}"
+    _style_axes(ax, title, "% расчётной ёмкости",
                 _positive_limits(cpu, target_resource, minimum=100))
-    fig.text(.24, .035, "CPU — оценка по очереди. Ресурс цели — результат расчёта воздействия.",
+    fig.text(.24, .035, "Синяя линия — наибольшая расчётная загрузка CPU среди узлов. Оранжевая — нагрузка ресурса среди целей воздействия (максимум).",
              color=MUTED, fontsize=8)
-    _save_time(fig, [ax], run, path, bottom=.21)
+    _save_time(fig, axes, run, path, bottom=.21, hspace=.65)
 
 
 def _accepted_training(snapshot: dict[str, Any]) -> bool | None:
@@ -645,16 +695,6 @@ def _accepted_transition_count(dynamics: dict[str, Any]) -> int | None:
     return int(actual) if actual is not None else None
 
 
-def _training_windows(dynamics: dict[str, Any]) -> list[tuple[float, float]]:
-    snapshots = dynamics.get("snapshots", [])
-    windows = []
-    for previous, current in zip(snapshots, snapshots[1:]):
-        if _accepted_training(current) is True:
-            windows.append((float(previous.get("time_seconds", 0)),
-                            float(current.get("time_seconds", 0))))
-    return windows
-
-
 def _observation_period(dynamics: dict[str, Any]) -> float:
     configured = dynamics.get("config", {}).get("step_seconds")
     if configured is not None and float(configured) > 0:
@@ -668,56 +708,72 @@ def _observation_period(dynamics: dict[str, Any]) -> float:
     return 1.0
 
 
+def _step_bars(starts, period):
+    """Объединить соседние отсчёты в непрерывные полосы (начало и ширина в секундах)."""
+    bars = []
+    for start in starts:
+        if bars and start == bars[-1][0] + bars[-1][1]:
+            first, width = bars[-1]
+            bars[-1] = (first, width + period)
+        else:
+            bars.append((start, period))
+    return bars
+
+
 def _plot_timeline(dynamics, run, path):
-    """Полосы строятся по наблюдениям и принятым переходам."""
-    windows = run.windows
+    """Показать принятые переходы обучения, обычные пакеты и активные фазы атак."""
     snapshots = dynamics.get("snapshots", [])
-    reset_windows = [(t, run.period) for t, snapshot in zip(run.by_step.values(), snapshots)
-                     if _kalman_window_reset(snapshot)]
-    labels = ["Обучение принято", "Предупреждение"]
-    if reset_windows:
-        labels.append("Сброс Калмана")
-    event_labels = {window["attack_id"]: window["label"] for window in windows}
-    event_rows = {key: row for row, key in enumerate(event_labels, start=len(labels))}
-    labels.extend(event_labels.values())
-    fig, axis = plt.subplots(figsize=(13.5, max(3.7, 2.8 + .44 * len(labels))))
+    times = list(run.by_step.values())
     period = run.period
-    training = [(start, end - start) for start, end in _training_windows(dynamics)]
-    warnings = [(run.by_step[step], period) for step, snapshot in zip(run.by_step, snapshots)
-                if snapshot.get("koopman", {}).get("forecast_is_early_warning")]
-    for intervals, row, color in ((training, 0, GREEN), (warnings, 1, AMBER), (reset_windows, 2, PURPLE)):
-        if intervals:
-            axis.broken_barh(intervals, (row - .3, .6), color=color, alpha=.85)
-    for window in windows:
-        lane = event_rows[window["attack_id"]]
-        color = ATTACK_KIND_COLORS.get(window["kind"], RED)
-        start, width = window["start"], window["end"] - window["start"]
-        recovery = window["recovery"]
-        axis.broken_barh([(start, width)], (lane - .3, .6),
-                         facecolors="none" if recovery else color,
-                         edgecolors=color if recovery else "none",
-                         hatch="//" if recovery else None, alpha=.85)
+    training = [previous for previous, current, snapshot in zip(times, times[1:], snapshots[1:])
+                if current - previous == period and _accepted_training(snapshot) is True]
+    traffic = []
+    traffic_measured = False
+    for t, snapshot in zip(times, snapshots):
+        summary = snapshot.get("traffic", {}).get("summary", {})
+        rate = _nested_float(summary, ("normal_arrival_rate_pps",), default=np.nan)
+        if not np.isfinite(rate):
+            rate = _nested_float(summary, ("legitimate_packet_count",), default=np.nan) / period
+        if np.isfinite(rate):
+            traffic_measured = True
+            if rate > 0:
+                traffic.append(t)
+
+    attacks = [window for window in run.windows if not window["recovery"]]
+    event_labels = {w["attack_id"]: w["label"] for w in attacks}
+    labels = ["Обучение Купмана", "Обычный трафик"]
+    event_rows = {key: row for row, key in enumerate(event_labels, start=len(labels))}
+    labels.extend(f"Атака · {name}" for name in event_labels.values())
+    if not attacks:
+        labels.append("Атаки")
+    fig, ax = plt.subplots(figsize=(14, max(4.1, 2.5 + .39 * len(labels))))
+    for starts, row, color in ((training, 0, GREEN), (traffic, 1, BLUE)):
+        if starts:
+            ax.broken_barh(_step_bars(starts, period), (row - .26, .52), color=color)
+    for window in attacks:
+        row = event_rows[window["attack_id"]]
+        ax.broken_barh([(window["start"], window["end"] - window["start"])],
+                       (row - .26, .52), color=RED)
+
+    if not traffic:
+        ax.text(.01, 1, "Обычных поступлений не зарегистрировано" if traffic_measured else "Нет данных о трафике",
+                transform=ax.get_yaxis_transform(), va="center", color=MUTED, fontsize=9)
+    if not attacks:
+        ax.text(.01, 2, "Активные атаки не наблюдались", transform=ax.get_yaxis_transform(),
+                va="center", color=MUTED, fontsize=9)
+
+    style_axis(ax, "Обучение, обычный трафик и атаки")
+    ax.set_yticks(range(len(labels)), [fill(label, 42) for label in labels])
+    ax.set_ylim(len(labels) - .5, -.5)
+    ax.grid(True, axis="y", color=MUTED, alpha=.15, linewidth=.6)
+    ax.tick_params(axis="y", length=0, labelsize=9)
     transitions = _accepted_transition_count(dynamics)
     count = "нет данных" if transitions is None else str(transitions)
-    style_axis(axis, "Хронология наблюдений")
-    axis.set_yticks(range(len(labels)), [fill(label, 42) for label in labels])
-    axis.set_ylim(len(labels) - .5, -.5)
-    axis.grid(False, axis="y")
-    axis.set_xlabel("время от t0, с", color=MUTED, fontsize=8)
-    axis.tick_params(axis="y", length=0, labelsize=8)
-    fig.text(.24, .37 / fig.get_figheight(), f"Принято переходов в обучение: {count}. Наблюдалось событий: {len(event_rows)}.",
-             color=TEXT, fontsize=8)
-    fig.text(.24, .16 / fig.get_figheight(), "Предупреждение отмечает момент выдачи прогноза. Штриховка обозначает восстановление.",
+    fig.text(.24, .18 / fig.get_figheight(),
+             f"Принято переходов в обучение: {count}. Обычный трафик отмечен на шагах с поступлением абонентских пакетов.",
              color=MUTED, fontsize=8)
-    _save_time(fig, [axis], run, path, bottom=1.05 / fig.get_figheight(), top=1 - .85 / fig.get_figheight())
-
-
-def _kalman_window_reset(snapshot):
-    kalman = snapshot.get("koopman", {}).get("kalman_filter", {})
-    local = kalman.get("local_observation") or {}
-    return bool(local.get("window", {}).get("global_reset_reasons")) or any(
-        local.get(kind, {}).get("covariance_reset_entity_count", 0) for kind in ("vertices", "edges")
-    )
+    _save_time(fig, [ax], run, path, bottom=.85 / fig.get_figheight(), top=1 - .85 / fig.get_figheight(),
+               show_recovery=False)
 
 
 def _positive_limits(*series, minimum=1.0) -> tuple[float, float]:

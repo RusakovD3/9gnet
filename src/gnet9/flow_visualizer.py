@@ -640,11 +640,11 @@ def _draw_security_observations(ax, current, attacks):
 
 
 def _draw_security_quality(ax, tier_rows):
-    _dashboard_text(ax, 435, 125, "Качество услуг", 17, bold=True)
+    _dashboard_text(ax, 435, 125, "Качество услуг по всей сети", 17, bold=True)
     tiers = {t.get("sla_grade"): t for t in tier_rows}
     if not tiers:
         return _dashboard_text(ax, 435, 163, "Нет данных о качестве", 14)
-    y = _dashboard_text(ax, 435, 163, "Потоки, выполнившие проверенные требования", 11, color=MUTED) + 9
+    y = _dashboard_text(ax, 435, 163, "Абонентские потоки, выполнившие проверенные требования", 11, color=MUTED) + 9
     for grade, label in (("gold", "Золотой"), ("silver", "Серебряный"), ("bronze", "Бронзовый")):
         tier = tiers.get(grade, {})
         total = tier.get("flow_count")
