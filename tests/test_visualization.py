@@ -8,7 +8,7 @@ import pytest
 
 from main import parse_args, _simulation_timing
 from src.gnet9.address_visualizer import subscriber_address_groups
-from src.gnet9.dynamics_charts import _link_load_rows, extract_dynamics_chart_series
+from src.gnet9.dynamics_charts import _link_load_summary, extract_dynamics_chart_series
 from src.gnet9.network_layout import network_positions
 from src.gnet9.topology_builder import GNetBaselineBuilder
 
@@ -22,7 +22,8 @@ def test_peak_load_uses_rate_at_each_step_not_largest_byte_count():
             {"route": ["a", "b"], "wire_bytes": byte_count, "interval_seconds": seconds},
             {"route": ["a", "b"], "wire_bytes": 9000000, "interval_seconds": 1, "quarantined": True},
         ]}}
-    rows = _link_load_rows(model, [snapshot(1, 1000000, 1), snapshot(2, 2000000, 10)])
+    rows, per_step = _link_load_summary(model, [snapshot(1, 1000000, 1), snapshot(2, 2000000, 10)])
+    assert per_step == [80, 16]
     assert rows == [{"label": "a ↔ b", "utilization_percent": 80, "step_index": 1}]
 
 
@@ -32,8 +33,8 @@ def test_capacity_chart_reads_compact_saved_state_without_live_model():
         "edge_metric_names": names, "edge_ids": [["a", "b"]], "edge_vectors": [[10, 8]]}}}
     full = {"step_index": 4, "traffic": {"network_state": {"edges": [
         {"source": "a", "target": "b", "metrics": dict(zip(names, [10, 8]))}]}}}
-    assert _link_load_rows(None, [compact]) == _link_load_rows(None, [full])
-    assert _link_load_rows(None, [compact])[0]["utilization_percent"] == 80
+    assert _link_load_summary(None, [compact]) == _link_load_summary(None, [full])
+    assert _link_load_summary(None, [compact])[0][0]["utilization_percent"] == 80
 
 
 def test_sla_chart_shows_compliance_and_marks_missing_data():

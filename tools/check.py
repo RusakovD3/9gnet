@@ -32,7 +32,7 @@ SMOKE_FILES = (
     "l1_d0sl_parsed.json", "l1_policies.d0sl", "network_dynamics.json",
     "algorithm_dialogue.json", "algorithm_dialogue.md", "standards_and_equipment_audit.json",
     "network_logic.png", "layer_scheme.png", "ip_address_map.png", "service_flows.png",
-    "charts/koopman_risk.png", "charts/lyapunov_growth.png", "charts/native_traffic.png",
+    "charts/incident_overview.png", "charts/koopman_risk.png", "charts/lyapunov_growth.png", "charts/native_traffic.png",
     "charts/attack_traffic.png", "charts/sla_by_class.png", "charts/attacked_node_sla.png",
     "charts/event_timeline.png", "charts/arbitrator_signals.png", "charts/capacity_bottlenecks.png",
     "charts/link_utilization.png", "charts/resource_utilization.png", "charts/service_sla_forecast.png",

@@ -16,11 +16,11 @@ RED = "#fb7185"
 PURPLE = "#a78bfa"
 
 
-def save_figure(fig, path: Path, *, dpi: int = 180) -> None:
+def save_figure(fig, path: Path, *, dpi: int = 180, tight: bool = True) -> None:
     """Сохранить рисунок и закрыть его даже при ошибке записи."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(path, dpi=dpi, bbox_inches="tight", pad_inches=0.18,
+        fig.savefig(path, dpi=dpi, bbox_inches="tight" if tight else None, pad_inches=0.18,
                     facecolor=fig.get_facecolor())
     finally:
         plt.close(fig)

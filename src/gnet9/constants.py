@@ -124,6 +124,7 @@ DYNAMICS_STEPS = 10
 
 
 DYNAMICS_CHART_FILES = {
+    "overview": "incident_overview.png",
     "koopman": "koopman_risk.png",
     "lyapunov": "lyapunov_growth.png",
     "native_traffic": "native_traffic.png",

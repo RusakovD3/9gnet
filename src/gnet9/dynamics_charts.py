@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
+from textwrap import fill
 from typing import Any
 
 import matplotlib.pyplot as plt
-from matplotlib.collections import PatchCollection
+from matplotlib.collections import PatchCollection, PolyCollection
 from matplotlib.colors import Normalize, SymLogNorm
+from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 from matplotlib.ticker import MaxNLocator
 import numpy as np
@@ -74,18 +77,22 @@ def export_dynamics_charts(
     snapshots = dynamics.get("snapshots", [])
     detail = flow_snapshots if flow_snapshots is not None else snapshots
     charts = {key: output_dir / name for key, name in DYNAMICS_CHART_FILES.items()}
-    _plot_koopman(series, dynamics, charts["koopman"])
-    _plot_lyapunov(series, dynamics, charts["lyapunov"])
-    _plot_native_traffic(series, detail, charts["native_traffic"])
-    _plot_attack_traffic(snapshots, charts["attack_traffic"])
-    _plot_sla_by_class(series, charts["sla"])
-    _plot_target_sla(detail or snapshots, charts["target_sla"])
-    _plot_service_forecast(dynamics.get("service_sla_evaluation", {}), charts["service_forecast"])
-    _plot_timeline(dynamics, charts["timeline"])
-    _plot_arbitrator(series, charts["arbitrator"])
-    _plot_capacity_bottlenecks(model, detail, charts["capacity"])
-    _plot_link_utilization(model, detail, charts["links"])
-    _plot_resource_utilization(detail, charts["resources"])
+    run = RunTimeAxis.from_result(dynamics)
+    line_peaks, peak_series = _link_load_summary(model, detail)
+    risk, threshold = _risk_series(series, dynamics)
+    _plot_overview(series, risk, threshold, run, charts["overview"])
+    _plot_koopman(series, risk, threshold, run, charts["koopman"])
+    _plot_lyapunov(series, dynamics, run, charts["lyapunov"])
+    _plot_native_traffic(series, detail, run, charts["native_traffic"])
+    _plot_attack_traffic(snapshots, run, charts["attack_traffic"])
+    _plot_sla_by_class(series, run, charts["sla"])
+    _plot_target_sla(detail or snapshots, run, charts["target_sla"])
+    _plot_service_forecast(dynamics.get("service_sla_evaluation", {}), charts["service_forecast"], run)
+    _plot_timeline(dynamics, run, charts["timeline"])
+    _plot_arbitrator(series, run, charts["arbitrator"])
+    _plot_capacity_bottlenecks(line_peaks, charts["capacity"])
+    _plot_link_utilization(_steps(detail), peak_series, run, charts["links"])
+    _plot_resource_utilization(detail, run, charts["resources"])
 
     # Не оставлять в каталоге старые перегруженные диаграммы: так результат
     # текущего запуска не смешивается с историческими файлами.
@@ -164,22 +171,117 @@ def _steps(snapshots):
     return [int(snapshot.get("step_index", index)) for index, snapshot in enumerate(snapshots)]
 
 
-def _step_axis(ax, steps):
-    ax.set_xlabel("шаг модели", color=MUTED, fontsize=9)
-    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
-    if steps:
-        ax.set_xlim(min(steps) - .5, max(steps) + .5)
+@dataclass
+class RunTimeAxis:
+    """Общее время наблюдений, в секундах от t0, для всех диаграмм прогона."""
+    by_step: dict[int, float]
+    period: float
+    windows: list[dict]
+    starts: tuple[float, ...]
+    ends: tuple[float, ...]
+    recoveries: tuple[float, ...]
+
+    @classmethod
+    def from_result(cls, dynamics):
+        snapshots = dynamics.get("snapshots", [])
+        period = _observation_period(dynamics)
+        by_step = {step: float(s.get("time_seconds", step * period))
+                   for step, s in zip(_steps(snapshots), snapshots)}
+        windows = _attack_windows(dynamics, period, by_step)
+        active = [w for w in windows if not w["recovery"]]
+        observed = {by_step[step] for step, s in zip(by_step, snapshots)
+                    if "events" in s.get("attacks", {})}
+        recovered = {by_step[e["recovered_step"]]
+                     for e in dynamics.get("resilience_evaluation", {}).get("episodes", [])
+                     if e.get("recovered_step") in by_step}
+        return cls(by_step, period, windows,
+                   tuple(sorted({w["start"] for w in active})),
+                   tuple(sorted({w["end"] for w in active if w["end"] in observed})),
+                   tuple(sorted(recovered)))
+
+    def seconds(self, steps):
+        return [self.by_step.get(step, np.nan) for step in steps]
 
 
-def _plot_koopman(series, dynamics, path):
-    fig, ax = plt.subplots(figsize=(11.5, 4.7))
-    steps = series["steps"]
+def _save_time(fig, axes, run, path, *, bottom=.28, top=.83, hspace=None):
+    """Одинаковый прямоугольник проекции по X во всех PNG, включая карты."""
+    fig.set_figwidth(14)
+    fig.subplots_adjust(left=.24, right=.92, bottom=bottom, top=top, hspace=hspace)
+    limits = (min(run.by_step.values()), max(run.by_step.values()) + run.period) if run.by_step else (0, run.period)
+    guides = [(run.starts, RED, "-", "Начало атаки"),
+              (run.ends, AMBER, "--", "Конец атаки"),
+              (run.recoveries, GREEN, ":", "Доставка восстановлена")]
+    # У совпавших границ одна координата X. Делим высоту, чтобы видеть каждый тип.
+    at_time = {}
+    for index, (times, _, _, _) in enumerate(guides):
+        for t in times:
+            at_time.setdefault(t, []).append(index)
+    handles = []
+    for index, (times, color, style, label) in enumerate(guides):
+        if not times:
+            continue
+        low = np.array([at_time[t].index(index) / len(at_time[t]) for t in times])
+        high = low + np.array([1 / len(at_time[t]) for t in times])
+        for ax in axes:
+            ax.vlines(times, low, high, transform=ax.get_xaxis_transform(), colors=color,
+                      linestyles=style, linewidth=.95, alpha=.85, zorder=1.8)
+        handles.append(Line2D([], [], color=color, linestyle=style, label=label))
+    for ax in axes:
+        ax.set_xlim(*limits)
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=10, integer=run.period.is_integer()))
+    axes[-1].set_xlabel("Время от t0, с", color=MUTED, fontsize=9)
+    if handles:
+        fig.legend(handles=handles, loc="upper right", bbox_to_anchor=(.925, .998),
+                   ncol=len(handles), frameon=False, labelcolor=TEXT, fontsize=9)
+    save_figure(fig, path, tight=False)
+
+
+def _risk_series(series, dynamics):
     snapshots = dynamics.get("snapshots", [])
-    confidence = [value / 100 for value in series["precursor_confidence_percent"]]
     risk = [_nested_float(s, ("koopman", "forecast_risk_score"), default=fallback)
             for s, fallback in zip(snapshots, series["koopman_forecast_risk"])]
     resolved = _nested_float(dynamics, ("config", "resolved_warning_risk_threshold"), default=np.nan)
     threshold = [_nested_float(s, ("koopman", "warning_risk_threshold"), default=resolved) for s in snapshots]
+    return risk, threshold
+
+
+def _plot_overview(series, risk, threshold, run, path):
+    fig, axes = plt.subplots(3, 1, figsize=(14, 7), sharex=True)
+    times = run.seconds(series["steps"])
+    _plot_line(axes[0], times, risk, "Риск Купмана", BLUE)
+    _plot_line(axes[0], times, threshold, "Порог предупреждения", MUTED, linestyle="--")
+    delivery = series["legitimate_delivery_percent"]
+    _plot_line(axes[1], times, delivery, "Доставлено пакетов", GREEN)
+    warned = np.asarray(series["koopman_warning_percent"]) == 100
+    issued = warned & np.isfinite(risk)
+    if issued.any():
+        axes[0].scatter(np.asarray(times)[issued], np.asarray(risk)[issued], marker="v",
+                        color=AMBER, s=24, label="Выдано предупреждение", clip_on=False, zorder=3)
+    _sla_lines(axes[2], series, times)
+    panels = [
+        ("Прогноз угрозы", "Оценка 0–1", (0, 1)),
+        ("Доставка обычных пакетов", "% пакетов", None),
+        ("Выполнение SLA", "% потоков класса", (0, 100)),
+    ]
+    for ax, (title, unit, limits) in zip(axes, panels):
+        _style_axes(ax, title, unit, limits, legend=False)
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            _side_legend(ax, handles, labels)
+        else:
+            ax.text(.5, .5, "Нет измерений", transform=ax.transAxes,
+                    ha="center", va="center", color=MUTED)
+    finite = np.asarray(delivery)[np.isfinite(delivery)]
+    if finite.size:
+        # Один процентный пункт даёт читаемую шкалу и при постоянной доставке.
+        axes[1].set_ylim(max(0, min(99, finite.min()) - .1), 100.1)
+    _save_time(fig, axes, run, path, bottom=.10, top=.90, hspace=.50)
+
+
+def _plot_koopman(series, risk, threshold, run, path):
+    fig, ax = plt.subplots(figsize=(14, 4.7))
+    steps = run.seconds(series["steps"])
+    confidence = [value / 100 for value in series["precursor_confidence_percent"]]
     _plot_line(ax, steps, confidence, "наблюдаемый предвестник", BLUE, linestyle="--")
     _plot_line(ax, steps, risk, "оценка риска Купмана", AMBER)
     _plot_line(ax, steps, threshold, "действующий порог предупреждения", GREEN, linestyle="--")
@@ -187,27 +289,25 @@ def _plot_koopman(series, dynamics, path):
         for index, boundary in enumerate(TRIGGER_BANDS["koopman"]):
             ax.axhline(boundary, color=MUTED, alpha=.66, linestyle=":", linewidth=1.1,
                        label="границы срочности арбитра" if index == 0 else None)
-    _step_axis(ax, steps)
-    _style_axes(ax, "Риск по прогнозу Купмана", "оценка 0–1", (0, 1), legend_columns=2)
-    fig.text(.095, .035, "Оценка без единиц. Границы арбитра задают срочность проверки.",
+    _style_axes(ax, "Риск по прогнозу Купмана", "оценка 0–1", (0, 1))
+    fig.text(.24, .035, "Оценка без единиц. Границы арбитра задают срочность проверки.",
              color=MUTED, fontsize=8)
-    _save(fig, path, bottom=.32, left=.095)
+    _save_time(fig, [ax], run, path, bottom=.21)
 
 
-def _plot_lyapunov(series, dynamics, path):
+def _plot_lyapunov(series, dynamics, run, path):
     fig, ax = plt.subplots(figsize=(11.5, 4.7))
     growth = []
     for snapshot in dynamics.get("snapshots", []):
         derivative = _nested_float(snapshot, ("koopman", "lyapunov_derivative_per_second"), default=np.nan)
         scale = _nested_float(snapshot, ("koopman", "lyapunov_remap_response_scale_per_second"), default=np.nan)
         growth.append(derivative / (abs(derivative) + scale) if scale > 0 and np.isfinite(derivative) else np.nan)
-    _plot_line(ax, series["steps"], growth, "нормированная скорость изменения V", PURPLE)
+    _plot_line(ax, run.seconds(series["steps"]), growth, "нормированная скорость изменения V", PURPLE)
     ax.axhline(0, color=MUTED, linestyle=":", linewidth=1.1)
-    _step_axis(ax, series["steps"])
     _style_axes(ax, "Изменение функции Ляпунова", "скорость на шкале −1…+1", (-1, 1))
-    fig.text(.095, .035, "Преобразование r / (|r| + s), где r — сохранённая скорость V за секунду, s — масштаб из результата.",
+    fig.text(.24, .035, "Преобразование r / (|r| + s), где r — сохранённая скорость V за секунду, s — масштаб из результата.",
              color=MUTED, fontsize=8)
-    _save(fig, path, bottom=.30, left=.095)
+    _save_time(fig, [ax], run, path, bottom=.21)
 
 
 def _expected_native_rates(snapshots):
@@ -220,7 +320,7 @@ def _expected_native_rates(snapshots):
     return rates
 
 
-def _plot_native_traffic(series, snapshots, path):
+def _plot_native_traffic(series, snapshots, run, path):
     fig, ax = plt.subplots(figsize=(11.5, 4.7))
     steps = series["steps"]
     actual = series["normal_arrival_rate_pps"]
@@ -228,18 +328,18 @@ def _plot_native_traffic(series, snapshots, path):
                 zip(series["filtered_normal_arrival_rate_pps"], series["kalman_applied"])]
     expected = dict(zip(_steps(snapshots), _expected_native_rates(snapshots)))
     expected_values = [expected.get(step, np.nan) for step in steps]
+    steps = run.seconds(steps)
     _plot_line(ax, steps, actual, "обычные поступления", BLUE)
     _plot_line(ax, steps, expected_values, "расчётная средняя интенсивность", MUTED, linestyle=":")
     _plot_line(ax, steps, filtered, "Калман на исправных наблюдениях", GREEN)
-    _step_axis(ax, steps)
-    _style_axes(ax, "Обычный трафик и поступления по Пуассону", "пакетов/с", legend_columns=3)
+    _style_axes(ax, "Обычный трафик и поступления по Пуассону", "пакетов/с")
     finite = [value for values in (actual, filtered, expected_values) for value in values if np.isfinite(value)]
     if finite:
         padding = max((max(finite) - min(finite)) * .15, max(finite) * .0001, 1e-9)
         ax.set_ylim(max(0, min(finite) - padding), max(finite) + padding)
-    fig.text(.095, .035, "Шаг 0 — нагруженный эталон. Вертикальная шкала увеличена для сравнения.",
+    fig.text(.24, .035, "Шаг 0 — нагруженный эталон. Вертикальная шкала увеличена для сравнения.",
              color=MUTED, fontsize=8)
-    _save(fig, path, bottom=.30, left=.095)
+    _save_time(fig, [ax], run, path, bottom=.21)
 
 
 def _observed_event_id(event):
@@ -247,7 +347,7 @@ def _observed_event_id(event):
 
 
 def _event_display_label(event):
-    name = event.get("attack_label_ru") or _observed_event_id(event)
+    name = event.get("attack_label_ru") or event.get("name_ru") or _observed_event_id(event)
     target = event.get("target_id")
     return f"{name} · {target}" if target else name
 
@@ -264,12 +364,12 @@ def _event_packet_rates(snapshots):
     return result
 
 
-def _plot_attack_traffic(snapshots, path):
+def _plot_attack_traffic(snapshots, run, path):
     events = _event_packet_rates(snapshots)
     rows = [(event["label"], event["rates"]) for event in events.values()]
     maximum = max((rate for _, rates in rows for rate in rates.values() if np.isfinite(rate)), default=1)
     _plot_observed_grid(
-        _steps(snapshots), rows, path,
+        run, rows, path,
         title="Пакетная интенсивность каждого наблюдённого события",
         colorbar_label="предложено пакетов/с",
         caption="0 — воздействие без пакетов. Пустая клетка — событие или интенсивность не наблюдались.",
@@ -279,20 +379,25 @@ def _plot_attack_traffic(snapshots, path):
     )
 
 
-def _plot_sla_by_class(series, path):
-    fig, ax = plt.subplots(figsize=(11.5, 4.7))
+def _sla_lines(ax, series, times):
     for grade, color, pattern in zip(SLA_GRADES, (AMBER, BLUE, PURPLE), ("-", "--", ":")):
-        _plot_line(ax, series["steps"], series[f"{grade}_sla_percent"],
+        _plot_line(ax, times, series[f"{grade}_sla_percent"],
                    SLA_GRADES[grade], color, linestyle=pattern)
-    _step_axis(ax, series["steps"])
-    _style_axes(ax, "Выполнение SLA по всей сети", "% потоков своего класса", (0, 100), legend_columns=3)
-    _save(fig, path, bottom=.30, left=.095)
+
+
+def _plot_sla_by_class(series, run, path):
+    fig, ax = plt.subplots(figsize=(14, 4.7))
+    _sla_lines(ax, series, run.seconds(series["steps"]))
+    _style_axes(ax, "Выполнение SLA по всей сети", "% потоков своего класса", (0, 100))
+    _save_time(fig, [ax], run, path, bottom=.21)
 
 
 def _target_sla_rows(snapshots):
     """Учитывать каждый оценённый легитимный поток один раз для каждой цели."""
     targets = {str(event["target_id"]) for snapshot in snapshots
                for event in snapshot.get("attacks", {}).get("events", []) if event.get("target_id")}
+    if not targets:
+        return {}
     rows = {(target, grade): {} for target in sorted(targets) for grade in SLA_GRADES}
     for step, snapshot in zip(_steps(snapshots), snapshots):
         events_by_id = {_observed_event_id(event): str(event["target_id"])
@@ -314,7 +419,7 @@ def _target_sla_rows(snapshots):
     return rows
 
 
-def _plot_service_forecast(evaluation, path):
+def _plot_service_forecast(evaluation, path, run=None):
     fig, axes = plt.subplots(3, 1, figsize=(11.5, 9))
     cases = evaluation.get("cases", {})
     outcomes = (("hit", "Предупреждённое нарушение"), ("false_alarm", "Ложная тревога"),
@@ -370,14 +475,20 @@ def _plot_service_forecast(evaluation, path):
         service = TRAFFIC_LABELS.get(case["service"], case["service"])
         _style_axes(ax, f"{label} · {service} · {case['flow_id']} · {case['label_ru']}",
                     case["unit"], legend=False)
-        ax.legend(loc="best", fontsize=7, ncol=2, facecolor=PANEL, labelcolor=TEXT)
-        ax.set_xlabel("Время модели, с", color=MUTED, fontsize=9)
+        if run is None:
+            ax.legend(loc="best", fontsize=7, ncol=2, facecolor=PANEL, labelcolor=TEXT)
+            ax.set_xlabel("Время модели, с", color=MUTED, fontsize=9)
+        else:
+            _side_legend(ax, *ax.get_legend_handles_labels())
+    if run is not None:
+        _save_time(fig, list(axes), run, path, bottom=.08, top=.91, hspace=.8)
+        return
     fig.suptitle("Прогноз Купмана по критериям SLA отдельных потоков", color=TEXT, fontsize=15)
     fig.subplots_adjust(left=.09, right=.97, hspace=.65, bottom=.07, top=.91)
     save_figure(fig, path)
 
 
-def _plot_target_sla(snapshots, path):
+def _plot_target_sla(snapshots, run, path):
     counts = _target_sla_rows(snapshots)
     active_steps = {}
     steps = _steps(snapshots)
@@ -398,7 +509,7 @@ def _plot_target_sla(snapshots, path):
             continue
         highlights.extend((len(rows) - 1, step) for step in sorted(active_steps.get(target, ())))
     _plot_observed_grid(
-        steps, rows, path,
+        run, rows, path,
         title="Выполнение SLA у атакованных узлов",
         colorbar_label="% оценённых потоков своего класса",
         caption="Учтены связанные с узлом потоки. Рамка — воздействие на узел. Пустая клетка — нет оценённых потоков.",
@@ -409,59 +520,60 @@ def _plot_target_sla(snapshots, path):
 
 
 def _plot_observed_grid(
-    steps, rows, path, *, title, colorbar_label, caption, norm, cmap, highlights=(), label_zero=False,
+    run, rows, path, *, title, colorbar_label, caption, norm, cmap, highlights=(), label_zero=False,
 ):
-    fig, ax = plt.subplots(figsize=(13.5, max(3.7, 2.25 + .31 * len(rows))))
-    boxes, values = [], []
+    fig, ax = plt.subplots(figsize=(14, max(4.3, 2.25 + .44 * len(rows))))
+    vertices, values, centers = [], [], []
     for row, (_, series) in enumerate(rows):
         for step, value in series.items():
-            if not np.isfinite(value):
+            if step not in run.by_step or not np.isfinite(value):
                 continue
-            boxes.append(Rectangle((step - .46, row - .42), .92, .84))
+            start = run.by_step[step]
+            end = start + run.period
+            vertices.append([(start, row - .42), (end, row - .42),
+                             (end, row + .42), (start, row + .42)])
+            if len(run.by_step) <= 30 or (label_zero and value == 0):
+                centers.append(((start + end) / 2, row, value))
             values.append(value)
     if values:
-        heat = PatchCollection(boxes, cmap=cmap, norm=norm, linewidths=0)
+        heat = PolyCollection(vertices, cmap=cmap, norm=norm, linewidths=0)
         heat.set_array(np.asarray(values))
         ax.add_collection(heat)
-        legend = fig.colorbar(heat, ax=ax, pad=.025, fraction=.035)
+        legend = fig.colorbar(heat, cax=ax.inset_axes([1.015, 0, .013, 1]))
         legend.set_label(colorbar_label, color=MUTED, fontsize=9)
         legend.ax.tick_params(colors=MUTED, labelsize=8)
-        for box, value in zip(boxes, values):
-            if len(steps) <= 30 or (label_zero and value == 0):
-                red, green, blue, _ = heat.to_rgba(value)
-                color = PANEL if .2126 * red + .7152 * green + .0722 * blue > .48 else TEXT
-                ax.text(box.get_x() + .46, box.get_y() + .42, f"{value:.4g}",
-                        ha="center", va="center", color=color, fontsize=6.5)
+        for x, y, value in centers:
+            red, green, blue, _ = heat.to_rgba(value)
+            color = PANEL if .2126 * red + .7152 * green + .0722 * blue > .48 else TEXT
+            ax.text(x, y, f"{value:.4g}", ha="center", va="center", color=color, fontsize=6.5)
     else:
         ax.text(.5, .5, "Нет наблюдений для графика", transform=ax.transAxes,
                 color=MUTED, ha="center", fontsize=9)
     if highlights:
-        outlines = [Rectangle((step - .46, row - .42), .92, .84) for row, step in highlights]
+        outlines = [Rectangle((run.by_step[step], row - .42), run.period, .84) for row, step in highlights if step in run.by_step]
         ax.add_collection(PatchCollection(outlines, facecolor="none", edgecolor=TEXT,
                                           linewidth=.65, zorder=2))
-    _step_axis(ax, steps)
     style_axis(ax, title)
-    ax.set_yticks(range(len(rows)), [label for label, _ in rows])
+    ax.set_yticks(range(len(rows)), [fill(label, 42) for label, _ in rows])
     ax.set_ylim(max(len(rows) - .5, .5), -.5)
     ax.grid(False)
-    fig.text(.075, .035, caption, color=MUTED, fontsize=8)
-    _save(fig, path, bottom=.18, left=.28)
+    fig.text(.24, .16 / fig.get_figheight(), caption, color=MUTED, fontsize=8)
+    _save_time(fig, [ax], run, path, bottom=.85 / fig.get_figheight(), top=1 - .85 / fig.get_figheight())
 
 
-def _plot_arbitrator(series, path):
+def _plot_arbitrator(series, run, path):
     fig, ax = plt.subplots(figsize=(11.5, 4.7))
     for key, label, color in (("state_hausdorff_normalized", "расстояние Хаусдорфа", BLUE),
                               ("lyapunov_remap_pressure", "вклад Ляпунова в решение", PURPLE),
                               ("remap_pressure", "необходимость защиты", RED)):
-        _plot_line(ax, series["steps"], series[key], label, color)
-    _step_axis(ax, series["steps"])
-    _style_axes(ax, "Основания решения арбитра", "оценка 0–1", (0, 1), legend_columns=3)
-    _save(fig, path, bottom=.30, left=.095)
+        _plot_line(ax, run.seconds(series["steps"]), series[key], label, color)
+    _style_axes(ax, "Основания решения арбитра", "оценка 0–1", (0, 1))
+    _save_time(fig, [ax], run, path, bottom=.21)
 
 
-def _plot_capacity_bottlenecks(model, snapshots, path: Path) -> None:
+def _plot_capacity_bottlenecks(line_peaks, path: Path) -> None:
     fig, ax = plt.subplots(figsize=(11.5, 4.7))
-    top = sorted(_link_load_rows(model, snapshots),
+    top = sorted(line_peaks,
                  key=lambda row: row["utilization_percent"], reverse=True)[:8]
     bars = ax.barh([row["label"] for row in reversed(top)], [row["utilization_percent"] for row in reversed(top)],
                    color=BLUE, height=.6)
@@ -478,21 +590,19 @@ def _plot_capacity_bottlenecks(model, snapshots, path: Path) -> None:
     _save(fig, path, bottom=.17, left=.17)
 
 
-def _plot_link_utilization(model, snapshots, path):
+def _plot_link_utilization(steps, peak_series, run, path):
     fig, ax = plt.subplots(figsize=(11.5, 4.7))
-    steps = _steps(snapshots)
-    peak_series = [_snapshot_peak_load(model, snapshot) for snapshot in snapshots]
+    steps = run.seconds(steps)
     _plot_line(ax, steps, peak_series, "максимальная предложенная нагрузка", BLUE)
     ax.axhline(100, color=MUTED, linestyle="--", linewidth=1.1, label="пропускная способность линии")
-    _step_axis(ax, steps)
     _style_axes(ax, "Максимальная предложенная нагрузка линий на каждом шаге", "% пропускной способности",
                 _positive_limits(peak_series, minimum=100))
-    _save(fig, path, bottom=.30, left=.095)
+    _save_time(fig, [ax], run, path, bottom=.21)
 
 
-def _plot_resource_utilization(snapshots, path):
+def _plot_resource_utilization(snapshots, run, path):
     fig, ax = plt.subplots(figsize=(11.5, 4.7))
-    steps = _steps(snapshots)
+    steps = run.seconds(_steps(snapshots))
     cpu = []
     for snapshot in snapshots:
         state = snapshot.get("traffic", {}).get("network_state", {})
@@ -505,12 +615,11 @@ def _plot_resource_utilization(snapshots, path):
                        for snapshot in snapshots]
     _plot_line(ax, steps, cpu, "CPU (процессор)", BLUE)
     _plot_line(ax, steps, target_resource, "ресурс атакованной цели", AMBER)
-    _step_axis(ax, steps)
     _style_axes(ax, "Оценки загрузки ресурсов", "% расчётной ёмкости",
-                _positive_limits(cpu, target_resource, minimum=100), legend_columns=2)
-    fig.text(.095, .035, "CPU — оценка по очереди. Ресурс цели — результат расчёта воздействия.",
+                _positive_limits(cpu, target_resource, minimum=100))
+    fig.text(.24, .035, "CPU — оценка по очереди. Ресурс цели — результат расчёта воздействия.",
              color=MUTED, fontsize=8)
-    _save(fig, path, bottom=.30, left=.095)
+    _save_time(fig, [ax], run, path, bottom=.21)
 
 
 def _accepted_training(snapshot: dict[str, Any]) -> bool | None:
@@ -550,38 +659,35 @@ def _observation_period(dynamics: dict[str, Any]) -> float:
     configured = dynamics.get("config", {}).get("step_seconds")
     if configured is not None and float(configured) > 0:
         return float(configured)
-    time = [float(s.get("time_seconds", 0)) for s in dynamics.get("snapshots", [])]
-    return next((end - start for start, end in zip(time, time[1:]) if end > start), 1.0)
-
-
-def _set_time_limits(axis, dynamics: dict[str, Any]) -> None:
-    time = [float(s.get("time_seconds", 0)) for s in dynamics.get("snapshots", [])]
-    if time:
-        axis.set_xlim(min(time), max(time) + _observation_period(dynamics))
-
-
-def _plot_timeline(dynamics: dict[str, Any], path: Path) -> None:
-    """Полосы строятся по наблюдениям и принятым переходам."""
-    windows = _attack_windows(dynamics)
     snapshots = dynamics.get("snapshots", [])
-    resets = [snapshot for snapshot in snapshots if _kalman_window_reset(snapshot)]
+    stamps = [(step, float(s["time_seconds"])) for step, s in zip(_steps(snapshots), snapshots)
+              if s.get("time_seconds") is not None]
+    for (previous, start), (current, end) in zip(stamps, stamps[1:]):
+        if end > start and current > previous:
+            return (end - start) / (current - previous)
+    return 1.0
+
+
+def _plot_timeline(dynamics, run, path):
+    """Полосы строятся по наблюдениям и принятым переходам."""
+    windows = run.windows
+    snapshots = dynamics.get("snapshots", [])
+    reset_windows = [(t, run.period) for t, snapshot in zip(run.by_step.values(), snapshots)
+                     if _kalman_window_reset(snapshot)]
     labels = ["Обучение принято", "Предупреждение"]
-    if resets:
+    if reset_windows:
         labels.append("Сброс Калмана")
     event_labels = {window["attack_id"]: window["label"] for window in windows}
     event_rows = {key: row for row, key in enumerate(event_labels, start=len(labels))}
     labels.extend(event_labels.values())
-    fig, axis = plt.subplots(figsize=(13.5, max(3.7, 2.2 + .32 * len(labels))))
-    period = _observation_period(dynamics)
-    for start, end in _training_windows(dynamics):
-        axis.broken_barh([(start, end - start)], (-.3, .6), color=GREEN, alpha=.8)
-    for snapshot in snapshots:
-        if snapshot.get("koopman", {}).get("forecast_is_early_warning"):
-            axis.broken_barh([(float(snapshot.get("time_seconds", 0)), period)], (.7, .6),
-                             color=AMBER, alpha=.85)
-    for snapshot in resets:
-        axis.broken_barh([(float(snapshot.get("time_seconds", 0)), period)], (1.7, .6),
-                         color=PURPLE, alpha=.85)
+    fig, axis = plt.subplots(figsize=(13.5, max(3.7, 2.8 + .44 * len(labels))))
+    period = run.period
+    training = [(start, end - start) for start, end in _training_windows(dynamics)]
+    warnings = [(run.by_step[step], period) for step, snapshot in zip(run.by_step, snapshots)
+                if snapshot.get("koopman", {}).get("forecast_is_early_warning")]
+    for intervals, row, color in ((training, 0, GREEN), (warnings, 1, AMBER), (reset_windows, 2, PURPLE)):
+        if intervals:
+            axis.broken_barh(intervals, (row - .3, .6), color=color, alpha=.85)
     for window in windows:
         lane = event_rows[window["attack_id"]]
         color = ATTACK_KIND_COLORS.get(window["kind"], RED)
@@ -594,17 +700,16 @@ def _plot_timeline(dynamics: dict[str, Any], path: Path) -> None:
     transitions = _accepted_transition_count(dynamics)
     count = "нет данных" if transitions is None else str(transitions)
     style_axis(axis, "Хронология наблюдений")
-    axis.set_yticks(range(len(labels)), labels)
+    axis.set_yticks(range(len(labels)), [fill(label, 42) for label in labels])
     axis.set_ylim(len(labels) - .5, -.5)
     axis.grid(False, axis="y")
     axis.set_xlabel("время от t0, с", color=MUTED, fontsize=8)
     axis.tick_params(axis="y", length=0, labelsize=8)
-    _set_time_limits(axis, dynamics)
-    fig.text(.075, .070, f"Принято переходов в обучение: {count}. Наблюдалось событий: {len(event_rows)}.",
+    fig.text(.24, .37 / fig.get_figheight(), f"Принято переходов в обучение: {count}. Наблюдалось событий: {len(event_rows)}.",
              color=TEXT, fontsize=8)
-    fig.text(.075, .035, "Предупреждение отмечает момент выдачи прогноза. Штриховка обозначает восстановление.",
+    fig.text(.24, .16 / fig.get_figheight(), "Предупреждение отмечает момент выдачи прогноза. Штриховка обозначает восстановление.",
              color=MUTED, fontsize=8)
-    _save(fig, path, bottom=.21, left=.27)
+    _save_time(fig, [axis], run, path, bottom=1.05 / fig.get_figheight(), top=1 - .85 / fig.get_figheight())
 
 
 def _kalman_window_reset(snapshot):
@@ -620,14 +725,12 @@ def _positive_limits(*series, minimum=1.0) -> tuple[float, float]:
     return 0.0, max(minimum, max(finite, default=0) * 1.12)
 
 
-def _attack_windows(dynamics: dict[str, Any]) -> list[dict[str, Any]]:
+def _attack_windows(dynamics, step_seconds, by_step) -> list[dict[str, Any]]:
     grouped: dict[tuple[str, bool], list[dict[str, Any]]] = {}
-    step_seconds = _observation_period(dynamics)
-    for snapshot in dynamics.get("snapshots", []):
+    for time, snapshot in zip(by_step.values(), dynamics.get("snapshots", [])):
         for event in snapshot.get("attacks", {}).get("events", []):
             key = _observed_event_id(event)
             recovery = bool(event.get("is_recovery_effect"))
-            time = float(snapshot.get("time_seconds", 0.0))
             windows = grouped.setdefault((key, recovery), [])
             if windows and time <= windows[-1]["end"] + 1e-9:
                 windows[-1]["end"] = max(windows[-1]["end"], time + step_seconds)
@@ -663,24 +766,23 @@ def _snapshot_link_loads(model, snapshot):
             for edge, rate in rates.items() if model is not None and model.graph.has_edge(*edge)]
 
 
-def _snapshot_peak_load(model, snapshot):
-    return max((rate / capacity * 100 for _, rate, capacity in _snapshot_link_loads(model, snapshot)
-                if np.isfinite(rate) and np.isfinite(capacity) and capacity > 0), default=float("nan"))
-
-
-def _link_load_rows(model, snapshots):
-    """Для каждой линии сохранить её пик и шаг, на котором он достигнут."""
+def _link_load_summary(model, snapshots):
+    """Пики каждой линии и каждого снимка за один обход предложенной нагрузки."""
+    per_step = []
     peaks = {}
     for snapshot in snapshots:
+        maximum = None
         for edge, rate, capacity in _snapshot_link_loads(model, snapshot):
             if not np.isfinite(rate) or not np.isfinite(capacity) or capacity <= 0:
                 continue
             edge = tuple(sorted(edge))
             utilization = rate / capacity * 100
+            maximum = utilization if maximum is None else max(maximum, utilization)
             if edge not in peaks or utilization > peaks[edge]["utilization_percent"]:
                 peaks[edge] = {"label": " ↔ ".join(edge), "utilization_percent": utilization,
                                "step_index": snapshot.get("step_index", 0)}
-    return list(peaks.values())
+        per_step.append(np.nan if maximum is None else maximum)
+    return list(peaks.values()), per_step
 
 
 def _plot_line(ax, x, y, label: str, color: str, *, linestyle: str = "-") -> None:
@@ -702,7 +804,6 @@ def _style_axes(
     ylim=None,
     *,
     legend: bool = True,
-    legend_columns: int = 1,
 ) -> None:
     style_axis(ax, title, ylabel)
     if ylim is not None:
@@ -712,17 +813,13 @@ def _style_axes(
         ax.text(.5, .5, "Нет данных для этого показателя", transform=ax.transAxes,
                 color=MUTED, ha="center", va="center", fontsize=9)
     if legend and handles:
-        # Легенда находится под данными, а не поверх линий и столбцов.
-        ax.legend(
-            loc="upper center",
-            bbox_to_anchor=(0.5, -0.22),
-            ncol=legend_columns,
-            facecolor=PANEL,
-            edgecolor="none",
-            labelcolor=TEXT,
-            fontsize=8,
-            frameon=False,
-        )
+        _side_legend(ax, handles, labels)
+
+
+def _side_legend(ax, handles, labels):
+    ax.legend(handles, [fill(label, 28) for label in labels],
+              loc="center right", bbox_to_anchor=(-.095, .5),
+              frameon=False, labelcolor=TEXT, fontsize=8)
 
 
 def _save(

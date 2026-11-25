@@ -322,7 +322,8 @@ def write_run_summary(summary, directory: Path):
               "и [пояснениях решений](algorithm_dialogue.md).",
               "Состав правил наблюдения приведён в [перечне Sigma, Suricata и YARA](detection_rules/manifest.json).", ""]
     if "koopman" in summary["files"]:
-        lines += ["[Купман](charts/koopman_risk.png) · [Ляпунов](charts/lyapunov_growth.png) · "
+        lines += ["[Прогноз, доставка и качество услуг на одной шкале времени](charts/incident_overview.png)", "",
+                  "[Купман](charts/koopman_risk.png) · [Ляпунов](charts/lyapunov_growth.png) · "
                   "[Хронология](charts/event_timeline.png) · [Арбитр](charts/arbitrator_signals.png)", "",
                   "[Обычный трафик](charts/native_traffic.png) · [Трафик атак](charts/attack_traffic.png) · "
                   "[SLA сети](charts/sla_by_class.png) · [SLA атакованных узлов](charts/attacked_node_sla.png)", "",

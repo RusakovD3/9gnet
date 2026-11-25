@@ -36,7 +36,7 @@ def test_unknown_measurements_are_gaps_instead_of_zero_or_success():
     for name in ("legitimate_delivery_percent", "gold_sla_percent",
                  "sla_margin_min", "koopman_forecast_risk", "normal_arrival_rate_pps"):
         assert np.isnan(series[name][0]), name
-    assert np.isnan(charts._snapshot_peak_load(None, {}))
+    assert np.isnan(charts._link_load_summary(None, [{}])[1][0])
 
 
 def test_observed_windows_preserve_gaps_and_ignore_future_schedule():
@@ -48,7 +48,7 @@ def test_observed_windows_preserve_gaps_and_ignore_future_schedule():
                 "training_summary": {"clean_training_steps": 17}}
     assert charts._accepted_transition_count(dynamics) == 1
     assert charts._training_windows(dynamics) == [(0, 2)]
-    windows = charts._attack_windows(dynamics)
+    windows = charts.RunTimeAxis.from_result(dynamics).windows
     assert [(w["start"], w["end"]) for w in windows] == [(0, 2), (6, 8)]
     # Плановый размер чистого участка не выдаётся за принятые переходы.
     assert charts._accepted_transition_count({"training_summary": {"clean_training_steps": 17}}) is None
@@ -56,15 +56,17 @@ def test_observed_windows_preserve_gaps_and_ignore_future_schedule():
 
 def test_capacity_separates_resources_keeps_outliers_and_saved_admission_limit(tmp_path, monkeypatch):
     captured = []
-    monkeypatch.setattr(charts, "save_figure", lambda figure, path: captured.append(figure))
+    monkeypatch.setattr(charts, "save_figure", lambda figure, path, **kwargs: captured.append(figure))
     snapshots = _snapshots()
     snapshots[2]["traffic"]["network_state"]["edge_vectors"] = [[10, 15]]
-    charts._plot_capacity_bottlenecks(None, snapshots, tmp_path / "capacity.png")
+    run = charts.RunTimeAxis.from_result({"snapshots": snapshots})
+    rows, peaks = charts._link_load_summary(None, snapshots)
+    charts._plot_capacity_bottlenecks(rows, tmp_path / "capacity.png")
     figure = captured[0]
     try:
         assert len(figure.axes) == 1
-        charts._plot_link_utilization(None, snapshots, tmp_path / "links.png")
-        charts._plot_resource_utilization(_snapshots(), tmp_path / "resources.png")
+        charts._plot_link_utilization(list(run.by_step), peaks, run, tmp_path / "links.png")
+        charts._plot_resource_utilization(_snapshots(), run, tmp_path / "resources.png")
         network, servers = captured[1].axes[0], captured[2].axes[0]
         assert figure.axes[0].patches[0].get_width() == 150
         assert figure.axes[0].get_xlim()[1] >= 150
@@ -89,8 +91,8 @@ def test_capacity_shows_target_work_when_packet_queue_cpu_is_low(tmp_path, monke
     for snapshot, pressure in zip(snapshots, [0, 75, 100, 0]):
         snapshot["traffic"]["network_state"]["node_metric_maxima"]["cpu_load_percent"] = 22
         snapshot["attacks"]["maximum_target_utilization_percent"] = pressure
-    monkeypatch.setattr(charts, "save_figure", lambda figure, path: captured.append(figure))
-    charts._plot_resource_utilization(snapshots, tmp_path / "resources.png")
+    monkeypatch.setattr(charts, "save_figure", lambda figure, path, **kwargs: captured.append(figure))
+    charts._plot_resource_utilization(snapshots, charts.RunTimeAxis.from_result({"snapshots": snapshots}), tmp_path / "resources.png")
     figure = captured[0]
     try:
         lines = {line.get_label(): line.get_ydata() for line in figure.axes[0].lines}
@@ -102,7 +104,7 @@ def test_capacity_shows_target_work_when_packet_queue_cpu_is_low(tmp_path, monke
 
 def test_timeline_labels_actual_training_and_prediction_issue_time(tmp_path, monkeypatch):
     captured = []
-    monkeypatch.setattr(charts, "save_figure", lambda figure, path: captured.append(figure))
+    monkeypatch.setattr(charts, "save_figure", lambda figure, path, **kwargs: captured.append(figure))
     dynamics = {"snapshots": _snapshots(), "config": {"step_count": 99, "step_seconds": 2},
                 "training_summary": {"clean_training_steps": 17}}
     dynamics["snapshots"][2]["koopman"]["kalman_filter"] = {
@@ -112,7 +114,7 @@ def test_timeline_labels_actual_training_and_prediction_issue_time(tmp_path, mon
         "local_observation": {"window": {"global_reset_reasons": []},
                               "vertices": {"covariance_reset_entity_count": 1}},
     }
-    charts._plot_timeline(dynamics, tmp_path / "timeline.png")
+    charts._plot_timeline(dynamics, charts.RunTimeAxis.from_result(dynamics), tmp_path / "timeline.png")
     figure = captured[0]
     try:
         text = " ".join(item.get_text() for item in figure.texts)
@@ -120,7 +122,8 @@ def test_timeline_labels_actual_training_and_prediction_issue_time(tmp_path, mon
         assert "момент выдачи прогноза" in text
         assert len(figure.axes) == 1
         assert "Сброс Калмана" in {tick.get_text() for tick in figure.axes[0].get_yticklabels()}
-        assert len(figure.axes[0].collections) == 4
+        assert len(figure.axes[0].collections) == 3
+        assert len(figure.axes[0].collections[-1].get_paths()) == 2
     finally:
         plt.close(figure)
 
@@ -129,7 +132,7 @@ def test_png_exports_render_for_empty_and_recorded_data(tmp_path):
     for name, dynamics in (("empty", {}), ("recorded", {"snapshots": _snapshots()})):
         exported = charts.export_dynamics_charts(dynamics, tmp_path / name)
         assert {path.name for path in exported.values()} == {
-            "koopman_risk.png", "lyapunov_growth.png", "native_traffic.png",
+            "incident_overview.png", "koopman_risk.png", "lyapunov_growth.png", "native_traffic.png",
             "attack_traffic.png", "sla_by_class.png", "attacked_node_sla.png",
             "event_timeline.png", "arbitrator_signals.png", "capacity_bottlenecks.png",
             "link_utilization.png", "resource_utilization.png", "service_sla_forecast.png",
@@ -140,9 +143,9 @@ def test_png_exports_render_for_empty_and_recorded_data(tmp_path):
     assert not plt.get_fignums()
 
 
-def test_koopman_and_lyapunov_read_saved_values_and_use_step_axis(tmp_path, monkeypatch):
+def test_koopman_and_lyapunov_read_saved_values_and_use_seconds(tmp_path, monkeypatch):
     captured = []
-    monkeypatch.setattr(charts, "save_figure", lambda figure, path: captured.append(figure))
+    monkeypatch.setattr(charts, "save_figure", lambda figure, path, **kwargs: captured.append(figure))
     snapshots = _snapshots()
     for snapshot, derivative in zip(snapshots, [-.025, 0, .025, .05]):
         snapshot["attacks"]["precursor_confidence"] = .13
@@ -153,15 +156,16 @@ def test_koopman_and_lyapunov_read_saved_values_and_use_step_axis(tmp_path, monk
         )
     dynamics = {"snapshots": snapshots}
     series = charts.extract_dynamics_chart_series(dynamics)
-    charts._plot_koopman(series, dynamics, tmp_path / "risk.png")
-    charts._plot_lyapunov(series, dynamics, tmp_path / "lyapunov.png")
+    run = charts.RunTimeAxis.from_result(dynamics)
+    charts._plot_koopman(series, *charts._risk_series(series, dynamics), run, tmp_path / "risk.png")
+    charts._plot_lyapunov(series, dynamics, run, tmp_path / "lyapunov.png")
     try:
         risk, growth = (figure.axes[0] for figure in captured)
         assert risk.get_ylim() == (0, 1)
         assert growth.get_ylim() == (-1, 1)
         np.testing.assert_array_equal(risk.lines[1].get_ydata(), [.8] * 4)
         np.testing.assert_array_equal(risk.lines[2].get_ydata(), [.37] * 4)
-        np.testing.assert_array_equal(growth.lines[0].get_xdata(), [0, 1, 2, 3])
+        np.testing.assert_array_equal(growth.lines[0].get_xdata(), [0, 2, 4, 6])
         np.testing.assert_allclose(growth.lines[0].get_ydata(), [-.5, 0, .5, 2 / 3])
     finally:
         for figure in captured:
@@ -196,3 +200,49 @@ def test_event_rates_and_target_sla_follow_observed_flows():
     expected = charts._expected_native_rates(snapshots)
     assert expected[1] == 40.0
     assert np.isnan(expected[0])
+
+
+def test_event_guides_use_observed_boundaries_and_saved_recovery():
+    event = {"attack_id": "A"}
+    states = [[], [event], [event, {"attack_id": "B"}],
+              [dict(event, is_recovery_effect=True)], [], [event]]
+    snapshots = [{"step_index": i, "time_seconds": 5 * i, "attacks": {"events": events}}
+                 for i, events in enumerate(states)]
+    result = {"snapshots": snapshots, "resilience_evaluation": {"episodes": [
+        {"recovered_step": 4}, {"recovered_step": None}]}}
+    axis = charts.RunTimeAxis.from_result(result)
+    assert axis.starts == (5, 10, 25)
+    assert axis.ends == (15,)
+    assert axis.recoveries == (20,)
+    # Конец окна наблюдения и отсутствующие снимки не подтверждают конец атаки.
+    assert charts.RunTimeAxis.from_result({"snapshots": snapshots[2::2],
+        "config": {"step_seconds": 5}}).ends == ()
+
+
+def test_export_projects_same_second_to_same_pixel_across_time_charts(tmp_path, monkeypatch):
+    snapshots = _snapshots()
+    snapshots[1]["attacks"]["events"] = [{"attack_id": "one", "effective_packet_rate_pps": 0}]
+    result = {"snapshots": snapshots, "resilience_evaluation": {"episodes": [{"recovered_step": 2}]}}
+    projections = {}
+
+    def check_figure(fig, path, *, tight=True):
+        try:
+            if path.name == "capacity_bottlenecks.png":
+                return
+            assert not tight
+            for ax in fig.axes:
+                assert ax.get_xlim() == (0, 8)
+                projections.setdefault(path.name, []).append(ax.transData.transform((4, 0))[0])
+                start, end, restored = [c.get_segments() for c in ax.collections[-3:]]
+                np.testing.assert_allclose(start, [[[2, 0], [2, 1]]])
+                np.testing.assert_allclose(end, [[[4, 0], [4, .5]]])
+                np.testing.assert_allclose(restored, [[[4, .5], [4, 1]]])
+        finally:
+            plt.close(fig)
+
+    monkeypatch.setattr(charts, "save_figure", check_figure)
+    charts.export_dynamics_charts(result, tmp_path)
+    assert "attack_traffic.png" in projections and "event_timeline.png" in projections
+    assert len(projections["incident_overview.png"]) == 3
+    pixels = [x for axes in projections.values() for x in axes]
+    np.testing.assert_allclose(pixels, pixels[0])
