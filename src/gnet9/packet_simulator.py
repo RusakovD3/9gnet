@@ -340,10 +340,8 @@ def _build_tcp_flow(context: FlowContext) -> dict[str, Any]:
             "file_size_mib": policy.get("file_size_mib"),
             "completion_time_budget_seconds": policy.get("completion_time_budget_seconds"),
             "media_codec": context.app.get("media_codec"),
-            "glass_to_glass_latency_ms": (
-                round(float(context.attrs.get("latency_budget_ms", 0.0)) * 0.65, 3)
-                if context.attrs.get("traffic_kind") == "live_streaming" else None
-            ),
+            # Сквозная задержка прямого эфира станет известна после расчёта очереди.
+            "glass_to_glass_latency_ms": None,
             "startup_time_budget_ms": policy.get("startup_time_budget_ms"),
             "rebuffer_ratio_budget_percent": policy.get("rebuffer_ratio_budget_percent"),
             "segment_deadline_miss_budget_percent": policy.get(

@@ -38,11 +38,66 @@ def test_overlapping_lead_windows_can_match_two_distinct_episodes():
     assert report["deployment_gate"]["passed"]
 
 
-def test_lead_uses_first_correct_sample_within_required_window():
+def test_late_update_is_separate_from_an_initial_warning_outside_lead_window():
     points = [TelemetryPoint(t, float(2 <= t <= 12), t == 23, "", "") for t in range(40)]
     metrics = _evaluate_threshold(points, 0.5, TelemetryValidationConfig(), max_gap=1.5)
-    # Окно 3–13 с. Первый подходящий отсчёт — в 3 с, упреждение — 20 с.
-    assert metrics["minimum_observed_lead_seconds"] == 20
+    # Фронт в 2 с опередил событие на 21 с, ближайшее обновление в окне — в 3 с.
+    assert metrics["predicted_onset_count"] == 0
+    assert metrics["false_warning_episode_count"] == 1
+    assert metrics["within_episode_updates"]["predicted_onset_count"] == 1
+    assert metrics["within_episode_updates"]["minimum_observed_lead_seconds"] == 20
+
+
+def test_calibration_finds_the_only_feasible_threshold_among_513_scores():
+    scores = list(range(513))
+    for timestamp, score in ((5, 512), (35, 511), (512, 510)):
+        j = scores.index(score)
+        scores[timestamp], scores[j] = scores[j], scores[timestamp]
+    points = [TelemetryPoint(start + t, v / 512, t in (20, 50), "", "")
+              for start in (0, 513) for t, v in enumerate(scores)]
+    config = TelemetryValidationConfig(training_fraction=0.5, minimum_events_per_partition=2)
+    report = validate_external_telemetry(points, config)
+    assert report["deployment_gate"]["passed"]
+    assert report["threshold_selection"]["selected_warning_risk_threshold"] == 511 / 512
+
+
+def test_long_episodes_cannot_pass_on_updates_and_have_an_occupancy_budget():
+    def points(onset):
+        return [TelemetryPoint(t, float(t % 100 != 0), t % 100 == onset, "", "") for t in range(1000)]
+    config = TelemetryValidationConfig(training_fraction=0.5)
+    late = points(50)
+    retrospective = validate_external_telemetry(late, config)
+    assert not retrospective["deployment_gate"]["passed"]
+    metrics = _evaluate_threshold(late[500:], 1.0, config, max_gap=1.5)
+    assert metrics["warning_occupancy_ratio"] == pytest.approx(494 / 499)
+    assert metrics["predicted_onset_count"] == 0
+    assert metrics["within_episode_updates"]["predicted_onset_count"] == 5
+    timely_points = points(15)
+    timely = validate_external_telemetry(timely_points, config)
+    assert timely["independent_holdout"]["metrics"]["predicted_onset_count"] == 5
+    assert not timely["deployment_gate"]["passed"]
+    relaxed = replace(config, maximum_warning_occupancy_ratio=1.0)
+    assert validate_external_telemetry(timely_points, relaxed)["deployment_gate"]["passed"]
+
+
+def test_earlier_schema_requires_revalidation_from_source_csv(tmp_path):
+    path = tmp_path / "old.json"
+    write_validation_report({"report_version": 2}, path)
+    with pytest.raises(TelemetryValidationError, match="CSV"):
+        load_pilot_calibration(path)
+
+
+def test_pilot_loader_checks_actual_occupancy_in_each_partition(tmp_path):
+    config = TelemetryValidationConfig(training_fraction=0.5, minimum_events_per_partition=1)
+    report = validate_external_telemetry(_two_part_trace({5}, {20}), config)
+    path = tmp_path / "inconsistent.json"
+    for metrics in (report["threshold_selection"]["training_metrics"], report["independent_holdout"]["metrics"]):
+        measured = metrics["warning_occupancy_ratio"]
+        metrics["warning_occupancy_ratio"] = 1.0
+        write_validation_report(report, path)
+        with pytest.raises(TelemetryValidationError):
+            load_pilot_calibration(path)
+        metrics["warning_occupancy_ratio"] = measured
 
 
 @pytest.mark.parametrize("gap, expected_matches, left_censored", [(0, 1, 1), (100, 2, 0)])
@@ -257,7 +312,7 @@ def test_external_csv_does_not_treat_missing_attack_label_as_healthy(tmp_path: P
 
 
 @pytest.mark.parametrize("field", ["minimum_lead_seconds", "maximum_lead_seconds",
-    "maximum_false_warnings_per_hour", "minimum_events_per_partition"])
+    "maximum_false_warnings_per_hour", "minimum_events_per_partition", "maximum_warning_occupancy_ratio"])
 @pytest.mark.parametrize("value", [float("nan"), float("inf")])
 def test_external_validation_rejects_nonfinite_configuration(field: str, value: float) -> None:
     with pytest.raises(TelemetryValidationError, match="конечными"):

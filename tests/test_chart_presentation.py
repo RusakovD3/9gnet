@@ -141,6 +141,7 @@ def test_png_exports_render_for_empty_and_recorded_data(tmp_path):
         for path in exported.values():
             image = plt.imread(path)
             assert image.shape[0] > 400 and image.shape[1] > 1000
+            np.testing.assert_allclose(image[0, 0, :3], [1, 1, 1])
     assert not plt.get_fignums()
 
 
@@ -251,8 +252,39 @@ def test_sla_legend_counts_accounted_flows_per_step():
     fig, ax = plt.subplots()
     try:
         charts._sla_lines(ax, series, [0, 2])
-        assert ax.lines[0].get_label() == "золотой · потоков: 8–10"
+        assert ax.lines[0].get_label() == "золотой · потоков: 8–10\nмин. 50 % в 0 с"
         np.testing.assert_array_equal(ax.lines[0].get_ydata(), [50, 75])
+    finally:
+        plt.close(fig)
+
+
+def test_minimum_caption_uses_first_observed_minimum_and_handles_flat_or_missing_series():
+    assert charts._minimum_caption([0, 2, 4, 6], [np.nan, 99.25, 100, 99.25]) == "мин. 99,25 % в 2 с"
+    assert charts._minimum_caption([0, 2], [100, np.nan]) == "100 % по измерениям"
+    assert charts._minimum_caption([0, 2], [100, 99.999]) == "мин. <100 % в 2 с"
+    assert charts._minimum_caption([0], [np.nan]) == ""
+
+
+def test_forecast_case_title_and_legend_fit_exported_canvas(tmp_path, monkeypatch):
+    figures = []
+    monkeypatch.setattr(charts, "save_figure", lambda fig, *args, **kwargs: figures.append(fig))
+    case = {"service": "RTP_VLC_AV", "flow_id": "M1_01",
+            "label_ru": "односторонняя задержка медиапотока", "unit": "мс",
+            "measurements": [{"time_seconds": 0, "value": 100, "budget": 150}],
+            "issue_time_seconds": 0, "target_time_seconds": 2, "actual_time_seconds": 2,
+            "measured_value": 100, "predicted_value": 160, "trend_at_target": 110}
+    charts._plot_service_forecast({"cases": {"hit": case}}, tmp_path / "forecast.png",
+                                  charts.RunTimeAxis.from_result({"snapshots": _snapshots()}))
+    fig, = figures
+    try:
+        fig.canvas.draw()
+        ax = fig.axes[0]
+        legend = ax.get_legend()
+        assert "Тренд потока" not in [t.get_text() for t in legend.get_texts()]
+        title = next(t for t in fig.findobj(plt.Text) if t.get_text().startswith("Предупреждённое нарушение"))
+        for artist in (title, legend):
+            bounds = artist.get_window_extent(fig.canvas.get_renderer())
+            assert fig.bbox.contains(*bounds.min) and fig.bbox.contains(*bounds.max)
     finally:
         plt.close(fig)
 

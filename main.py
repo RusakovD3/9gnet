@@ -562,6 +562,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Максимум ложных эпизодов в час для допуска внешнего порога (по умолчанию 0.10).",
     )
     parser.add_argument(
+        "--telemetry-max-warning-occupancy-ratio",
+        type=float,
+        default=TelemetryValidationConfig.maximum_warning_occupancy_ratio,
+        help="Предельная доля времени под тревогой (0–1), по умолчанию 0.20 (12 минут в час).",
+    )
+    parser.add_argument(
         "--attack-start-step", type=_positive_int, default=None,
         help="Шаг начала первой атаки. Предвестники появляются раньше; до них Купман обучается на исправном трафике.",
     )
@@ -737,6 +743,7 @@ def main() -> None:
             minimum_precision=args.telemetry_min_precision,
             minimum_recall=args.telemetry_min_recall,
             maximum_false_warnings_per_hour=args.telemetry_max_false_warnings_per_hour,
+            maximum_warning_occupancy_ratio=args.telemetry_max_warning_occupancy_ratio,
         )
         try:
             telemetry = read_telemetry_csv(args.validate_telemetry_csv)
@@ -753,12 +760,14 @@ def main() -> None:
         metrics = report["independent_holdout"]["metrics"]
         rate = metrics["false_warnings_per_hour"]
         rate_text = f"{rate:.3f}" if rate is not None else "нет данных"
+        occupancy = metrics["warning_occupancy_ratio"]
+        occupancy_text = f"{occupancy:.1%}" if occupancy is not None else "нет данных"
         print(f"Отчёт проверки порога готового ряда риска: {report_path}")
         print(
             "Порог на отложенном участке: "
             f"precision={metrics['precision'] * 100:.1f}%, "
             f"recall={metrics['recall'] * 100:.1f}%, "
-            f"ложных эпизодов/ч={rate_text}; "
+            f"ложных эпизодов/ч={rate_text}, под тревогой={occupancy_text}, "
             f"допуск={gate['status']}."
         )
         return

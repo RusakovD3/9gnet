@@ -115,7 +115,7 @@ def build_run_summary(dynamics, *, include_charts=True):
         "service_sla_forecast": {
             k: v for k, v in dynamics.get("service_sla_evaluation", {}).items()
             if k in {"maximum_horizon_seconds", "methods", "by_horizon_seconds", "by_service", "cases",
-                     "attribution", "route_stress", "operator_alert_evaluation"}
+                     "attribution", "route_stress", "operator_alert_evaluation", "operator_rule_version"}
         },
         "service_sla_runtime": dynamics.get("service_sla_runtime", {}),
         "operation_mode": "forecast_and_human_recommendations_only",
@@ -216,8 +216,14 @@ def _service_forecast_text(summary):
         lines += ["", "[График измерений, порогов и прогнозов по этим случаям](charts/service_sla_forecast.png)."]
     issued = forecast.get("operator_alert_evaluation", {})
     if issued:
-        lines += ["", "Для рабочего предупреждения о задержке медиапотока правило, выбранное на "
-                  "predictive-demo/11, требует измеренной потери и прогнозируемого пересечения за 2 с.",
+        description = {
+            2: "Правило учитывает изменение задержки потока, скачок показания датчика на пути и цену одного пакета.",
+            3: "Прогноз учитывает очередь, спрос и потери медиапотоков. Для DNS проверяются нагрузка "
+               "на сервер, число запросов и наблюдаемые тайм-ауты.",
+            4: "Для прогноза битрейта проверяются средний спрос и его разброс у абонентов. "
+               "Прогноз задержки учитывает очередь, прогноз тайм-аутов DNS — число запросов и тайм-аутов сервера.",
+        }.get(forecast.get("operator_rule_version"), "Прежнее правило предупреждало о задержке медиапотока при потере.")
+        lines += ["", description,
                   "", "| Окно зачёта, с | Предупреждены / все начала | Ложные / ч |",
                   "|---:|---:|---:|"]
         for horizon, row in issued.items():

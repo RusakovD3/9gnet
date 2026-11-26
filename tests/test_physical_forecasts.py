@@ -1,11 +1,93 @@
 import numpy as np
 import pytest
 
-from src.gnet9.koopman import KoopmanOnlineAnalyzer
+from src.gnet9.koopman import (KoopmanOnlineAnalyzer, _forecast_risk, _ideal_training_vectors,
+                               _scale_vector, apply_koopman_to_arbitrator)
 from src.gnet9.topology_builder import GNetBaselineBuilder
 
 
 MODEL = GNetBaselineBuilder().build()
+
+
+@pytest.mark.parametrize("signals,expected", [
+    ({"syn_backlog_growth_ratio": .9}, "syn_flood"),
+    ({"scan_rate_pps": 1}, "unknown_degradation_or_attack"),
+])
+def test_active_class_and_advice_follow_sensor_after_changing_hidden_event(signals, expected):
+    baseline = {"metric_names": ["OBS.precursor_confidence"], "vector": [0.]}
+    results = []
+    for hidden in ("power_attack", "dos"):
+        analyzer = KoopmanOnlineAnalyzer.from_t0(MODEL, baseline, step_seconds=2)
+        observation = {"active": hidden == "power_attack",
+                       "events": [{"kind": hidden, "target_id": "C1", "attack_id": "hidden-" + hidden}],
+                       "signature_observations": [{"sensor_node_id": "C2", "signals": signals}]}
+        result = analyzer.analyze_step(MODEL, baseline, attack_state=observation, step_index=1, time_seconds=2)
+        snapshot = {"arbitrator": {}, "attacks": observation}
+        apply_koopman_to_arbitrator(snapshot, result)
+        assert snapshot["arbitrator"]["trigger_card"]["confirmed"]
+        assert result["forecast_attack_kind"] == result["current_attack_kind"] == expected
+        assert result["current_attack_ids"] == result["forecast_attack_ids"] == []
+        assert result["forecast_target_ids"] == ["C2"]
+        assert all(h["attack_kind"] == expected and h["target_ids"] == ["C2"]
+                   for h in result["horizon_forecasts"])
+        assert all(r["target_id"] == "C2" and r["kind"] == expected and "attack_id" not in r
+                   for r in result["forecast_entity_records"])
+        results.append((result, snapshot["arbitrator"]["recommendation"]))
+    assert results[0] == results[1]
+
+
+def test_healthy_training_samples_respect_physical_bounds_and_absence_of_threat():
+    names = ["L7.gold_threat_minimum_distance_ms.mean", "L7.koopman_residual.mean",
+             "L7.remap_pressure.mean", "L2.cpu_load_percent.max", "L1.sla_margin.min"]
+    baseline = np.array([0., 0., 0., 100., 1.])
+    rows = _ideal_training_vectors(names, baseline, _scale_vector(names, baseline))
+    assert rows.shape == (64, 5)
+    assert np.all(rows[:, 0] == 0.)
+    assert np.all(rows >= 0.)
+    assert np.all(rows[:, 2:] <= [1., 100., 1.])
+    assert rows[0] == pytest.approx(baseline)
+
+
+def test_legacy_event_uses_its_sensor_reading_without_its_scenario_class():
+    state = {"metric_names": ["OBS.precursor_confidence"], "vector": [0.]}
+    event = {"target_id": "C1", "kind": "power_attack", "attack_id": "hidden",
+             "sensor_signals": {"syn_backlog_growth_ratio": .9}}
+    analyzer = KoopmanOnlineAnalyzer.from_t0(MODEL, state, step_seconds=2)
+    result = analyzer.analyze_step(MODEL, state, attack_state={"events": [event]}, step_index=1, time_seconds=2)
+    assert result["forecast_attack_kind"] == "syn_flood"
+    assert result["forecast_target_ids"] == ["C1"]
+    assert result["forecast_attack_ids"] == []
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_event_without_any_measurements_cannot_confirm_or_classify_an_attack(legacy):
+    state = {"metric_names": ["OBS.precursor_confidence"], "vector": [0.]}
+    empty_sensors = {} if legacy else {"signature_observations": [], "target_observations": []}
+    outputs = []
+    for events in ([], [{"kind": "dos", "target_id": "C1", "attack_id": "simulated"}]):
+        analyzer = KoopmanOnlineAnalyzer.from_t0(MODEL, state, step_seconds=2)
+        analyzer.analyze_step(MODEL, state, attack_state=empty_sensors, step_index=0, time_seconds=0)
+        observation = {**empty_sensors, "active": bool(events), "events": events}
+        result = analyzer.analyze_step(MODEL, state, attack_state=observation, step_index=1, time_seconds=2)
+        snapshot = {"arbitrator": {}, "attacks": observation}
+        apply_koopman_to_arbitrator(snapshot, result)
+        assert result["risk_state"] == "nominal"
+        assert result["forecast_attack_kind"] == result["current_attack_kind"] == "none"
+        assert not snapshot["arbitrator"]["trigger_card"]["confirmed"]
+        assert not snapshot["arbitrator"]["recommendation"]["requires_human_action"]
+        assert result["nominal_training"]["transition_accepted"] == (not legacy or not events)
+        outputs.append((result, snapshot["arbitrator"]))
+    if not legacy:
+        assert outputs[0] == outputs[1]
+
+
+@pytest.mark.parametrize("score,threshold,expected", [
+    (.4000003, .4000002, True), (.3999997, .3999998, False),
+])
+def test_risk_comparison_preserves_both_sides_of_a_close_threshold(score, threshold, expected):
+    measured = _forecast_risk(deviation=0., residual=0., operator_drift=0.,
+                              attack_score=score, precursor_only=False, threat_proximity_risk=0.)
+    assert (measured >= threshold) == expected
 
 
 def test_novel_loss_does_not_drive_cpu_or_line_outside_observations():
@@ -53,7 +135,8 @@ def test_future_schedule_and_scenario_label_cannot_change_any_issued_horizon():
             "scenario": scenario,
             "future_attack_start_step": onset,
             "precursors": [{"sensor_node_id": "C2", "signals": {"syn_backlog_growth_ratio": .9},
-                            "attack_id": str(onset), "start_step": onset}],
+                            "attack_id": str(onset), "start_step": onset,
+                            "correlation_id": f"TEL-{onset}-0-1"}],
         }
         traces.append([model.analyze_step(MODEL, measurement, attack_state=observation,
                                           step_index=step, time_seconds=2 * step) for step in range(2)])
@@ -61,6 +144,8 @@ def test_future_schedule_and_scenario_label_cannot_change_any_issued_horizon():
         assert first["horizon_forecasts"] == second["horizon_forecasts"]
         assert first["forecast_entity_records"] == second["forecast_entity_records"]
         assert first["numeric_forecast_origin"] == second["numeric_forecast_origin"]
+        assert first["forecast_correlation_ids"] == second["forecast_correlation_ids"] == [
+            f"TEL-{first['step_index']}-C2"]
     assert [row["forecast_is_early_warning"] for row in traces[0]] == [False, True]
 
 

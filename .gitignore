@@ -11,6 +11,7 @@ env/
 
 # Результаты расчётов и временные файлы
 output/
+/temp-local/
 __pycache__/
 *.py[cod]
 *.log

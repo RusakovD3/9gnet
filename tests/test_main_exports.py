@@ -200,6 +200,8 @@ def test_sigma_matches_observed_hypotheses_and_preserves_simulation_truth(tmp_pa
             {"target_id": "M1_01", "kind": "brute_force", "mitre_technique_id": "T1110.001"},
         ]},
     }
+    # Прогноз продолжающегося события и журнал сигнатур ссылаются на одно измерение.
+    snapshot["koopman"]["forecast_entity_records"].append(snapshot["koopman"]["signature_entity_records"][0])
     export_detection_rules(None, [snapshot], tmp_path)
 
     logs = [
@@ -297,3 +299,9 @@ def test_cli_rejects_simultaneous_validation_and_calibration_profile() -> None:
                 "profile.json",
             ]
         )
+
+
+def test_cli_allows_external_warning_occupancy_budget():
+    args = parse_args(["--validate-telemetry-csv", "telemetry.csv",
+                       "--telemetry-max-warning-occupancy-ratio", "0.15"])
+    assert args.telemetry_max_warning_occupancy_ratio == 0.15

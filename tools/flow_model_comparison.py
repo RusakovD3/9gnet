@@ -10,11 +10,14 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.gnet9.service_forecast import (
-    ServiceSLAForecaster, _delivery_projection, _identity, _offered_rate, _score_window, operator_warnings,
+    ServiceSLAForecaster, _delivery_projection, _identity, _offered_rate, _score_window, baseline_operator_warnings,
     warning_meets_rule,
 )
 from tools.flow_replay import archive_info, observations
 from tools.forecast_experiment import compare_at_alarm_budget
+
+
+ISSUE_HORIZON_SECONDS = 2
 
 
 def _family(w):
@@ -54,13 +57,13 @@ def _choose(views, method, groups, group_by):
     for group in groups:
         best = (0, 0)
         selected[group] = None
-        for loss, issue_horizon in ((False, 20), (True, 20), (True, 2)):
+        for loss in (False, True):
             for n in (1, 2, 3, 5, 10):
-                rule = {"confirmations": n, "require_loss": loss, "issue_horizon_seconds": issue_horizon}
+                rule = {"confirmations": n, "require_loss": loss, "issue_horizon_seconds": ISSUE_HORIZON_SECONDS}
                 candidate = _filtered(views, method, {group: rule}, group_by)
-                result, _ = _score_window(candidate, method, 20)
+                result, _ = _score_window(candidate, method, ISSUE_HORIZON_SECONDS)
                 quality = result["hits"], sum(result["lead_seconds"])
-                if not result["false_alarms"] and quality > best:
+                if not result["false_alarms"] and not result["censored"] and quality > best:
                     selected[group], best = rule, quality
     return selected
 
@@ -165,29 +168,37 @@ def compare(path, calibration=None, *, per_criterion=False):
             delay_errors["after"] += abs(w["predicted_value"] - actual)
             delay_errors["trend"] += abs(max(0., value - w["margin_delta"]) - actual)
             delay_errors["persistence"] += abs(value - actual)
-        pending_delay = operator_warnings(views["after"][-1])
+        pending_delay = baseline_operator_warnings(views["after"][-1])
     table, policies, repeats = {}, {}, {}
     group_by = _criterion if per_criterion else _family
     groups = sorted(criteria) if per_criterion else ("rate", "delay", "other")
-    for label, variant, method in (("before", "before", "koopman"), ("after", "after", "koopman"),
-                                   ("trend", "after", "trend")):
+    selection_horizon = (calibration.get("selection_horizon_seconds", 20)
+                         if calibration is not None else ISSUE_HORIZON_SECONDS)
+    comparisons = [("before", "before", "koopman"), ("after", "after", "koopman"),
+                   ("trend", "after", "trend")]
+    # В прежних архивах контроль с переносом последнего измерения отсутствовал.
+    if calibration is None or "persistence" in calibration["stratified_policy"]:
+        comparisons.append(("persistence", "after", "persistence"))
+    for label, variant, method in comparisons:
         series = views[variant]
         policies[label] = (_choose(series, method, groups, group_by) if calibration is None
                            else calibration["stratified_policy"][label])
         original = (None if calibration is None else {"confirmation_samples":
                     {method: calibration["repeat_policy"][label]}})
-        comparison = compare_at_alarm_budget(series, original)
+        comparison = compare_at_alarm_budget(series, original, horizon_seconds=selection_horizon)
         repeats[label] = comparison["confirmation_samples"][method]
-        repeat_rule = {"confirmations": repeats[label], "require_loss": False} if repeats[label] else None
+        repeat_rule = {"confirmations": repeats[label], "require_loss": False,
+                       "issue_horizon_seconds": selection_horizon} if repeats[label] else None
         selected_series = _filtered(series, method, policies[label], group_by)
-        table[label] = {"raw": _score(series, method),
+        table[label] = {"raw": _score(series, method, selection_horizon),
                         "repeat": _score(_filtered(series, method,
-                            dict.fromkeys(("rate", "delay", "other"), repeat_rule)), method),
-                        "stratified": _score(selected_series, method)}
+                            dict.fromkeys(("rate", "delay", "other"), repeat_rule)), method, selection_horizon),
+                        "stratified": _score(selected_series, method, selection_horizon)}
         if per_criterion:
             table[label]["stratified_by_matching_window"] = {
                 str(h): _score(selected_series, method, h) for h in (2, 10, 20)}
     return {"archive": path.name, "seed": info["seed"], "scenario": info["scenario"],
+            "selection_horizon_seconds": selection_horizon,
             "vary_demand": info["vary_demand"], "calibration_run": "predictive-demo/11",
             "validation_budget_false_per_observed_hour": 0, "repeat_policy": repeats,
             "policy_grouping": grouping, "stratified_policy": policies, "warnings": table,

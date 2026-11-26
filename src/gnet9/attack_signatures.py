@@ -14,6 +14,8 @@ MITRE_T1110_001_APT28_PROCEDURE_URL = "https://attack.mitre.org/techniques/T1110
 MITRE_T1110_001_APT28_MIN_ATTEMPTS_PER_HOUR = 300
 MITRE_T1110_001_ATTEMPTS_PER_SECOND = MITRE_T1110_001_APT28_MIN_ATTEMPTS_PER_HOUR / 3600
 MITRE_AN0969_PACKET_RATE_PPS = 10_000
+MITRE_AN0988_VOLUME_BYTES = 1_000_000
+MITRE_AN0988_WINDOW_SECONDS = 300
 # Длительность окна в секундах, стратегия и аналитика с примером настройки.
 MITRE_OBSERVATION_WINDOWS = {
     "T1046": (60, "DET0376", "AN1057"),
@@ -61,6 +63,7 @@ FEATURE_GROUPS = {
     "mobile_connectivity": ({"mobile_endpoint_flag": 1, "mobile_link_failure_ratio": 0.60},),
     "authentication": ({"inferred_attempt_rate_per_account_per_second": MITRE_T1110_001_ATTEMPTS_PER_SECOND},),
     "packet_rate": ({"observed_packet_rate_pps": MITRE_AN0969_PACKET_RATE_PPS},),
+    "egress_volume": ({"channel_volume_threshold_exceeded": 1},),
 }
 FEATURE_WEIGHTS = {
     "T1498.001": {"traffic_burst": 1.0, "packet_rate": 1.0},
@@ -71,7 +74,7 @@ FEATURE_WEIGHTS = {
     "T1046": {"service_discovery": 1.0},
     "T1204": {"user_execution": 1.0, "application_pressure": 0.20},
     "T1068": {"privilege_transition": 1.0, "user_execution": 0.20},
-    "T1041": {"egress": 1.0, "traffic_burst": 0.20},
+    "T1041": {"egress": 1.0, "traffic_burst": 0.20, "egress_volume": 1.0},
     "T1464": {"mobile_connectivity": 1.0},
     "T1110.001": {"authentication": 1.0},
 }
@@ -85,6 +88,9 @@ TECHNIQUE_BY_KIND = {
 LAG_WEIGHTS = (1.0, 0.85, 0.70, 0.55, 0.40, 0.30, 0.20, 0.10)
 WEIGHTED_MASKS = {technique: np.outer([features.get(name, 0.0) for name in FEATURE_GROUPS], LAG_WEIGHTS)
                   for technique, features in FEATURE_WEIGHTS.items()}
+# Сумма байтов уже включает историю датчика и входит в оценку один раз.
+EGRESS_VOLUME_ROW = tuple(FEATURE_GROUPS).index("egress_volume")
+WEIGHTED_MASKS["T1041"][EGRESS_VOLUME_ROW, 1:] = 0
 FLOOD_MECHANISMS = {
     "dos": ("udp_flood", "UDP flood"), "ddos": ("reflection_amplification", "отражённое усиление"),
     "syn_flood": ("syn_flood", "SYN flood"), "dhcp_flood": ("dhcp_flood", "DHCP flood"),
@@ -108,9 +114,39 @@ def _signal(signals: dict, name: str) -> float:
         value = float(signals.get(name, 0.0))
     except (TypeError, ValueError, OverflowError):
         return 0.0
-    if name == "authentication_failure_ratio" and not 0 <= value <= 1:
+    if name in ("authentication_failure_ratio", "established_channel_transfer_ratio") and not 0 <= value <= 1:
         return 0.0
     return value if math.isfinite(value) else 0.0
+
+
+def _volume_window_steps(step_seconds: int) -> int:
+    """Число полных интервалов, вместе занимающих строго меньше пяти минут."""
+    if step_seconds <= 0:
+        raise ValueError("Длительность шага должна быть положительной")
+    return math.ceil(MITRE_AN0988_WINDOW_SECONDS / step_seconds) - 1
+
+
+def signature_history_steps(step_seconds: int) -> int:
+    """Число отсчётов вместе с текущим для масок и накопления объёма T1041."""
+    return max(len(LAG_WEIGHTS), _volume_window_steps(step_seconds))
+
+
+def _channel_rate(sample: dict) -> float:
+    fraction = _signal(sample, "established_channel_transfer_ratio")
+    return max(0.0, _signal(sample, "unusual_egress_bytes_per_second")) * fraction
+
+
+def _observed_channel_bytes(signals: dict, history: list[dict | None], step_seconds: int) -> float | None:
+    """Сумма (байт/с × доля × с) по известным интервалам одного датчика."""
+    window_steps = _volume_window_steps(step_seconds)
+    if not window_steps:
+        return None
+    current = _channel_rate(signals)
+    if not current:
+        return 0.0
+    rates = [current]
+    rates.extend(_channel_rate(sample) for sample in history[:window_steps - 1] if sample is not None)
+    return math.fsum(rate * step_seconds for rate in rates)
 
 
 def _feature_vector(signals: dict) -> list[float]:
@@ -126,6 +162,9 @@ def _technique_mask(technique: str, step_seconds: int) -> np.ndarray:
     if step_seconds <= 0:
         raise ValueError("Длительность шага должна быть положительной")
     mask = WEIGHTED_MASKS[technique]
+    if technique == "T1041" and _volume_window_steps(step_seconds) == 0:
+        mask = mask.copy()
+        mask[EGRESS_VOLUME_ROW] = 0
     if technique in MITRE_OBSERVATION_WINDOWS:
         window_seconds, _, _ = MITRE_OBSERVATION_WINDOWS[technique]
         ages_seconds = np.arange(len(LAG_WEIGHTS)) * step_seconds
@@ -167,6 +206,14 @@ def signature_catalog(*, step_seconds: int = DYNAMICS_STEP_SECONDS) -> dict:
         "observed_metric": "observed_packet_rate_pps",
         "packets_per_second": MITRE_AN0969_PACKET_RATE_PPS,
     }
+    references["T1041"] = {
+        "source_url": "https://attack.mitre.org/detectionstrategies/DET0348/#:~:text=DataVolumeThreshold",
+        "analytic_id": "AN0988", "origin": "DataVolumeThreshold_example",
+        "volume_strictly_greater_than_bytes": MITRE_AN0988_VOLUME_BYTES,
+        "duration_strictly_less_than_seconds": MITRE_AN0988_WINDOW_SECONDS,
+        "observed_metric": "observed_channel_volume_bytes",
+        "derivation": "sum(unusual_egress_bytes_per_second * established_channel_transfer_ratio * step_seconds)",
+    }
     return {
         "value_origin": "gnet9_scenario_assumption",
         "row_kinds": list(SIGNATURE_LIMITS),
@@ -179,6 +226,11 @@ def signature_catalog(*, step_seconds: int = DYNAMICS_STEP_SECONDS) -> dict:
         "minimum_values": SIGNATURE_MATRIX.tolist(),
         "hadamard_mask": SIGNATURE_MASK.astype(int).tolist(),
         "match_semantics": "minimum_observed_to_threshold_ratio_over_required_columns_at_least_one",
+        "alternative_gate": {"exfiltration": {
+            "replaces_required_column": "unusual_egress_bytes_per_second",
+            "condition": "channel_volume_threshold_exceeded",
+            "numeric_reference": "T1041",
+        }},
         "weighted_masks": {
             "rows": list(FEATURE_GROUPS), "step_lags": list(range(len(LAG_WEIGHTS))),
             "normalization_by_row": FEATURE_GROUPS, "lag_weights": LAG_WEIGHTS,
@@ -200,6 +252,10 @@ def match_attack_signature(signals: dict, *, history: list[dict | None] | None =
     Например, один запуск при росте CPU на 0,30 даёт min(1, 2) = 1.
     Отсутствующие или неконечные значения не удовлетворяют порогу.
     """
+    history = history or []
+    channel_bytes = _observed_channel_bytes(signals, history, step_seconds)
+    volume_exceeded = channel_bytes is not None and channel_bytes > MITRE_AN0988_VOLUME_BYTES
+    signals = {**signals, "channel_volume_threshold_exceeded": int(volume_exceeded)}
     values = np.array([_signal(signals, name) for name in SIGNATURE_COLUMNS])
     power_control = _signal(signals, "power_control_anomaly_ratio")
     voltage_sag = _signal(signals, "power_voltage_sag_ratio")
@@ -207,6 +263,10 @@ def match_attack_signature(signals: dict, *, history: list[dict | None] | None =
         power_control / 0.18, voltage_sag / 0.02,
     )
     masked = (values / SIGNATURE_SCALE) * SIGNATURE_MASK
+    if volume_exceeded:
+        row = tuple(SIGNATURE_LIMITS).index("exfiltration")
+        column = SIGNATURE_COLUMNS.index("unusual_egress_bytes_per_second")
+        masked[row, column] = max(masked[row, column], channel_bytes / MITRE_AN0988_VOLUME_BYTES)
     margins = np.min(np.where(SIGNATURE_MASK, masked, np.inf), axis=1)
     matches = np.flatnonzero(margins >= 1.0)
     if matches.size == 0:
@@ -214,19 +274,22 @@ def match_attack_signature(signals: dict, *, history: list[dict | None] | None =
     kinds = tuple(SIGNATURE_LIMITS)
     candidates = {kinds[index]: float(margins[index]) for index in matches}
     techniques = {TECHNIQUE_BY_KIND[kind] for kind in candidates if kind in TECHNIQUE_BY_KIND}
-    scores = _weighted_scores(techniques, signals, history or [], step_seconds) if techniques else {}
+    scores = _weighted_scores(techniques, signals, history, step_seconds) if techniques else {}
     ordered = sorted(candidates, key=lambda kind: (
         2 if kind not in {"dos", "ddos"} else 1 if kind == "ddos" else 0,
         scores.get(TECHNIQUE_BY_KIND.get(kind), 1.0), candidates[kind],
     ), reverse=True)
     kind = ordered[0]
     technique = TECHNIQUE_BY_KIND.get(kind)
+    observed = {name: float(value) for name, value in zip(SIGNATURE_COLUMNS, values)
+                if name in SIGNATURE_LIMITS[kind]}
+    if kind == "exfiltration":
+        observed["observed_channel_volume_bytes"] = channel_bytes
     return {
         "kind": kind, "margin_ratio": round(candidates[kind], 6), "matching_kinds": ordered,
         "weighted_technique_id": technique,
         "weighted_score": round(scores[technique], 6) if technique else None,
         "weighted_technique_scores": {technique: round(score, 6) for technique, score in scores.items()},
         **flood_fields(kind, _signal(signals, "observed_ingress_count")),
-        "observed_values": {name: float(value) for name, value in zip(SIGNATURE_COLUMNS, values)
-                            if name in SIGNATURE_LIMITS[kind]},
+        "observed_values": observed,
     }

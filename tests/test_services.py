@@ -1,6 +1,9 @@
 from collections import Counter
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 from src.gnet9.addressing import build_ip_address_plan
 from src.gnet9.attacks import apply_attack_effects
@@ -169,9 +172,31 @@ def test_each_application_has_balanced_flows_and_targets_a_physical_server() -> 
     live = next(flow for flow in traffic["flows"] if flow["application"] == "LIVE_HLS" and flow["sla_grade"] == "gold")
     dns = next(flow for flow in traffic["flows"] if flow["application"] == "DNS" and flow["sla_grade"] == "gold")
     assert ftp["tcp_retransmission_budget_percent"] == 0.1
-    assert live["glass_to_glass_latency_ms"] == 1300.0
+    assert live["glass_to_glass_latency_ms"] == pytest.approx(1300.0 + live["one_way_latency_ms"])
     assert live["startup_time_budget_ms"] == 1500.0
     assert dns["dns_request_rate_qps"] == 2.0
+
+
+def test_live_latency_follows_route_and_is_independent_of_sla_limit():
+    client = "F1_02"
+    def snapshot(extra_delay_ms, budget_ms):
+        graph = MODEL.graph.copy()
+        attrs = graph.nodes[client]
+        graph.edges[client, attrs["home_access"]]["latency_ms"] += extra_delay_ms
+        attrs["latency_budget_ms"] = budget_ms
+        attrs["d0sl_policy"] = dict(attrs["d0sl_policy"], latency_budget_ms=budget_ms)
+        traffic = simulate_packet_snapshot(replace(MODEL, graph=graph), step_index=0,
+                                           time_seconds=0, step_seconds=2, detail="flows")
+        flow = next(f for f in traffic["flows"] if f["client_node"] == client)
+        return flow["slo_evaluation"]["metrics"]["ll_hls_live_edge_latency_ms"]
+
+    baseline = snapshot(0, 3000)
+    slow = snapshot(4000, 3000)
+    assert slow["observed_value"] == pytest.approx(baseline["observed_value"] + 4000)
+    assert baseline["compliant"] and not slow["compliant"]
+    relaxed = snapshot(4000, 8000)
+    assert relaxed["observed_value"] == slow["observed_value"]
+    assert relaxed["compliant"]
 
 
 def test_service_aware_slo_evaluation_exports_honest_metric_coverage() -> None:

@@ -6,6 +6,7 @@ from collections import defaultdict
 from typing import Any
 
 from .gelenbe import gelenbe_queue
+from .routing import LOGICAL_SERVICE_MEDIUM
 
 
 VERTEX_METRICS = (
@@ -113,8 +114,12 @@ def network_runtime_metrics(model, flows: list[dict[str, Any]], events=(), *, de
         if declared:
             service = sum(float(f.get("transport_queue", {}).get("service_rate_pps", 0.0)) for f in normal) or float(declared["service_rate_pps"])
         else:
-            capacity = sum(float(model.graph.edges[node, neighbor].get("capacity_mbps", 0.0))
-                           for neighbor in model.graph.neighbors(node))
+            # Привязка услуги к хосту задаёт условную полосу виртуальной услуги.
+            # Аппаратная пропускная способность сервера складывается из его портов.
+            capacity = sum(
+                float(edge.get("capacity_mbps", 0.0)) for edge in model.graph[node].values()
+                if attrs.get("role") == "service" or edge.get("medium") != LOGICAL_SERVICE_MEDIUM
+            )
             service = max(1.0, capacity * 1_000_000.0 / (8.0 * max(packet_bytes, 1.0)))
         # Эквивалент уничтожения не переносится вдоль всего маршрута.
         # Атакующие пакеты выше входят только в положительное поступление.

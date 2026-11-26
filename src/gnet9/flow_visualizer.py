@@ -15,6 +15,7 @@ from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 from matplotlib.widgets import Button, Slider
 import numpy as np
 
+from . import chart_style
 from .constants import SERVICE_DISPLAY_NAMES
 from .flow_details import (FLOW_SHORT_LABELS, _flow_summary, _flow_is_visible,
                            _interactive_snapshot_summary, _interactive_status_sections,
@@ -574,7 +575,7 @@ def draw_security_dashboard(model, snapshots: list[dict[str, Any]], path: Path) 
 
     # Координаты в типографских пунктах; высота зависит от числа строк.
     width = 792
-    fig = plt.figure(facecolor=BACKGROUND)
+    fig = plt.figure(facecolor=chart_style.BACKGROUND)
     ax = fig.add_axes([0, 0, 1, 1])
     ax.set_axis_off()
     ax.set_xlim(0, width)
@@ -583,11 +584,13 @@ def draw_security_dashboard(model, snapshots: list[dict[str, Any]], path: Path) 
     step = snapshot.get("step_index", index)
     time = snapshot.get("time_seconds")
     when = f"Шаг {step}" + (f"  ·  {time:g} с от начала прогона" if time is not None else "")
-    _dashboard_text(ax, 24, 65, when, 13, color=MUTED)
-    _dashboard_text(ax, 768, 26, "Максимальный уровень срочности за прогон", 11, color=MUTED, align="right")
+    _dashboard_text(ax, 24, 65, when, 13, color=chart_style.MUTED)
+    _dashboard_text(ax, 768, 26, "Максимальный уровень срочности за прогон", 11, color=chart_style.MUTED, align="right")
     severity = dashboard["severity_label"] if dashboard["severity_available"] else "Нет данных о срочности"
-    _dashboard_text(ax, 768, 48, severity, 19, color=dashboard["severity_color"], bold=True, align="right")
-    ax.hlines(103, 24, 768, colors=BORDER)
+    severity_color = {"critical": chart_style.RED, "high": chart_style.AMBER,
+                      "warning": chart_style.AMBER, "watch": chart_style.BLUE}.get(dashboard["severity"], chart_style.MUTED)
+    _dashboard_text(ax, 768, 48, severity, 19, color=severity_color, bold=True, align="right")
+    ax.hlines(103, 24, 768, colors=chart_style.BORDER)
 
     attacks = snapshot.get("attacks", {})
     current = [alarm for alarm in dashboard["alarms"] if alarm["phase"] != "history"]
@@ -595,7 +598,7 @@ def draw_security_dashboard(model, snapshots: list[dict[str, Any]], path: Path) 
     observations_end = _draw_security_observations(ax, current, attacks)
     quality_end = _draw_security_quality(ax, attacks.get("sla_restoration", {}).get("tiers", []))
     divider = max(observations_end, quality_end) + 10
-    ax.hlines(divider, 24, 768, colors=BORDER)
+    ax.hlines(divider, 24, 768, colors=chart_style.BORDER)
     y = _dashboard_text(ax, 24, divider + 21, "Первое действие оператора", 17, bold=True)
     recommendation = dashboard["recommendation"]
     steps = recommendation.get("steps_ru", [])
@@ -606,7 +609,7 @@ def draw_security_dashboard(model, snapshots: list[dict[str, Any]], path: Path) 
     save_figure(fig, path, dpi=135)
 
 
-def _dashboard_text(ax, x, y, value, size, *, color=TEXT, bold=False, wrap=0, align="left"):
+def _dashboard_text(ax, x, y, value, size, *, color=chart_style.TEXT, bold=False, wrap=0, align="left"):
     value = textwrap.fill(value, width=wrap) if wrap else value
     ax.text(x, y, value, fontsize=size, color=color, fontweight="bold" if bold else "normal",
             va="top", ha=align, linespacing=1.25)
@@ -618,16 +621,16 @@ def _draw_security_observations(ax, current, attacks):
     y = 163
     for alarm in current[:2]:
         y = _dashboard_text(ax, 24, y, f"{alarm['phase_label']}  ·  {alarm['target_id']}", 11,
-                            color=MUTED, wrap=50)
+                            color=chart_style.MUTED, wrap=50)
         y = _dashboard_text(ax, 24, y + 2, alarm["kind_label"], 15, bold=True, wrap=34)
         routes = alarm["routes"]
         if routes:
-            y = _dashboard_text(ax, 24, y + 2, "Маршрут: " + " → ".join(routes[0]), 11, color=BLUE, wrap=50)
+            y = _dashboard_text(ax, 24, y + 2, "Маршрут: " + " → ".join(routes[0]), 11, color=chart_style.BLUE, wrap=50)
         elif alarm["phase"] != "precursor" and alarm["evidence_lines"]:
-            y = _dashboard_text(ax, 24, y + 2, alarm["evidence_lines"][0], 11, color=MUTED, wrap=50)
+            y = _dashboard_text(ax, 24, y + 2, alarm["evidence_lines"][0], 11, color=chart_style.MUTED, wrap=50)
         y += 13
     if len(current) > 2:
-        y = _dashboard_text(ax, 24, y, f"Другие наблюдения на шаге: {len(current) - 2}", 11, color=MUTED)
+        y = _dashboard_text(ax, 24, y, f"Другие наблюдения на шаге: {len(current) - 2}", 11, color=chart_style.MUTED)
 
     if not current:
         observed = "events" in attacks and "precursors" in attacks
@@ -644,7 +647,7 @@ def _draw_security_quality(ax, tier_rows):
     tiers = {t.get("sla_grade"): t for t in tier_rows}
     if not tiers:
         return _dashboard_text(ax, 435, 163, "Нет данных о качестве", 14)
-    y = _dashboard_text(ax, 435, 163, "Абонентские потоки, выполнившие проверенные требования", 11, color=MUTED) + 9
+    y = _dashboard_text(ax, 435, 163, "Абонентские потоки, выполнившие проверенные требования", 11, color=chart_style.MUTED) + 9
     for grade, label in (("gold", "Золотой"), ("silver", "Серебряный"), ("bronze", "Бронзовый")):
         tier = tiers.get(grade, {})
         total = tier.get("flow_count")
@@ -652,8 +655,8 @@ def _draw_security_quality(ax, tier_rows):
         count = "нет потоков" if total == 0 else "нет данных"
         if total and compliant is not None:
             count = f"{compliant} из {total}"
-            ax.hlines(y + 19, 435, 768, colors=BORDER, linewidth=3)
-            ax.hlines(y + 19, 435, 435 + 333 * compliant / total, colors=BLUE, linewidth=3)
+            ax.hlines(y + 19, 435, 768, colors=chart_style.BORDER, linewidth=3)
+            ax.hlines(y + 19, 435, 435 + 333 * compliant / total, colors=chart_style.BLUE, linewidth=3)
         _dashboard_text(ax, 435, y, label, 12)
         _dashboard_text(ax, 768, y, count, 12, align="right")
         y += 36

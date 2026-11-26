@@ -9,6 +9,7 @@ recommendations for a human operator while preserving the ideal ``t0`` reference
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from math import isclose
 from time import perf_counter
 from typing import Any, Literal
 
@@ -46,7 +47,7 @@ from .l1_d0sl import SLA_GRADE_WEIGHTS, weighted_sla_compliance
 from .packet_simulator import TRAFFIC_APPS, simulate_packet_snapshot
 from .routing import FixedTopologyRoutes
 from .runtime_metrics import LINK_LOAD_RATIO_ORIGIN, compact_runtime_state
-from .service_forecast import ServiceSLAForecaster, _score_window, evaluate_service_forecasts, operator_warnings
+from .service_forecast import ServiceSLAForecaster, _score_window, evaluate_service_forecasts
 from .route_stress import RouteStressMonitor, evaluate_route_stress
 from .tensor_matrix import (
     build_tensor_matrix_view,
@@ -212,9 +213,9 @@ def simulate_stationary_dynamics(
             nominal=koopman_view["nominal_training"]["observation_eligible"],
         )
         view = snapshot["service_sla_forecast"]
-        view["operator_warnings"] = operator_warnings(view)
-        route_view = route_monitor.observe(traffic.get("flows", ()), snapshot.get("attacks", {}).get("precursors", ()),
+        route_view = route_monitor.observe(traffic.get("flows", ()), snapshot.get("attacks", {}).get("precursors"),
                                            time_seconds=snapshot["time_seconds"])
+        view["operator_warnings"] = route_view["operator_warnings"]
         snapshot["service_sla_forecast"]["route_stress_warnings"] = route_view["warnings"]
         if step_index or config.include_t0:
             route_views.append(route_view)
@@ -256,7 +257,8 @@ def simulate_stationary_dynamics(
     if config.step_seconds == 2:
         issued = [{**v, "warnings": v["operator_warnings"]} for v in service_views]
         service_evaluation["operator_alert_evaluation"] = {
-            str(h): _score_window(issued, "koopman", h)[0] for h in (2, 10, 20)}
+            str(h): _score_window(issued, "operator", h)[0] for h in (2, 10, 20)}
+        service_evaluation["operator_rule_version"] = route_monitor.operator_version
     service_evaluation["route_stress"] = evaluate_route_stress(route_views, service_views)
     sla_forecaster.case_traces(service_evaluation)
     for case in service_evaluation["cases"].values():
@@ -713,6 +715,13 @@ def validate_ideal_t0(model: NetworkModel, snapshot: dict[str, Any] | None = Non
             violations.append({"scope": "L7", "reason": "non_ideal_koopman_t0"})
         if "traffic" in snapshot:
             traffic = snapshot["traffic"].get("summary", {})
+            count = traffic.get("legitimate_packet_count", 0)
+            interval = traffic.get("interval_seconds", 0)
+            rate = traffic.get("normal_arrival_rate_pps", 0.0)
+            if not (type(count) is int and count > 0 and type(interval) in (float, int) and interval > 0
+                    and type(rate) in (float, int) and rate > 0
+                    and isclose(rate, count / interval, rel_tol=1e-9)):
+                violations.append({"scope": "TRAFFIC", "reason": "invalid_normal_offered_load"})
             if traffic.get("observed_dropped_packets", 0) or traffic.get("observed_retransmissions", 0) or traffic.get("observed_loss_ratio", 0.0):
                 violations.append({"scope": "TRAFFIC", "reason": "observed_loss_or_retransmission"})
             metrics["observed_loss_ratio"] = float(traffic.get("observed_loss_ratio", 0.0))
@@ -1245,12 +1254,16 @@ def _warning_episodes_and_exposure(snapshots, step_seconds):
     return episodes, observed_seconds, warning_seconds, span - observed_seconds
 
 
-def _match_warning_episodes(episodes, onsets, step_seconds):
-    """Максимальное число пар. При равенстве предпочитаем ранние начала и сигналы."""
+def _match_warning_episodes(episodes, onsets, step_seconds, required_lead_seconds):
+    """Максимизировать число пар, затем число пар с требуемым упреждением."""
     graph = nx.Graph()
     first_signals = {}
     latest_step = max((ep.samples[-1][0] for ep in episodes), default=0)
     onset_priority = (latest_step + 1) * (len(onsets) + 1)
+    # Бонус одной своевременной пары превышает сумму штрафов за поздние
+    # начала и сигналы даже в самом большом возможном сопоставлении.
+    max_pairs = min(len(onsets), len(episodes))
+    timely_bonus = 1 + max_pairs * (len(onsets) * onset_priority + latest_step)
     for onset_index, (snapshot, event) in enumerate(onsets):
         step, time = snapshot["step_index"], snapshot["time_seconds"]
         for episode_index, episode in enumerate(episodes):
@@ -1260,8 +1273,9 @@ def _match_warning_episodes(episodes, onsets, step_seconds):
             for issue_step, issue_time, window_start, window_end in episode.samples:
                 if time - issue_time >= step_seconds and window_start <= step <= window_end:
                     first_signals[onset_index, episode_index] = (issue_step, issue_time)
+                    timely = time - issue_time >= required_lead_seconds
                     graph.add_edge(("onset", onset_index), ("warning", episode_index),
-                                   weight=-(onset_index * onset_priority + issue_step))
+                                   weight=timely * timely_bonus - onset_index * onset_priority - issue_step)
                     break
     matched = {}
     for left, right in nx.max_weight_matching(graph, maxcardinality=True):
@@ -1287,7 +1301,7 @@ def _koopman_evaluation(
                     if int(event.get("relative_step", -1)) == 0]
     episodes, observed_seconds, warning_seconds, gap_seconds = _warning_episodes_and_exposure(
         snapshots, step_seconds)
-    matched = _match_warning_episodes(episodes, onset_events, step_seconds)
+    matched = _match_warning_episodes(episodes, onset_events, step_seconds, required_lead_seconds)
     records = []
     for index, (snapshot, event) in enumerate(onset_events):
         match = matched.get(index)

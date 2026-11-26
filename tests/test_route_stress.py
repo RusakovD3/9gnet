@@ -12,6 +12,38 @@ def sample(value, onset=50):
     return [{"sensor_node_id": "S", "start_step": onset, "signals": {"dns_query_pressure_ratio": value}}]
 
 
+def test_operator_forecasts_next_sample_from_local_delay_and_measured_route_signal():
+    def media(client, node, count, latency, loss=0):
+        return {"client_node": client, "traffic_kind": "voice", "route": [client, node], "packet_count": count,
+                "observed_dropped_packets": loss, "slo_evaluation": {"metrics": {
+                    name: {"compliant": True, "required": True, "comparison": "lte", "unit": unit,
+                           "observed_value": value, "effective_budget_value": limit}
+                    for name, unit, value, limit in (("one_way_media_latency_ms", "ms", latency, 150),
+                            ("network_packet_loss_percent", "%", 100 * loss / count, 1))}}}
+
+    initial = [media("A", "S", 100, 90), media("B", "S", 50, 10), media("C", "X", 50, 10)]
+    current = [media("A", "S", 100, 140, 1), *initial[1:]]
+    def run(hidden):
+        monitor = RouteStressMonitor(2)
+        assert not monitor.observe(initial, [], time_seconds=0)["operator_warnings"]
+        readings = [{"sensor_node_id": "S", "signals": {"traffic_acceleration_ratio": .6}, "start_step": hidden}]
+        issued = monitor.observe(current, readings, time_seconds=2)["operator_warnings"]
+        assert not monitor.observe(current, readings, time_seconds=4)["operator_warnings"]
+        assert not monitor.observe(current, [], time_seconds=8)["operator_warnings"]
+        return issued
+
+    warnings = run(99)
+    assert warnings == run(5)
+    assert {(w["flow_id"], w["criterion"], w["predicted_value"]) for w in warnings} == {
+        ("A", "one_way_media_latency_ms", 165), ("A", "network_packet_loss_percent", 2),
+        ("B", "network_packet_loss_percent", 2)}
+    assert all(w["issue_time_seconds"] == 2 and w["target_time_seconds"] == 4 for w in warnings)
+    monitor = RouteStressMonitor(2)
+    monitor.observe(initial, None, time_seconds=0)
+    readings = [{"sensor_node_id": "S", "signals": {"traffic_acceleration_ratio": .6}}]
+    assert not monitor.observe(initial, readings, time_seconds=2)["operator_warnings"]
+
+
 def test_warning_needs_local_rising_readings_and_strict_one_loss_sensitivity():
     monitor = RouteStressMonitor(2)
     flows = [dns("A", "S", 10), dns("B", "X", 10), dns("C", "S", 100)]
@@ -60,3 +92,59 @@ def test_false_alarms_per_hour_uses_only_adjacent_measured_intervals():
     empty = evaluate_route_stress(views[:1], truth[:1])["methods"][METHOD]
     assert empty["issued_samples"] == 0
     assert empty["false_alarms_per_observed_hour"] is None
+
+
+def test_queue_delay_is_counted_once_and_bitrate_uses_comparable_offers():
+    def media(name, delay, queue, loss, measured):
+        def metric(value, limit, comparison, unit):
+            return dict(observed_value=value, budget_value=limit, effective_budget_value=limit,
+                        compliant=True, comparison=comparison, unit=unit, required=True)
+        return {"client_node": name, "traffic_kind": "vlc_av", "sla_grade": "gold", "packet_count": 100,
+                "observed_dropped_packets": loss, "payload_bytes": 25000, "interval_seconds": 2,
+                "transport_queue": {"additional_delay_ms": queue, "utilization_rho": 2},
+                "slo_evaluation": {"metrics": {
+                    "one_way_media_latency_ms": metric(delay, 250, "lte", "ms"),
+                    "media_bitrate_kbps": metric(measured, 82, "gte", "kbit/s")}}}
+    first = [media(n, 10, 0, 0, 100) for n in "ABC"]
+    now = [media(n, 200, 60, 16, 84) for n in "ABC"]
+    for version in (2, 3, 4):
+        monitor = RouteStressMonitor(2, operator_version=version)
+        monitor.observe(first, [], time_seconds=0)
+        warnings = monitor.observe(now, [], time_seconds=2)["operator_warnings"]
+        if version == 2:
+            assert {w["predicted_value"] for w in warnings} == {295}
+        else:
+            assert len(warnings) == 3
+            assert {(w["criterion"], w["predicted_value"], w["predicted_headroom"]) for w in warnings} == {
+                ("media_bitrate_kbps", 80, -2)}
+            monitor.observe([], [], time_seconds=4)
+            assert not monitor.observe(now, [], time_seconds=6)["operator_warnings"]
+
+    # При среднем спросе 100 кбит/с разброс одновременных предложений 90, 100, 110
+    # оставляет реалистичный исход выше предела 82 кбит/с даже при потере 20%.
+    for row, demand in zip(now, (90, 100, 110)):
+        row["payload_bytes"] = 250 * demand
+        metric = row["slo_evaluation"]["metrics"]["media_bitrate_kbps"]
+        metric.update(observed_value=.84 * demand, compliant=.84 * demand >= 82)
+    for version, expected in ((3, ["B", "C"]), (4, [])):
+        monitor = RouteStressMonitor(2, operator_version=version)
+        monitor.observe(first, [], time_seconds=0)
+        issued = monitor.observe(now, [], time_seconds=2)["operator_warnings"]
+        assert [w["flow_id"] for w in issued if w["criterion"] == "media_bitrate_kbps"] == expected
+
+
+def test_dns_warning_needs_delivered_pressure_and_observed_timeouts_on_same_server():
+    def flows(lost):
+        rows = [dns("A", "S", 4), dns("B", "S", 4), dns("C", "X", 4)]
+        for row in rows:
+            row["sla_grade"] = "gold"
+        rows[0]["dns_timeout_count"] = lost
+        if lost:
+            rows[0]["slo_evaluation"]["metrics"]["dns_timeout_ratio_percent"].update(
+                compliant=False, observed_value=25.)
+        return rows
+    for readings in (None, [], sample(.9)):
+        monitor = RouteStressMonitor(2)
+        monitor.observe(flows(0), [], time_seconds=0)
+        issued = monitor.observe(flows(1), readings, time_seconds=2)["operator_warnings"]
+        assert [(w["flow_id"], w["predicted_value"]) for w in issued] == ([("B", 12.5)] if readings else [])

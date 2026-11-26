@@ -37,6 +37,16 @@ def test_t0_reports_missing_access_link():
                for v in result["violations"])
 
 
+def test_packet_t0_requires_positive_consistent_offered_load():
+    snap = simulate_stationary_dynamics(MODEL, DynamicsConfig(step_count=0))["snapshots"][0]
+    summary = snap["traffic"]["summary"]
+    for invalid in ({}, dict(summary, legitimate_packet_count=0, normal_arrival_rate_pps=0),
+                    dict(summary, normal_arrival_rate_pps=summary["normal_arrival_rate_pps"] + 1)):
+        result = validate_ideal_t0(MODEL, {**snap, "traffic": {"summary": invalid}})
+        assert not result["ok"]
+        assert any(item["reason"] == "invalid_normal_offered_load" for item in result["violations"])
+
+
 def test_fixed_distances_match_individual_paths_for_all_endpoint_types():
     graph = nx.Graph()
     graph.add_nodes_from(("a", "b", "c"), role="core-router")

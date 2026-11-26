@@ -97,7 +97,8 @@ def test_tcp_recovery_and_udp_do_not_double_count_loss(model):
     apply_transport_queues(model, [tcp, udp])
     assert tcp["transport_queue"]["tcp_recovery_seconds"] > 0
     assert udp["transport_queue"]["tcp_recovery_seconds"] == 0
-    assert tcp["goodput_mbps"] < udp["goodput_mbps"]
+    # Оба потока доставили по 20 000 байт за 2 с; ожидание повтора относится к задержке.
+    assert tcp["goodput_mbps"] == udp["goodput_mbps"] == pytest.approx(0.08)
     assert tcp["one_way_latency_ms"] > 5
     assert tcp["observed_dropped_packets"] == udp["observed_dropped_packets"] == 800
     assert udp["observed_retransmissions"] == 0

@@ -221,6 +221,8 @@ def test_predictive_precursor_contains_only_current_sensor_telemetry() -> None:
     assert all(not (forbidden & set(item)) for item in observations)
     assert all(item["sensor_node_id"] in MODEL.graph for item in observations)
     assert all(item["signals"] for item in observations)
+    assert all(item["correlation_id"] == f"TEL-{observation_step}-{item['sensor_node_id']}"
+               for item in observations)
 
     first_event = active_attack_events(
         MODEL,

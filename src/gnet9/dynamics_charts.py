@@ -9,16 +9,17 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 from matplotlib.collections import PatchCollection, PolyCollection
-from matplotlib.colors import Normalize, SymLogNorm
+from matplotlib.colors import LinearSegmentedColormap, Normalize, SymLogNorm
 from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 from matplotlib.ticker import MaxNLocator
+from matplotlib.transforms import blended_transform_factory
 import numpy as np
 from .arbitrator import TRIGGER_BANDS
 from .constants import DYNAMICS_CHART_FILES
 from .flow_details import TRAFFIC_LABELS
-from .plot_style import (PANEL, TEXT, MUTED, BLUE, GREEN,
-                         AMBER, RED, PURPLE, save_figure, style_axis)
+from .chart_style import BACKGROUND, TEXT, MUTED, BLUE, GREEN, AMBER, RED, PURPLE, style_axis
+from .plot_style import save_figure
 
 
 AggregateSeriesSpec = tuple[str, str, str, str, float]
@@ -227,11 +228,11 @@ def _save_time(fig, axes, run, path, *, bottom=.28, top=.83, hspace=None, show_r
         high = low + np.array([1 / len(at_time[t]) for t in times])
         for ax in axes:
             ax.vlines(times, low, high, transform=ax.get_xaxis_transform(), colors=color,
-                      linestyles=style, linewidth=.95, alpha=.85, zorder=1.8)
+                      linestyles=style, linewidth=.85, alpha=.52, zorder=1.8)
         handles.append(Line2D([], [], color=color, linestyle=style, label=label))
     for ax in axes:
         ax.set_xlim(*limits)
-        ax.xaxis.set_major_locator(MaxNLocator(nbins=10, integer=run.period.is_integer()))
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=8, integer=run.period.is_integer()))
     axes[-1].set_xlabel("Время от t0, с", color=MUTED, fontsize=9)
     if handles:
         fig.legend(handles=handles, loc="upper right", bbox_to_anchor=(.925, .998),
@@ -249,12 +250,12 @@ def _risk_series(series, dynamics):
 
 
 def _plot_overview(series, risk, threshold, run, path):
-    fig, axes = plt.subplots(3, 1, figsize=(14, 7), sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=(14, 8), sharex=True)
     times = run.seconds(series["steps"])
     _plot_line(axes[0], times, risk, "Риск Купмана", BLUE)
     _plot_line(axes[0], times, threshold, "Порог предупреждения", MUTED, linestyle="--")
     delivery = series["legitimate_delivery_percent"]
-    _plot_line(axes[1], times, delivery, "Доставлено пакетов", GREEN)
+    _plot_line(axes[1], times, delivery, _minimum_caption(times, delivery), GREEN)
     warned = np.asarray(series["koopman_warning_percent"]) == 100
     issued = warned & np.isfinite(risk)
     if issued.any():
@@ -279,7 +280,7 @@ def _plot_overview(series, risk, threshold, run, path):
         # Один процентный пункт даёт читаемую шкалу и при постоянной доставке.
         axes[1].set_ylim(max(0, min(99, finite.min()) - .1), 100.1)
     fig.text(.24, .025, SLA_SCOPE, color=MUTED, fontsize=8)
-    _save_time(fig, axes, run, path, bottom=.13, top=.90, hspace=.50)
+    _save_time(fig, axes, run, path, bottom=.12, top=.90, hspace=.63)
 
 
 def _plot_koopman(series, risk, threshold, run, path):
@@ -392,11 +393,26 @@ def _count_range(counts):
     return str(low) if low == high else f"{low}–{high}"
 
 
+def _minimum_caption(times, percentages):
+    """Минимальная измеренная доля в процентах и время первого минимума в секундах."""
+    observed = [(value, t) for value, t in zip(percentages, times) if np.isfinite(value) and np.isfinite(t)]
+    if not observed:
+        return ""
+    minimum, first_time = min(observed)
+    percent = np.format_float_positional(minimum, precision=2, trim="-").replace(".", ",")
+    if minimum < 100 and percent == "100":
+        percent = "<100"
+    if all(value == minimum for value, _ in observed):
+        return f"{percent} % по измерениям"
+    return f"мин. {percent} % в {first_time:g} с"
+
+
 def _sla_lines(ax, series, times):
     for grade, color, pattern in zip(SLA_GRADES, (AMBER, BLUE, PURPLE), ("-", "--", ":")):
         count = _count_range(series[f"{grade}_flow_count"])
-        _plot_line(ax, times, series[f"{grade}_sla_percent"],
-                   f"{SLA_GRADES[grade]} · потоков: {count}", color, linestyle=pattern)
+        values = series[f"{grade}_sla_percent"]
+        label = f"{SLA_GRADES[grade]} · потоков: {count}\n{_minimum_caption(times, values)}"
+        _plot_line(ax, times, values, label, color, linestyle=pattern)
 
 
 def _plot_sla_by_class(series, run, path):
@@ -463,13 +479,14 @@ def _plot_service_forecast(evaluation, path, run=None):
         ax.step(times, budgets, where="post", color=AMBER, linestyle=":", label="Порог SLA")
         if "issue_time_seconds" in case:
             ax.axvline(case["issue_time_seconds"], color=MUTED, linewidth=1, label="Выдан прогноз")
-            ax.plot([case["issue_time_seconds"], case["target_time_seconds"]],
-                    [case["measured_value"]] * 2, color=GREEN, linestyle="-.",
-                    label="Последнее значение")
-            if "trend_at_target" in case:
+            if run is None:  # В отдельном контрольном эксперименте сравниваются методы.
                 ax.plot([case["issue_time_seconds"], case["target_time_seconds"]],
-                        [case["measured_value"], case["trend_at_target"]], linestyle=":", color=TEXT,
-                        label="Тренд потока")
+                        [case["measured_value"]] * 2, color=GREEN, linestyle="-.",
+                        label="Последнее значение")
+                if "trend_at_target" in case:
+                    ax.plot([case["issue_time_seconds"], case["target_time_seconds"]],
+                            [case["measured_value"], case["trend_at_target"]], linestyle=":", color=TEXT,
+                            label="Тренд потока")
             source = {"shared_route_delay_translation": "Наклон на общем пути",
                       "poisson_demand_delivery_koopman": "Спрос и доставка",
                       "healthy_margin_increment": "Изменение запаса"}.get(case.get("forecast_source"), "Прогноз Купмана")
@@ -488,10 +505,10 @@ def _plot_service_forecast(evaluation, path, run=None):
             actual = case["time_seconds"] if key == "miss" else case["actual_time_seconds"]
             ax.axvline(actual, color=RED, linestyle="--", label="Начало нарушения")
         service = TRAFFIC_LABELS.get(case["service"], case["service"])
-        _style_axes(ax, f"{label} · {service} · поток {case['flow_id']} · {case['label_ru']}",
+        _style_axes(ax, f"{label} · поток {case['flow_id']}\n{service} · {case['label_ru']}",
                     case["unit"], legend=False)
         if run is None:
-            ax.legend(loc="best", fontsize=7, ncol=2, facecolor=PANEL, labelcolor=TEXT)
+            ax.legend(loc="best", fontsize=8, ncol=2, facecolor=BACKGROUND, labelcolor=TEXT)
             ax.set_xlabel("Время модели, с", color=MUTED, fontsize=9)
         else:
             _side_legend(ax, *ax.get_legend_handles_labels())
@@ -531,7 +548,7 @@ def _plot_target_sla(snapshots, run, path):
         caption=("Учтены оценённые абонентские потоки класса, связанные с узлом через маршрут, конечную точку или событие.\n"
                  "Рамка — воздействие на узел. Пустая клетка — нет оценённых потоков."),
         norm=Normalize(0, 100),
-        cmap="RdYlGn",
+        cmap=LinearSegmentedColormap.from_list("sla", ["#982e29", "#e39360", "#e4edf2"]),
         highlights=highlights,
     )
 
@@ -561,7 +578,7 @@ def _plot_observed_grid(
         legend.ax.tick_params(colors=MUTED, labelsize=8)
         for x, y, value in centers:
             red, green, blue, _ = heat.to_rgba(value)
-            color = PANEL if .2126 * red + .7152 * green + .0722 * blue > .48 else TEXT
+            color = TEXT if .2126 * red + .7152 * green + .0722 * blue > .55 else BACKGROUND
             ax.text(x, y, f"{value:.4g}", ha="center", va="center", color=color, fontsize=6.5)
     else:
         ax.text(.5, .5, "Нет наблюдений для графика", transform=ax.transAxes,
@@ -592,8 +609,9 @@ def _plot_capacity_bottlenecks(line_peaks, path: Path) -> None:
     fig, ax = plt.subplots(figsize=(11.5, 4.7))
     top = sorted(line_peaks,
                  key=lambda row: row["utilization_percent"], reverse=True)[:8]
-    bars = ax.barh([row["label"] for row in reversed(top)], [row["utilization_percent"] for row in reversed(top)],
-                   color=BLUE, height=.6)
+    loads = [row["utilization_percent"] for row in reversed(top)]
+    bars = ax.barh([row["label"] for row in reversed(top)], loads,
+                   color=[RED if load > 100 else BLUE for load in loads], height=.55)
     for bar, row in zip(bars, reversed(top)):
         ax.text(bar.get_width() + .8, bar.get_y() + bar.get_height() / 2,
                 f"{row['utilization_percent']:.2f}% · шаг {row['step_index']}", va="center", color=TEXT, fontsize=9)
@@ -601,7 +619,10 @@ def _plot_capacity_bottlenecks(line_peaks, path: Path) -> None:
         ax.text(.5, .5, "Нет данных о нагрузке линий", transform=ax.transAxes, color=MUTED, ha="center")
     _style_axes(ax, "Восемь линий с наибольшей нагрузкой", "", legend=False)
     ax.set_xlabel("Предложенная нагрузка, % пропускной способности линии", color=MUTED, fontsize=9)
-    ax.set_xlim(0, max([100, *(row["utilization_percent"] * 1.3 for row in top)]))
+    ax.set_xlim(0, max([110, *(load * 1.3 for load in loads)]))
+    if top:
+        ax.axvline(100, color=MUTED, linestyle="--", linewidth=1, zorder=0)
+        ax.set_title("Пунктир — ёмкость линии (100 %)", loc="right", color=MUTED, fontsize=10)
     ax.grid(False, axis="y")
     ax.grid(axis="x", color=MUTED, linewidth=.5, alpha=.18)
     _save(fig, path, bottom=.17, left=.17)
@@ -667,8 +688,6 @@ def _plot_resource_utilization(snapshots, run, path):
         title += f"  ·  CPU: {next(iter(leaders))}"
     _style_axes(ax, title, "% расчётной ёмкости",
                 _positive_limits(cpu, target_resource, minimum=100))
-    fig.text(.24, .035, "Синяя линия — наибольшая расчётная загрузка CPU среди узлов. Оранжевая — нагрузка ресурса среди целей воздействия (максимум).",
-             color=MUTED, fontsize=8)
     _save_time(fig, axes, run, path, bottom=.21, hspace=.65)
 
 
@@ -873,9 +892,10 @@ def _style_axes(
 
 
 def _side_legend(ax, handles, labels):
-    ax.legend(handles, [fill(label, 28) for label in labels],
-              loc="center right", bbox_to_anchor=(-.095, .5),
-              frameon=False, labelcolor=TEXT, fontsize=8)
+    wrapped = ["\n".join(fill(line, 26) for line in label.splitlines()) for label in labels]
+    anchor = blended_transform_factory(ax.figure.transFigure, ax.transAxes)
+    ax.legend(handles, wrapped, loc="center left", bbox_to_anchor=(.015, .5), bbox_transform=anchor,
+              frameon=False, labelcolor=TEXT, fontsize=9)
 
 
 def _save(

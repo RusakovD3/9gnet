@@ -18,7 +18,7 @@ from statistics import median
 from typing import Any, Iterable
 
 
-REPORT_VERSION = 2
+REPORT_VERSION = 3
 REQUIRED_COLUMNS = ("timestamp_seconds", "risk_score", "attack_onset")
 
 
@@ -52,6 +52,8 @@ class TelemetryValidationConfig:
     minimum_precision: float = 0.90
     minimum_recall: float = 0.90
     maximum_false_warnings_per_hour: float = 0.10
+    # Бюджет внимания в пилоте: до 12 минут под тревогой за час наблюдения.
+    maximum_warning_occupancy_ratio: float = 0.20
 
     def validate(self) -> None:
         if not all(math.isfinite(value) for value in asdict(self).values()):
@@ -70,6 +72,8 @@ class TelemetryValidationConfig:
             raise TelemetryValidationError("minimum_recall должен быть в диапазоне (0, 1]")
         if self.maximum_false_warnings_per_hour < 0:
             raise TelemetryValidationError("maximum_false_warnings_per_hour не может быть отрицательным")
+        if not 0.0 <= self.maximum_warning_occupancy_ratio <= 1.0:
+            raise TelemetryValidationError("maximum_warning_occupancy_ratio должен быть в диапазоне [0, 1]")
 
 
 def read_telemetry_csv(path: Path) -> list[TelemetryPoint]:
@@ -155,16 +159,20 @@ def validate_external_telemetry(
     holdout_points = points[split_index:]
     candidates = _threshold_candidates(training_points)
     training_gap = _maximum_sample_gap(training_points)
-    selected = max(
-        (_evaluate_threshold(training_points, threshold, config, training_gap) for threshold in candidates),
-        key=lambda item: (
-            int(_meets_quality_gate(item, config)),
-            float(item["recall"]),
-            float(item["precision"]),
-            -item["false_warnings_per_hour"] if item["false_warnings_per_hour"] is not None else -math.inf,
-            float(item["warning_risk_threshold"]),
-        ),
-    )
+    best_rank = None
+    for evaluated_count, threshold in enumerate(candidates, 1):
+        item = _evaluate_threshold(training_points, threshold, config, training_gap)
+        rate = item["false_warnings_per_hour"]
+        rank = (_meets_quality_gate(item, config), item["recall"], item["precision"],
+                -rate if rate is not None else -math.inf, threshold)
+        if best_rank is None or rank > best_rank:
+            selected, best_rank = item, rank
+        # Идём от большего порога. Лучший возможный результат уже нельзя превзойти.
+        if rank[:4] == (True, 1.0, 1.0, 0.0):
+            break
+        # При снижении порога длительность под тревогой может только расти.
+        if best_rank[0] and item["warning_occupancy_ratio"] > config.maximum_warning_occupancy_ratio:
+            break
     threshold = float(selected["warning_risk_threshold"])
     previous = training_points[-1]
     first = holdout_points[0]
@@ -192,7 +200,9 @@ def validate_external_telemetry(
             "Хронологическое разделение без перемешивания: порог выбирается только на раннем "
             "участке, затем фиксируется и проверяется на последующем отложенном участке. "
             "Проверяется только порог готового ряда риска. Цель и вид угрозы в прогнозе "
-            "CSV отсутствуют. Совпадение оценивается по времени в одном непрерывном участке. "
+            "CSV отсутствуют. Для допуска учитывается время первого сигнала эпизода. "
+            "Совпадения с последующими отсчётами показаны отдельно. "
+            "Лимит доли времени под тревогой действует в обеих частях. "
             "Разрыв более 1,5 медианного интервала обучающей части завершает участок."
         ),
         "configuration": asdict(config),
@@ -206,6 +216,7 @@ def validate_external_telemetry(
         },
         "threshold_selection": {
             "candidate_count": len(candidates),
+            "evaluated_candidate_count": evaluated_count,
             "selection_uses_holdout": False,
             "selection_status": "feasible" if training_gate else "no_training_threshold_meets_gate",
             "selected_warning_risk_threshold": threshold,
@@ -273,9 +284,17 @@ def load_pilot_calibration(path: Path) -> dict[str, Any]:
             "Отчёт не прошёл независимую проверку и не может применяться как профиль порога"
         )
     threshold = profile.get("warning_risk_threshold")
+    training_metrics = _report_section(selection, "training_metrics")
+    holdout_metrics = _report_section(holdout, "metrics")
+    occupancy_limit = _report_section(report, "configuration").get("maximum_warning_occupancy_ratio")
+    if type(occupancy_limit) not in (int, float) or not 0 <= occupancy_limit <= 1:
+        raise TelemetryValidationError("В отчёте нужен предел доли времени под тревогой в диапазоне [0, 1]")
+    for metrics in (training_metrics, holdout_metrics):
+        occupancy = metrics.get("warning_occupancy_ratio")
+        if type(occupancy) not in (int, float) or not 0 <= occupancy <= occupancy_limit:
+            raise TelemetryValidationError("Доля времени под тревогой не соответствует условиям допуска")
     thresholds = (threshold, selection.get("selected_warning_risk_threshold"),
-                  _report_section(selection, "training_metrics").get("warning_risk_threshold"),
-                  _report_section(holdout, "metrics").get("warning_risk_threshold"))
+                  training_metrics.get("warning_risk_threshold"), holdout_metrics.get("warning_risk_threshold"))
     if not all(type(value) in (int, float) and 0 <= value <= 1 and value == threshold
                for value in thresholds):
         raise TelemetryValidationError("Порог профиля должен совпадать с проверенным порогом в диапазоне [0, 1]")
@@ -305,10 +324,28 @@ def _parse_bool(value: str | None, row_number: int) -> bool:
 
 
 def _threshold_candidates(points: Iterable[TelemetryPoint]) -> list[float]:
-    unique_scores = sorted({point.risk_score for point in points})
-    if len(unique_scores) <= 257:
-        return unique_scores
-    return sorted({unique_scores[round(index * (len(unique_scores) - 1) / 256)] for index in range(257)})
+    return sorted({point.risk_score for point in points}, reverse=True)
+
+
+def _match_episode_times(episodes, onsets, config):
+    """Каждый эпизод и каждое начало используют максимум один раз."""
+    next_episode = 0
+    matched = set()
+    leads = []
+    for onset in onsets:
+        earliest = onset - config.maximum_lead_seconds
+        latest = onset - config.minimum_lead_seconds
+        while next_episode < len(episodes) and episodes[next_episode][-1] < earliest:
+            next_episode += 1
+        if next_episode == len(episodes):
+            break
+        samples = episodes[next_episode]
+        first_valid = bisect_left(samples, earliest)
+        if first_valid < len(samples) and samples[first_valid] <= latest:
+            leads.append(onset - samples[first_valid])
+            matched.add(next_episode)
+            next_episode += 1
+    return matched, leads
 
 
 def _evaluate_threshold(
@@ -320,6 +357,7 @@ def _evaluate_threshold(
     continuing_warning: bool = False,
 ) -> dict[str, Any]:
     leads = []
+    update_leads = []
     episode_count = onset_count = censored_count = 0
     left_censored_count = 0
     observed_seconds = warning_seconds = 0.0
@@ -342,28 +380,16 @@ def _evaluate_threshold(
             # Её длительность входит в экспозицию, но новый эпизод не начался.
             left_censored_count = 1
             episodes = episodes[1:]
-        next_episode = 0
-        matched = set()
-        for onset in segment:
-            if not onset.attack_onset:
-                continue
-            onset_count += 1
-            earliest = onset.timestamp_seconds - config.maximum_lead_seconds
-            latest = onset.timestamp_seconds - config.minimum_lead_seconds
-            # Окна упорядочены по времени. Берём первый подходящий свободный эпизод.
-            while next_episode < len(episodes) and episodes[next_episode][-1] < earliest:
-                next_episode += 1
-            if next_episode == len(episodes):
-                continue
-            samples = episodes[next_episode]
-            first_valid = bisect_left(samples, earliest)
-            if first_valid < len(samples) and samples[first_valid] <= latest:
-                leads.append(onset.timestamp_seconds - samples[first_valid])
-                matched.add(next_episode)
-                next_episode += 1
+        onsets = [p.timestamp_seconds for p in segment if p.attack_onset]
+        onset_count += len(onsets)
+        starts = [[samples[0]] for samples in episodes]
+        matched, initial_leads = _match_episode_times(starts, onsets, config)
+        leads.extend(initial_leads)
+        _, updated = _match_episode_times(episodes, onsets, config)
+        update_leads.extend(updated)
         segment_end = segment[-1].timestamp_seconds
-        censored_count += sum(index not in matched and samples[-1] + config.maximum_lead_seconds > segment_end
-                              for index, samples in enumerate(episodes))
+        censored_count += sum(index not in matched and start[0] + config.maximum_lead_seconds > segment_end
+                              for index, start in enumerate(starts))
     predicted = len(leads)
     false_episodes = episode_count - predicted - censored_count - left_censored_count
     duration_seconds = points[-1].timestamp_seconds - points[0].timestamp_seconds
@@ -392,6 +418,11 @@ def _evaluate_threshold(
         "f1": 2.0 * precision * recall / max(precision + recall, 1e-12),
         "minimum_observed_lead_seconds": min(leads, default=0.0),
         "median_observed_lead_seconds": median(leads) if leads else 0.0,
+        "within_episode_updates": {
+            "predicted_onset_count": len(update_leads),
+            "minimum_observed_lead_seconds": min(update_leads, default=0.0),
+            "median_observed_lead_seconds": median(update_leads) if update_leads else 0.0,
+        },
     }
 
 
@@ -422,6 +453,8 @@ def _meets_quality_gate(metrics: dict[str, Any], config: TelemetryValidationConf
         and float(metrics["recall"]) >= config.minimum_recall
         and metrics["false_warnings_per_hour"] is not None
         and metrics["false_warnings_per_hour"] <= config.maximum_false_warnings_per_hour
+        and metrics["warning_occupancy_ratio"] is not None
+        and metrics["warning_occupancy_ratio"] <= config.maximum_warning_occupancy_ratio
     )
 
 

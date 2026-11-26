@@ -29,12 +29,19 @@ def warning_meets_rule(warning, rule):
                 and warning["horizon_seconds"] <= rule.get("issue_horizon_seconds", 20))
 
 
-def operator_warnings(view):
-    """Правила выбранного режима используют одно текущее измерение потерь."""
+def baseline_operator_warnings(view):
+    """Воспроизвести прежнее двухсекундное правило, выбранное на predictive-demo/11."""
     if view["step_seconds"] != 2:
         return []
     return [w for w in view["warnings"] if w["method"] == "koopman"
             and warning_meets_rule(w, CALIBRATED_FLOW_RULES.get(w["criterion"]))]
+
+
+def operator_warnings(view):
+    """Прочитать выпущенные предупреждения; старый снимок допускает реконструкцию."""
+    if "operator_warnings" in view:
+        return view["operator_warnings"]
+    return baseline_operator_warnings(view)
 
 
 def _crossing(margin, delta, coefficient, steps):
@@ -330,7 +337,7 @@ class ServiceSLAForecaster:
             ]
 
 
-def _score_window(views, method, horizon):
+def _score_window(views, method, horizon, *, on_outcome=None):
     """Одна открытая тревога на поток и критерий, исход измеряется один раз."""
     pending = {}
     cases = dict.fromkeys(CASE_TYPES)
@@ -346,6 +353,8 @@ def _score_window(views, method, horizon):
 
     def outcome(warning, field):
         count(warning["service"], field)
+        if on_outcome is not None:
+            on_outcome(field, warning)
         source = warning.get("forecast_source", method)
         sources.setdefault(source, dict.fromkeys(("hits", "false_alarms", "censored"), 0))[field] += 1
 
@@ -375,6 +384,8 @@ def _score_window(views, method, horizon):
             warning = pending.pop(_identity(onset), None)
             if warning is None:
                 count(service, "misses")
+                if on_outcome is not None:
+                    on_outcome("misses", onset)
                 if cases["miss"] is None:
                     cases["miss"] = dict(onset)
             else:

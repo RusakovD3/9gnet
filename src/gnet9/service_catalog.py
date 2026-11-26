@@ -56,6 +56,9 @@ APPLE_LL_HLS = (
     "https://developer.apple.com/documentation/http-live-streaming/"
     "hls-authoring-specification-for-apple-devices"
 )
+# Время кодирования и буферизации плеера в модели LL-HLS, мс.
+# Общее инженерное допущение для всех классов одной услуги.
+LL_HLS_PIPELINE_DELAY_MS = 1300.0
 
 
 SERVER_CATALOG = (

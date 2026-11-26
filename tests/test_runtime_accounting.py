@@ -181,6 +181,34 @@ def test_cpu_and_buffer_metrics_are_queue_estimates_with_explicit_units():
     assert compact["vertex_units"][7] == "ms2"
     assert compact["edge_units"][2] == "ms"
 
+
+def test_server_queue_uses_only_physical_interfaces():
+    model = _model()
+    flow = _flow()
+    def server_metrics():
+        state = network_runtime_metrics(model, [flow], detail="flows")
+        return next(n["metrics"] for n in state["nodes"] if n["id"] == "server")
+
+    original = server_metrics()
+    model.graph.add_node("service", level="L0", role="service")
+    model.graph.add_edge("server", "service", capacity_mbps=100_000.0,
+                         medium="logical-service-binding")
+    attached = server_metrics()
+    # Один физический порт 10 Мбит/с и 1000 байт на пакет.
+    assert attached["service_rate_pps"] == pytest.approx(1250.0)
+    assert attached == original
+
+
+@pytest.mark.parametrize("seconds", [1, 2, 10])
+def test_tcp_goodput_matches_delivered_bytes_at_every_window_length(seconds):
+    flow = _flow(packet_count=100 * seconds, payload_bytes=100000 * seconds,
+                 interval_seconds=seconds, observed_dropped_packets=50 * seconds,
+                 rtt_ms=1000.)
+    apply_transport_queues(_model(), [flow])
+    # За секунду доставляется 50 000 байт. Ожидание повтора одного пакета — 1 с.
+    assert flow["goodput_mbps"] == pytest.approx(0.4)
+    assert flow["transport_queue"]["tcp_recovery_seconds"] == pytest.approx(1.0)
+
 def test_stationary_loss_during_short_burst_has_transient_bias():
     # K=1, initially empty, λ=μ=1/s. P(full,t)=(1-exp(-2t))/2.
     # An arrival during the first second sees mean P(full)=.5-(1-exp(-2))/4.

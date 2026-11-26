@@ -24,6 +24,7 @@ from .attack_signatures import (
 )
 from .models import NetworkModel
 from .routing import has_data_path, shortest_data_path
+from .service_catalog import LL_HLS_PIPELINE_DELAY_MS
 from .transport_queue import apply_transport_queues
 
 
@@ -2193,6 +2194,11 @@ def _power_runtime_view(
     }
 
 
+def telemetry_correlation_id(step_index: int, sensor_node_id: str) -> str:
+    """Общий идентификатор показаний одного датчика за один шаг."""
+    return f"TEL-{step_index}-{sensor_node_id}"
+
+
 def observe_attack_precursors(
     model: NetworkModel,
     scenario: str,
@@ -2230,7 +2236,7 @@ def observe_attack_precursors(
     )
 
     observations: list[dict[str, Any]] = []
-    for profile_index, profile in enumerate(profiles, start=1):
+    for profile in profiles:
         lead_steps = profile.temporal.start_step - step_index
         if lead_steps < 1 or lead_steps > profile.temporal.precursor_steps:
             continue
@@ -2243,6 +2249,8 @@ def observe_attack_precursors(
             "observation_type": "pre_attack_telemetry",
             "observed_at_step": step_index,
             "observed_at_seconds": time_seconds,
+            "sensor_node_id": profile.target_id,
+            "correlation_id": telemetry_correlation_id(step_index, profile.target_id),
             "signal_confidence": signals.pop("signal_confidence"),
             "signals": signals,
             "value_origin": "scenario_assumption",
@@ -2250,16 +2258,13 @@ def observe_attack_precursors(
         if scenario == "predictive-demo":
             # Только сырые показания известного датчика. Здесь намеренно нет
             # attack_id, типа/начала атаки, горизонта и предполагаемой цели.
-            # Даже correlation_id не кодирует цель или профиль испытания.
             observations.append(
                 {
                     **common,
-                    "correlation_id": f"TEL-{resolved_seed}-{step_index}-{profile_index}",
                     # Идентификатор означает место фактического измерения
                     # аномальной очереди/NetFlow/UPS, а не скрытую «будущую цель».
                     # Именно поэтому контроллер может локализовать область риска,
                     # не получая start_step, тип атаки или attack_id.
-                    "sensor_node_id": profile.target_id,
                     # На слабой ранней ступени NetFlow видит лишь часть
                     # источников. Полный будущий набор ingress не раскрывается.
                     "observed_source_node_ids": list(profile.ingress_nodes)[
@@ -2279,8 +2284,6 @@ def observe_attack_precursors(
             observations.append(
                 {
                     **common,
-                    "correlation_id": f"TEL-{step_index}-{profile.target_id}",
-                    "sensor_node_id": profile.target_id,
                     "suspected_target_id": profile.target_id,
                     "observed_source_node_ids": list(profile.ingress_nodes),
                     "target_type": profile.target_type,
@@ -2835,7 +2838,7 @@ def _evaluate_flow_slo(model: NetworkModel, flow: dict[str, Any]) -> dict[str, A
         # Число сегментов за короткий шаг — пуассоновская реализация,
         # а не оценка устойчивой скорости целого файла. Берём заданное
         # ожидание полезной нагрузки и сохраняем текущую потерю эффективности
-        # (включая TCP-восстановление). Без ожидания остаётся прежняя оценка.
+        # по доставленным байтам. Без ожидания остаётся прежняя оценка.
         expected_payload_kbps = float(flow.get("normal_expected_payload_rate_bps",
                                                 offered_payload_kbps * 1000.0)) / 1000.0
         efficiency = (min(1.0, delivered_payload_kbps / offered_payload_kbps)
@@ -2990,12 +2993,11 @@ def _evaluate_flow_slo(model: NetworkModel, flow: dict[str, Any]) -> dict[str, A
         )
 
     elif traffic_kind == "live_streaming":
-        live_edge_base_ms = float(flow.get("glass_to_glass_latency_ms", latency_ms))
-        live_edge_latency_ms = (
-            live_edge_base_ms
-            + max(0.0, float(flow.get("additional_latency_ms", 0.0)))
-            + max(0.0, float(flow.get("attack_latency_penalty_ms", 0.0)))
-        )
+        # Сетевая задержка уже включает очередь и ожидание повтора TCP.
+        # Например, при пути 20 мс и конвейере 1300 мс до плеера пройдёт 1320 мс.
+        live_edge_latency_ms = LL_HLS_PIPELINE_DELAY_MS + latency_ms
+        flow["live_pipeline_delay_ms"] = LL_HLS_PIPELINE_DELAY_MS
+        flow["glass_to_glass_latency_ms"] = live_edge_latency_ms
         add_metric(
             "ll_hls_live_edge_latency_ms",
             label_ru="задержка относительно live edge",
@@ -3004,8 +3006,8 @@ def _evaluate_flow_slo(model: NetworkModel, flow: dict[str, Any]) -> dict[str, A
             unit="ms",
             comparison="lte",
             evidence="assumed",
-            value_origin="engineering_pipeline_baseline_plus_modeled_network_penalties",
-            note_ru="encoder/player pipeline задан инженерной baseline-оценкой, а не медиаплеером",
+            value_origin="assumed_encoder_player_delay_plus_current_one_way_delivery_time",
+            note_ru="Время кодирования и буферизации плеера задано инженерной оценкой.",
         )
         add_metric(
             "ll_hls_delivered_bitrate_kbps",

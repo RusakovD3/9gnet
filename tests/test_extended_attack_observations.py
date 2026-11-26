@@ -5,6 +5,7 @@ import pytest
 from src.gnet9.attack_signatures import match_attack_signature, signature_catalog
 from src.gnet9.attacks import active_attack_events, attack_catalog
 from src.gnet9.dynamics import DynamicsConfig, simulate_stationary_dynamics
+from src.gnet9.koopman import _forecast_entities
 from src.gnet9.topology_builder import GNetBaselineBuilder
 
 
@@ -15,7 +16,7 @@ def test_weighted_technique_masks_keep_strength_and_observed_lags():
         "T1046", "T1204", "T1068", "T1041", "T1464", "T1110.001",
     }
     for weights in catalog["techniques"].values():
-        assert len(weights) == 13 and all(len(row) == 8 for row in weights)
+        assert len(weights) == 14 and all(len(row) == 8 for row in weights)
         assert all(0 <= weight <= 1 for row in weights for weight in row)
     current = {"syn_backlog_growth_ratio": 0.36, "observed_ingress_count": 1}
     weaker = match_attack_signature(current)
@@ -99,6 +100,55 @@ def test_signature_needs_joint_evidence_and_ignores_labels():
     assert first["kind"] == "user_execution"
     assert match_attack_signature(metrics | {"kind": "dos", "start_step": 100}) == first
     assert first["margin_ratio"] == pytest.approx(1.0)
+
+
+def test_exfiltration_volume_uses_observed_channel_bytes_and_strict_bounds():
+    # 12 500 байт/с × 0,8 × 10 с = 100 000 байт за один интервал.
+    sample = {"unusual_egress_bytes_per_second": 12_500, "established_channel_transfer_ratio": 0.8}
+    assert match_attack_signature(sample, history=[sample] * 9, step_seconds=10) is None
+    match = match_attack_signature(sample, history=[sample] * 10, step_seconds=10)
+    assert match["weighted_technique_id"] == "T1041"
+    assert match["observed_values"]["observed_channel_volume_bytes"] == pytest.approx(1_100_000)
+    assert match_attack_signature(sample, history=[sample] * 9 + [None], step_seconds=10) is None
+    assert match_attack_signature({}, history=[sample] * 11, step_seconds=10) is None
+    assert match_attack_signature({"observed_channel_volume_bytes": 2_000_000,
+                                   "established_channel_transfer_ratio": 1}) is None
+    slower = {**sample, "unusual_egress_bytes_per_second": 5_000}
+    assert match_attack_signature(slower, history=[slower, slower], step_seconds=99)["kind"] == "exfiltration"
+    assert match_attack_signature(slower, history=[slower, slower], step_seconds=100) is None
+    invalid = {"unusual_egress_bytes_per_second": 25_000, "established_channel_transfer_ratio": 1.01}
+    assert match_attack_signature(invalid) is None
+
+
+def test_exfiltration_mask_scores_accumulated_volume_only_once():
+    sample = {"unusual_egress_bytes_per_second": 50_000, "established_channel_transfer_ratio": 1}
+    before = match_attack_signature(sample, history=[sample] * 3)
+    after = match_attack_signature(sample, history=[sample] * 4)
+    assert after["weighted_score"] > before["weighted_score"]
+    masks = signature_catalog()["weighted_masks"]
+    row = masks["rows"].index("egress_volume")
+    assert masks["techniques"]["T1041"][row] == [1, 0, 0, 0, 0, 0, 0, 0]
+    assert masks["numeric_references"]["T1041"]["analytic_id"] == "AN0988"
+    coarse = match_attack_signature(sample, step_seconds=300)
+    assert coarse["observed_values"]["observed_channel_volume_bytes"] is None
+    assert coarse["weighted_score"] == pytest.approx((50_000 / 75_000) / 1.2)
+    assert signature_catalog(step_seconds=300)["weighted_masks"]["techniques"]["T1041"][row] == [0] * 8
+
+
+def test_volume_history_is_scoped_to_sensor_and_observation_channel():
+    history = {}
+    sample = {"unusual_egress_bytes_per_second": 10_000, "established_channel_transfer_ratio": 1}
+    def reading(node):
+        return {"sensor_node_id": node, "signals": sample}
+    for step in range(1, 12):
+        observations = [reading("a")]
+        if step == 11:
+            observations.append(reading("b"))
+        state = {"signature_observations": observations, "precursors": [reading("a")] if step == 11 else []}
+        result = _forecast_entities(state, history, step, 10)
+        expected_targets = ["a"] if step == 11 else []
+        assert [r["target_id"] for r in result["signature_entity_records"]] == expected_targets
+        assert result["next_entity_records"] == []
 
 
 def test_extended_catalog_and_active_signatures():

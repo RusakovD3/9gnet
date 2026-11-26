@@ -97,6 +97,20 @@ def test_overlapping_warnings_match_by_target_type_and_window():
     assert result["right_censored_warning_count"] == 1
 
 
+def test_equal_cardinality_prefers_pairs_meeting_required_lead():
+    trace = [{"step_index": t, "time_seconds": t} for t in range(15)]
+    for step in (0, 2):
+        trace[step]["koopman"] = {"forecast_is_early_warning": True,
+            "forecast_window_start_step": 10, "forecast_window_end_step": 12,
+            "forecast_entity_records": [{"target_id": "C1", "kind": "dos"}]}
+    for step in (10, 12):
+        trace[step]["attacks"] = {"events": [
+            {"relative_step": 0, "target_id": "C1", "kind": "dos", "attack_id": str(step)}]}
+    result = _koopman_evaluation(trace, step_seconds=1, required_lead_seconds=10)
+    assert [record["lead_time_seconds"] for record in result["records"]] == [10, 10]
+    assert result["prediction_slo_status"] == "PASSED_SYNTHETIC_SCENARIO"
+
+
 def test_false_warning_requires_coverage_of_its_whole_window():
     warning = {
         "step_index": 1, "time_seconds": 5,
@@ -287,7 +301,8 @@ def test_koopman_predictor_exports_causal_forecast_and_residual() -> None:
     attack = dynamics["snapshots"][6]["koopman"]
     assert t0["training_reference"]["trained_on"] == "ideal_t0_neighbourhood"
     assert t0["training_reference"]["training_sample_count"] == 64
-    assert t0["training_reference"]["training_rank"] == t0["training_reference"]["nominal_metric_count"]
+    # Без угрозы расстояние до неё остаётся нулём во всех учебных строках.
+    assert t0["training_reference"]["training_rank"] == t0["training_reference"]["nominal_metric_count"] - 1
     assert t0["training_reference"]["training_data_origin"] == "deterministic_synthetic_metric_neighbourhood"
     assert t0["training_reference"]["ideal_operator_spectral_radius"] < 1.0
     assert len(t0["t0_signature"]) == 64

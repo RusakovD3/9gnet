@@ -64,9 +64,7 @@ def apply_transport_queues(model: NetworkModel, flows: list[dict[str, Any]], att
             flow["rtt_ms"] = round(float(flow["rtt_ms"]) + 2.0 * extra_delay, 4)
         recovery_seconds = 0.0
         if flow.get("transport") == "TCP" and lost:
-            # Ожидаемое число повторных попыток на успешно переданный пакет.
-            # Последовательные потери снижают полезную скорость, даже если
-            # объём предложенных данных на этом шаге остался прежним.
+            # Среднее ожидание повторов одного пакета, в секундах.
             recovery_seconds = (float(flow.get("rtt_ms") or 0.0) / 1000.0) * loss / max(1.0 - loss, 1e-3)
         # Уже внесённая задержка атаки покрывает очередь и восстановление
         # один раз. Повторное вычитание всей задержки теряло часть ожидания.
@@ -74,7 +72,8 @@ def apply_transport_queues(model: NetworkModel, flows: list[dict[str, Any]], att
         retry_delay_ms = max(0.0, recovery_seconds * 1000.0 - remaining_attack_delay)
         flow["one_way_latency_ms"] = round(float(flow["one_way_latency_ms"]) + retry_delay_ms, 4)
         delivered_payload = float(flow["payload_bytes"]) * (1.0 - loss)
-        goodput = delivered_payload * 8.0 / (interval + recovery_seconds) / 1_000_000.0
+        # 50 000 доставленных байт за 1 с дают 0,4 Мбит/с.
+        goodput = delivered_payload * 8.0 / interval / 1_000_000.0
         flow["transport_queue"] = {
             **estimate,
             "model": "finite_gelenbe_observation_based_cancellation",

@@ -27,7 +27,9 @@ def export_detection_rules(model, snapshots, directory: Path) -> None:
     for snapshot in snapshots:
         position = {key: snapshot[key] for key in ("step_index", "time_seconds")}
         koopman = snapshot["koopman"]
-        for record in (*koopman["forecast_entity_records"], *koopman.get("signature_entity_records", ())):
+        signatures = koopman.get("signature_entity_records", ())
+        forecasts = [record for record in koopman["forecast_entity_records"] if record not in signatures]
+        for record in (*forecasts, *signatures):
             source = OBSERVED_CLASSIFICATION_SOURCES.get(record.get("observation_type"))
             if source is None:
                 continue

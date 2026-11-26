@@ -50,7 +50,7 @@ def replay_signature(snapshots):
     return replay
 
 
-def compare_at_alarm_budget(views, calibration):
+def compare_at_alarm_budget(views, calibration, *, horizon_seconds=20):
     """Задержать выдачу до N последовательных прогнозов того же нарушения."""
     from src.gnet9.service_forecast import METHODS, _score_window
 
@@ -67,7 +67,7 @@ def compare_at_alarm_budget(views, calibration):
             for view in views:
                 warnings, current = [], {}
                 for w in view["warnings"]:
-                    if w["method"] != method:
+                    if w["method"] != method or w["horizon_seconds"] > horizon_seconds:
                         continue
                     key = w["service"], w["flow_id"], w["criterion"]
                     current[key] = previous.get(key, 0) + 1
@@ -75,8 +75,8 @@ def compare_at_alarm_budget(views, calibration):
                         warnings.append(w)
                 filtered.append({**view, "warnings": warnings})
                 previous = current
-            row, _ = _score_window(filtered, method, 20)
-            if calibration is None and row["false_alarms"] > 0:
+            row, _ = _score_window(filtered, method, horizon_seconds)
+            if calibration is None and (row["false_alarms"] or row["censored"]):
                 continue
             quality = (row["hits"], sum(row["lead_seconds"]))
             if best is None or quality > best:
@@ -84,6 +84,7 @@ def compare_at_alarm_budget(views, calibration):
                 selected[method] = required
                 scores[method] = {k: v for k, v in row.items() if k != "by_service"}
     return {"validation_budget_false_alarms_per_hour": 0, "confirmation_samples": selected,
+            "matching_horizon_seconds": horizon_seconds,
             "selection_run": "predictive-demo/11", "methods": scores}
 
 
