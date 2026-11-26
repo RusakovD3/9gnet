@@ -8,11 +8,14 @@ from src.gnet9.dynamics import DynamicsConfig, simulate_stationary_dynamics
 from src.gnet9.topology_builder import GNetBaselineBuilder
 
 
-def test_ten_weighted_technique_masks_keep_strength_and_observed_lags():
+def test_weighted_technique_masks_keep_strength_and_observed_lags():
     catalog = signature_catalog()["weighted_masks"]
-    assert len(catalog["techniques"]) == 10
+    assert set(catalog["techniques"]) == {
+        "T1498.001", "T1498.002", "T1499.001", "T1499.002", "T1499.003",
+        "T1046", "T1204", "T1068", "T1041", "T1464", "T1110.001",
+    }
     for weights in catalog["techniques"].values():
-        assert len(weights) == 11 and all(len(row) == 8 for row in weights)
+        assert len(weights) == 13 and all(len(row) == 8 for row in weights)
         assert all(0 <= weight <= 1 for row in weights for weight in row)
     current = {"syn_backlog_growth_ratio": 0.36, "observed_ingress_count": 1}
     weaker = match_attack_signature(current)
@@ -26,6 +29,55 @@ def test_ten_weighted_technique_masks_keep_strength_and_observed_lags():
     ambiguous = {"unexpected_privilege_transition_count": 1, "distinct_probed_services_count": 6}
     assert match_attack_signature(ambiguous)["kind"] == "network_discovery"
     assert match_attack_signature(ambiguous, history=[{"unexpected_privilege_transition_count": 2}])["kind"] == "privilege_escalation"
+
+
+def test_authentication_mask_uses_attempts_per_account_with_observed_failure_fraction():
+    # 120 ошибок/ч при доле ошибок 0,8 означают 150 попыток/ч на запись.
+    signals = {"authentication_failure_rate_per_second": 120 / 3600,
+               "authentication_failure_ratio": 0.8}
+    match = match_attack_signature(signals)
+    assert match["weighted_technique_id"] == "T1110.001"
+    assert match["weighted_score"] == pytest.approx(0.5)
+    assert match_attack_signature({**signals, "authentication_failure_ratio": 0.5}) is None
+    assert match_attack_signature({**signals, "authentication_failure_ratio": 1.1}) is None
+    full = {**signals, "authentication_failure_rate_per_second": 300 / 3600,
+            "authentication_failure_ratio": 1.0}
+    assert match_attack_signature(full)["weighted_score"] == 1
+    with_history = match_attack_signature(signals, history=[None, full])
+    assert with_history["weighted_score"] == pytest.approx((0.5 + 0.70) / 1.70)
+
+
+def test_discovery_mask_uses_real_elapsed_seconds_and_keeps_window_boundary():
+    current = {"distinct_probed_services_count": 6}
+    peak = {"distinct_probed_services_count": 12}
+    history = [None, peak, peak]
+    match = match_attack_signature(current, history=history, step_seconds=30)
+    assert match["weighted_score"] == pytest.approx((0.5 + 0.70) / 1.70)
+    assert match_attack_signature(current, history=history, step_seconds=31)["weighted_score"] == 0.5
+    catalog = signature_catalog(step_seconds=30)["weighted_masks"]
+    index = catalog["rows"].index("service_discovery")
+    assert catalog["techniques"]["T1046"][index] == [1, 0.85, 0.70, 0, 0, 0, 0, 0]
+
+
+def test_direct_flood_score_uses_packet_rate_observation_and_an0969_reference():
+    # Полная выраженность всплеска, половина ориентира 10 000 пакетов/с.
+    current = {"traffic_acceleration_ratio": 0.70, "target_concentration_ratio": 0.90,
+               "observed_packet_rate_pps": 5_000}
+    assert match_attack_signature(current)["weighted_score"] == pytest.approx(0.75)
+    assert match_attack_signature({**current, "observed_packet_rate_pps": 20_000})["weighted_score"] == 1.0
+    model = GNetBaselineBuilder().build()
+    event, = active_attack_events(model, "mitre-demo", step_index=2, time_seconds=10, step_seconds=5)
+    assert event["sensor_signals"]["observed_packet_rate_pps"] == event["effective_packet_rate_pps"]
+
+
+@pytest.mark.parametrize(("signals", "window"), [
+    ({"syn_backlog_growth_ratio": 0.36}, 30),
+    ({"authentication_failure_rate_per_second": 150 / 3600, "authentication_failure_ratio": 1.0}, 600),
+])
+def test_technique_time_window_limits_history_in_seconds(signals, window):
+    score = match_attack_signature(signals)["weighted_score"]
+    assert match_attack_signature(signals, history=[{}], step_seconds=window)["weighted_score"] < score
+    assert match_attack_signature(signals, history=[{}], step_seconds=window + 1)["weighted_score"] == score
 
 
 def test_flood_family_depends_on_observed_ingress_and_keeps_the_mechanism():

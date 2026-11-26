@@ -182,7 +182,9 @@ def export_attack_catalog(
         # `attacks` оставлен совместимым alias для прежнего mitre-demo.
         "attacks": mitre_catalog,
         "tensor_mappings": mitre_tensor_mapping_catalog(),
-        "observation_signature_matrix": signature_catalog(),
+        "observation_signature_matrix": signature_catalog(
+            step_seconds=(selected_config or DynamicsConfig()).step_seconds,
+        ),
         "scenarios": {
             "mitre-demo": mitre_catalog,
             "predictive-demo": attack_catalog(

@@ -1,3 +1,5 @@
+import pytest
+
 from src.gnet9.attacks import (
     MITRE_DEMO_ATTACKS,
     MITRE_T1110_001_ATTEMPTS_PER_SECOND,
@@ -243,6 +245,12 @@ def test_slow_brute_force_is_safe_authentication_telemetry() -> None:
         <= MITRE_T1110_001_ATTEMPTS_PER_SECOND
     )
     observation = snapshot["attacks"]["target_observations"][0]
+    record, = snapshot["koopman"]["signature_entity_records"]
+    # Шаг 4 — половина пиковой частоты. Журнал событий и маска видят один датчик.
+    assert record["feature_match"]["observed_values"]["authentication_failure_rate_per_second"] == (
+        snapshot["attacks"]["authentication_failure_rate_per_second"]
+    )
+    assert record["feature_match"]["weighted_score"] == pytest.approx(0.5, abs=1e-5)
     assert observation["authentication_parameter_origin"].startswith(
         "mitre_t1110_001_apt28_procedure_example"
     )

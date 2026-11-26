@@ -18,22 +18,16 @@ import math
 import random
 from typing import Any
 
-from .attack_signatures import SIGNATURE_LIMITS, flood_fields
+from .attack_signatures import (
+    MITRE_T1110_001_APT28_MIN_ATTEMPTS_PER_HOUR, MITRE_T1110_001_APT28_PROCEDURE_URL,
+    MITRE_T1110_001_ATTEMPTS_PER_SECOND, SIGNATURE_LIMITS, flood_fields,
+)
 from .models import NetworkModel
 from .routing import has_data_path, shortest_data_path
 from .transport_queue import apply_transport_queues
 
 
 MITRE_ATTACK_SOURCE = "https://attack.mitre.org/techniques/"
-MITRE_T1110_001_APT28_PROCEDURE_URL = "https://attack.mitre.org/techniques/T1110/001/"
-# MITRE's APT28 procedure example says "over 300 authentication attempts per
-# hour per targeted account".  The simulator uses 300/h only as the documented
-# lower-bound reference (one expected failed login every 12 seconds), not as a
-# universal attack rate or as a real traffic generator.
-MITRE_T1110_001_APT28_MIN_ATTEMPTS_PER_HOUR = 300
-MITRE_T1110_001_ATTEMPTS_PER_SECOND = (
-    MITRE_T1110_001_APT28_MIN_ATTEMPTS_PER_HOUR / 3_600
-)
 MITRE_TACTICS_BY_TECHNIQUE = {
     **dict.fromkeys(("T1498.001", "T1498.002", "T1499.001", "T1499.002", "T1499.003", "T1529"), "TA0040"),
     "T1110.001": "TA0006", "T0831": "TA0105", "T1068": "TA0004", "T1046": "TA0007",
@@ -379,7 +373,8 @@ MITRE_DEMO_ATTACKS = (
             authentication_attempt_rate_per_second=MITRE_T1110_001_ATTEMPTS_PER_SECOND,
             authentication_failure_ratio=1.0,
             authentication_attempt_rate_origin=(
-                "mitre_t1110_001_apt28_procedure_example_lower_bound_300_attempts_per_hour_per_account"
+                f"mitre_t1110_001_apt28_procedure_example_lower_bound_{MITRE_T1110_001_APT28_MIN_ATTEMPTS_PER_HOUR}"
+                "_attempts_per_hour_per_account"
             ),
             authentication_attempt_rate_reference_url=MITRE_T1110_001_APT28_PROCEDURE_URL,
         ),
@@ -1871,15 +1866,12 @@ def active_attack_events(
             if profile.technical.initiator_count is not None:
                 sensor["observed_ingress_count"] = profile.technical.initiator_count
         else:
-            sensor = _precursor_signals(profile, maturity=intensity)
+            sensor = _profile_signals(profile, maturity=intensity, active=True)
             sensor.pop("signal_confidence")
+        sensor["observed_packet_rate_pps"] = event["effective_packet_rate_pps"]
         event["sensor_signals"] = sensor
         if profile.kind == AttackKind.BRUTE_FORCE:
-            event["effective_authentication_attempt_rate_per_second"] = round(
-                float(profile.technical.authentication_attempt_rate_per_second or 0.0)
-                * intensity,
-                6,
-            )
+            event["effective_authentication_attempt_rate_per_second"] = sensor["authentication_attempt_rate_per_second"]
             event["effective_failed_authentication_attempt_count"] = round(
                 float(event["effective_authentication_attempt_rate_per_second"])
                 * resolved_step_seconds
@@ -2246,7 +2238,7 @@ def observe_attack_precursors(
             profile.temporal.precursor_steps,
             1,
         )
-        signals = _precursor_signals(profile, maturity=maturity)
+        signals = _profile_signals(profile, maturity=maturity)
         common = {
             "observation_type": "pre_attack_telemetry",
             "observed_at_step": step_index,
@@ -3390,10 +3382,11 @@ def _build_attack_flows(
     return flows
 
 
-def _precursor_signals(
+def _profile_signals(
     profile: AttackProfile,
     *,
     maturity: float = 1.0,
+    active: bool = False,
 ) -> dict[str, float | int]:
     """Сформировать только сырые признаки с плавным нарастанием 0 → 1.
 
@@ -3434,7 +3427,7 @@ def _precursor_signals(
     battery_discharge = 0.75 * visible_fraction if brownout else 0.0
     authentication_rate = (
         float(profile.technical.authentication_attempt_rate_per_second or 0.0)
-        * visible_fraction
+        * (maturity if active else visible_fraction)
         if profile.kind == AttackKind.BRUTE_FORCE
         else 0.0
     )
@@ -3460,7 +3453,8 @@ def _precursor_signals(
         "ups_input_voltage_ratio": round(1.0 - power_sag, 6),
         "power_voltage_sag_ratio": round(power_sag, 6),
         "battery_discharge_rate_ratio": round(battery_discharge, 6),
-        "authentication_failure_rate_per_second": round(authentication_rate, 6),
+        "authentication_attempt_rate_per_second": round(authentication_rate, 6),
+        "authentication_failure_rate_per_second": round(authentication_rate * authentication_failure_ratio, 6),
         "authentication_failure_ratio": round(authentication_failure_ratio, 6),
         "account_lockout_pressure": round(min(1.0, authentication_rate), 6),
         "target_concentration_ratio": round(0.30 + (concentration - 0.30) * ramp, 6),

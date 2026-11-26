@@ -6,6 +6,20 @@ import math
 
 import numpy as np
 
+from .constants import DYNAMICS_STEP_SECONDS
+
+
+# Ориентиры для конкретных наблюдений, с единицами и источниками в каталоге.
+MITRE_T1110_001_APT28_PROCEDURE_URL = "https://attack.mitre.org/techniques/T1110/001/"
+MITRE_T1110_001_APT28_MIN_ATTEMPTS_PER_HOUR = 300
+MITRE_T1110_001_ATTEMPTS_PER_SECOND = MITRE_T1110_001_APT28_MIN_ATTEMPTS_PER_HOUR / 3600
+MITRE_AN0969_PACKET_RATE_PPS = 10_000
+# Длительность окна в секундах, стратегия и аналитика с примером настройки.
+MITRE_OBSERVATION_WINDOWS = {
+    "T1046": (60, "DET0376", "AN1057"),
+    "T1499.001": (30, "DET0356", "AN1012"),
+    "T1110.001": (600, "DET0551", "AN1521"),
+}
 
 # При нескольких совпадениях более специфичные признаки имеют приоритет.
 # Числа заданы для стенда в единицах соответствующего показателя.
@@ -45,9 +59,11 @@ FEATURE_GROUPS = {
     "privilege_transition": ({"unexpected_privilege_transition_count": 2},),
     "egress": ({"unusual_egress_bytes_per_second": 75_000, "established_channel_transfer_ratio": 0.95},),
     "mobile_connectivity": ({"mobile_endpoint_flag": 1, "mobile_link_failure_ratio": 0.60},),
+    "authentication": ({"inferred_attempt_rate_per_account_per_second": MITRE_T1110_001_ATTEMPTS_PER_SECOND},),
+    "packet_rate": ({"observed_packet_rate_pps": MITRE_AN0969_PACKET_RATE_PPS},),
 }
 FEATURE_WEIGHTS = {
-    "T1498.001": {"traffic_burst": 1.0},
+    "T1498.001": {"traffic_burst": 1.0, "packet_rate": 1.0},
     "T1498.002": {"reflection": 1.0, "distributed_sources": 0.65, "traffic_burst": 0.45},
     "T1499.001": {"syn_backlog": 1.0, "traffic_burst": 0.25},
     "T1499.002": {"service_pressure": 1.0},
@@ -57,12 +73,14 @@ FEATURE_WEIGHTS = {
     "T1068": {"privilege_transition": 1.0, "user_execution": 0.20},
     "T1041": {"egress": 1.0, "traffic_burst": 0.20},
     "T1464": {"mobile_connectivity": 1.0},
+    "T1110.001": {"authentication": 1.0},
 }
 TECHNIQUE_BY_KIND = {
     "dos": "T1498.001", "ddos": "T1498.002", "syn_flood": "T1499.001",
     "dns_flood": "T1499.002", "dhcp_flood": "T1499.002", "application_flood": "T1499.003",
     "network_discovery": "T1046", "user_execution": "T1204", "privilege_escalation": "T1068",
     "exfiltration": "T1041", "mobile_network_dos": "T1464",
+    "brute_force": "T1110.001",
 }
 LAG_WEIGHTS = (1.0, 0.85, 0.70, 0.55, 0.40, 0.30, 0.20, 0.10)
 WEIGHTED_MASKS = {technique: np.outer([features.get(name, 0.0) for name in FEATURE_GROUPS], LAG_WEIGHTS)
@@ -90,26 +108,65 @@ def _signal(signals: dict, name: str) -> float:
         value = float(signals.get(name, 0.0))
     except (TypeError, ValueError, OverflowError):
         return 0.0
+    if name == "authentication_failure_ratio" and not 0 <= value <= 1:
+        return 0.0
     return value if math.isfinite(value) else 0.0
 
 
 def _feature_vector(signals: dict) -> list[float]:
+    failure_fraction = _signal(signals, "authentication_failure_ratio")
+    failures = _signal(signals, "authentication_failure_rate_per_second")
+    attempt_rate = failures / failure_fraction if failure_fraction > 0 else 0.0
+    signals = {**signals, "inferred_attempt_rate_per_account_per_second": attempt_rate}
     return [max(min(max(0.0, min(1.0, _signal(signals, name) / scale)) for name, scale in group.items())
                 for group in alternatives) for alternatives in FEATURE_GROUPS.values()]
 
 
-def _weighted_scores(techniques: set[str], signals: dict, history: list[dict | None]) -> dict[str, float]:
+def _technique_mask(technique: str, step_seconds: int) -> np.ndarray:
+    if step_seconds <= 0:
+        raise ValueError("Длительность шага должна быть положительной")
+    mask = WEIGHTED_MASKS[technique]
+    if technique in MITRE_OBSERVATION_WINDOWS:
+        window_seconds, _, _ = MITRE_OBSERVATION_WINDOWS[technique]
+        ages_seconds = np.arange(len(LAG_WEIGHTS)) * step_seconds
+        return mask * (ages_seconds <= window_seconds)
+    return mask
+
+
+def _weighted_scores(techniques: set[str], signals: dict, history: list[dict | None],
+                     step_seconds: int) -> dict[str, float]:
     samples = [signals, *history[:len(LAG_WEIGHTS) - 1]]
     available = [index for index, sample in enumerate(samples) if sample is not None]
     observation = np.array([_feature_vector(samples[index]) for index in available]).T
     scores = {}
     for technique in sorted(techniques):
-        mask = WEIGHTED_MASKS[technique][:, available]
+        mask = _technique_mask(technique, step_seconds)[:, available]
         scores[technique] = float(np.sum(mask * observation) / np.sum(mask))
     return scores
 
 
-def signature_catalog() -> dict:
+def signature_catalog(*, step_seconds: int = DYNAMICS_STEP_SECONDS) -> dict:
+    references = {
+        technique: {
+            "maximum_lag_seconds": seconds,
+            "window_origin": f"{analytic}_TimeWindow_example",
+            "window_source_url": f"https://attack.mitre.org/detectionstrategies/{strategy}/",
+        }
+        for technique, (seconds, strategy, analytic) in MITRE_OBSERVATION_WINDOWS.items()
+    }
+    references["T1110.001"].update({
+        "source_url": MITRE_T1110_001_APT28_PROCEDURE_URL,
+        "origin": "apt28_procedure_example_lower_bound",
+        "attempts_per_hour_per_account": MITRE_T1110_001_APT28_MIN_ATTEMPTS_PER_HOUR,
+        "observed_metric": "inferred_attempt_rate_per_account_per_second",
+        "derivation": "authentication_failure_rate_per_second / authentication_failure_ratio",
+    })
+    references["T1498.001"] = {
+        "source_url": "https://attack.mitre.org/detectionstrategies/DET0343/",
+        "origin": "AN0969_PacketRateThreshold_example",
+        "observed_metric": "observed_packet_rate_pps",
+        "packets_per_second": MITRE_AN0969_PACKET_RATE_PPS,
+    }
     return {
         "value_origin": "gnet9_scenario_assumption",
         "row_kinds": list(SIGNATURE_LIMITS),
@@ -125,14 +182,18 @@ def signature_catalog() -> dict:
         "weighted_masks": {
             "rows": list(FEATURE_GROUPS), "step_lags": list(range(len(LAG_WEIGHTS))),
             "normalization_by_row": FEATURE_GROUPS, "lag_weights": LAG_WEIGHTS,
-            "techniques": {technique: mask.tolist() for technique, mask in WEIGHTED_MASKS.items()},
+            "step_seconds": step_seconds,
+            "techniques": {technique: _technique_mask(technique, step_seconds).tolist()
+                           for technique in WEIGHTED_MASKS},
+            "numeric_references": references,
             "score_semantics": "weighted_mean_of_normalized_sensor_evidence_over_observed_steps",
-            "value_origin": "gnet9_engineering_hypothesis_without_external_validation",
+            "value_origin": "gnet9_engineering_assumptions_except_listed_numeric_references",
         },
     }
 
 
-def match_attack_signature(signals: dict, *, history: list[dict | None] | None = None) -> dict | None:
+def match_attack_signature(signals: dict, *, history: list[dict | None] | None = None,
+                           step_seconds: int = DYNAMICS_STEP_SECONDS) -> dict | None:
     """Сопоставить измерения с рядами матрицы без метки сценария.
 
     Строка совпадает, когда все её активные координаты достигают минимума.
@@ -153,7 +214,7 @@ def match_attack_signature(signals: dict, *, history: list[dict | None] | None =
     kinds = tuple(SIGNATURE_LIMITS)
     candidates = {kinds[index]: float(margins[index]) for index in matches}
     techniques = {TECHNIQUE_BY_KIND[kind] for kind in candidates if kind in TECHNIQUE_BY_KIND}
-    scores = _weighted_scores(techniques, signals, history or []) if techniques else {}
+    scores = _weighted_scores(techniques, signals, history or [], step_seconds) if techniques else {}
     ordered = sorted(candidates, key=lambda kind: (
         2 if kind not in {"dos", "ddos"} else 1 if kind == "ddos" else 0,
         scores.get(TECHNIQUE_BY_KIND.get(kind), 1.0), candidates[kind],

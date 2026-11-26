@@ -449,7 +449,7 @@ class KoopmanOnlineAnalyzer:
         # начала атаки, ни её скрытый идентификатор здесь не используются.
         delay_history = [*self.state_history, z_current.copy()][-self.delay_embedding_depth :]
         observed_trend = _delay_trend(delay_history, self.metric_names)
-        forecast_entities = _forecast_entities(attack_state, self.signature_history, step_index)
+        forecast_entities = _forecast_entities(attack_state, self.signature_history, step_index, self.step_seconds)
         observed_sensors = {
             str(item["sensor_node_id"]) for item in attack_state.get("precursors", [])
             if item.get("sensor_node_id") and isinstance(item.get("signals"), dict) and item["signals"]
@@ -1727,7 +1727,7 @@ def _recommendation(
     }
 
 
-def _forecast_entities(attack_state: dict[str, Any], history, step_index: int) -> dict[str, Any]:
+def _forecast_entities(attack_state: dict[str, Any], history, step_index: int, step_seconds: int) -> dict[str, Any]:
     events = attack_state.get("events", []) if isinstance(attack_state, dict) else []
     precursors = attack_state.get("precursors", []) if isinstance(attack_state, dict) else []
     # Для раннего прогноза допустимы только идентификатор узла, на котором
@@ -1737,8 +1737,9 @@ def _forecast_entities(attack_state: dict[str, Any], history, step_index: int) -
                             if step_index - len(LAG_WEIGHTS) < step < step_index}
         if not history[channel]:
             del history[channel]
-    next_records = _signature_records(precursors, "precursor", history, step_index)
-    signature_records = _signature_records(attack_state.get("signature_observations", []), "observed_signature", history, step_index)
+    next_records = _signature_records(precursors, "precursor", history, step_index, step_seconds)
+    signature_records = _signature_records(attack_state.get("signature_observations", []),
+                                            "observed_signature", history, step_index, step_seconds)
     current_records = [
         {
             "observation_type": "active_event",
@@ -1790,7 +1791,7 @@ def _forecast_entities(attack_state: dict[str, Any], history, step_index: int) -
     }
 
 
-def _signature_records(observations, observation_type, history, step_index):
+def _signature_records(observations, observation_type, history, step_index, step_seconds):
     records = []
     for item in observations:
         sensor_id = item.get("sensor_node_id")
@@ -1799,7 +1800,7 @@ def _signature_records(observations, observation_type, history, step_index):
         signals = item.get("signals", {})
         samples = history.setdefault((observation_type, str(sensor_id)), {})
         previous = [samples.get(step_index - lag) for lag in range(1, len(LAG_WEIGHTS))]
-        match = match_attack_signature(signals, history=previous)
+        match = match_attack_signature(signals, history=previous, step_seconds=step_seconds)
         # Два показания в одной точке в тот же шаг нельзя склеивать в одну сигнатуру.
         samples[step_index] = None if step_index in samples else dict(signals)
         if match is None:

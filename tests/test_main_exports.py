@@ -99,6 +99,11 @@ def test_exported_attack_catalog_matches_custom_simulation_schedule(tmp_path: Pa
     exported = json.loads(path.read_text(encoding="utf-8"))
     expected = json.loads(json.dumps(attack_catalog(model, scenario, config=config)))
     assert exported["scenarios"][scenario] == expected
+    masks = exported["observation_signature_matrix"]["weighted_masks"]
+    assert masks["step_seconds"] == config.step_seconds
+    refs = masks["numeric_references"]
+    assert refs["T1046"]["maximum_lag_seconds"] == 60
+    assert refs["T1110.001"]["attempts_per_hour_per_account"] == 300
 
 
 def test_compact_dynamics_export_keeps_runtime_flows_without_serializing_them(
