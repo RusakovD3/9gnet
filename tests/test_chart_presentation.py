@@ -129,6 +129,25 @@ def test_timeline_contains_only_training_native_traffic_and_observed_attacks(tmp
         plt.close(fig)
 
 
+def test_arbitrator_plots_recorded_stages_even_when_risk_is_unchanged(tmp_path, monkeypatch):
+    snapshots = _snapshots()
+    for snapshot, stage in zip(snapshots, ("observe", "confirm_observation", "emergency")):
+        snapshot["arbitrator"] = {"trigger_card": {"response_stage": stage,
+            "signals": {"koopman": {"value": .8}, "decision": {"value": .9}}}}
+    figures = []
+    monkeypatch.setattr(charts, "save_figure", lambda fig, *args, **kwargs: figures.append(fig))
+    charts._plot_arbitrator(snapshots, charts.RunTimeAxis.from_result({"snapshots": snapshots}),
+                            tmp_path / "arbitrator_signals.png")
+    fig, = figures
+    try:
+        signals, stages = fig.axes
+        lines = {line.get_label(): line.get_ydata() for line in signals.lines}
+        np.testing.assert_equal(lines["риск Купмана"], [.8, .8, .8, np.nan])
+        np.testing.assert_equal(stages.lines[0].get_ydata(), [0, 1, 4, np.nan])
+    finally:
+        plt.close(fig)
+
+
 def test_png_exports_render_for_empty_and_recorded_data(tmp_path):
     for name, dynamics in (("empty", {}), ("recorded", {"snapshots": _snapshots()})):
         exported = charts.export_dynamics_charts(dynamics, tmp_path / name)
@@ -136,7 +155,6 @@ def test_png_exports_render_for_empty_and_recorded_data(tmp_path):
             "incident_overview.png", "koopman_risk.png", "lyapunov_growth.png", "native_traffic.png",
             "attack_traffic.png", "sla_by_class.png", "attacked_node_sla.png",
             "event_timeline.png", "arbitrator_signals.png", "capacity_bottlenecks.png",
-            "link_utilization.png", "resource_utilization.png", "service_sla_forecast.png",
         }
         for path in exported.values():
             image = plt.imread(path)

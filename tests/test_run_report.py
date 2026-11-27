@@ -46,7 +46,7 @@ def test_gold_priority_requires_evidence(levels, expected):
     assert _resilience_evaluation(steps, step_seconds=2)["gold_never_worse_than_silver_or_bronze"] is expected
 
 
-def test_brief_report_highlights_urgent_step_and_preserves_full_history(tmp_path):
+def test_brief_report_highlights_urgent_step_and_detailed_report_preserves_history(tmp_path):
     steps = [_snapshot(i, False) for i in (1, 2, 3)]
     for step, stage in zip(steps, ("prepare", "emergency", "emergency")):
         step["arbitrator"] = {"recommendation": {"response_stage": stage, "requires_human_action": True,
@@ -56,7 +56,9 @@ def test_brief_report_highlights_urgent_step_and_preserves_full_history(tmp_path
     text = (tmp_path / "run_summary.md").read_text(encoding="utf8")
     assert text.count("Проверьте питание узла.") == 1
     assert "Шаг 2" in text and "срочная защита" in text
-    assert len(report["recommendations"]) == 3
+    assert [item["step_index"] for item in report["recommendations"]] == [2]
+    detailed = build_run_summary({"snapshots": steps}, detailed_output=True)
+    assert len(detailed["recommendations"]) == 3
 
 
 def test_planned_training_is_distinct_from_accepted_and_sla_uses_denominator(tmp_path):

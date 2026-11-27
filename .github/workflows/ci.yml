@@ -52,6 +52,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: verification-${{ matrix.os }}-py${{ matrix.python }}
-          path: output/verification/
+          path: temp-local/verification/
           if-no-files-found: warn
           retention-days: 7

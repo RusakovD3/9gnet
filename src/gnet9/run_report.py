@@ -47,7 +47,7 @@ def _prediction_summary(evaluation):
     result = {key: evaluation.get(key) for key in (
         "attack_onset_count", "predicted_before_onset_count", "prediction_recall",
         "prediction_precision", "false_positive_warning_count", "right_censored_warning_count", "minimum_observed_lead_seconds",
-        "maximum_observed_lead_seconds", "prediction_slo_seconds", "prediction_slo_status",
+        "maximum_observed_lead_seconds", "median_observed_lead_seconds", "prediction_slo_predicted_count", "prediction_slo_seconds", "prediction_slo_status",
         "warning_episode_count", "observed_duration_seconds", "gap_duration_seconds",
         "warning_duration_seconds", "warning_occupancy_ratio", "false_warnings_per_simulated_hour")}
     result["evaluated"] = bool(evaluation.get("attack_onset_count"))
@@ -57,10 +57,16 @@ def _prediction_summary(evaluation):
             result[key] = None
         result["prediction_slo_status"] = ("NOT_APPLICABLE_NO_OBSERVED_ONSETS"
             if result["attack_onset_count"] == 0 else None)
+    if not result["predicted_before_onset_count"]:
+        for key in ("minimum_observed_lead_seconds", "median_observed_lead_seconds", "maximum_observed_lead_seconds"):
+            result[key] = None
+    result["records"] = evaluation.get("records", [])
+    result["false_positive_warnings"] = evaluation.get("false_positive_warnings", [])
+    result["right_censored_warnings"] = evaluation.get("right_censored_warnings", [])
     return result
 
 
-def build_run_summary(dynamics, *, include_charts=True):
+def build_run_summary(dynamics, *, include_charts=True, detailed_output=False):
     """Сохранять отсутствие наблюдений как null, а не как успех или нулевую нагрузку."""
     snapshots = dynamics.get("snapshots", [])
     evaluation = dynamics.get("koopman_evaluation", {})
@@ -74,6 +80,10 @@ def build_run_summary(dynamics, *, include_charts=True):
     observed_attacks = [snapshot for snapshot in snapshots if snapshot.get("attacks", {}).get("events")]
     action_snapshots = [s for s in snapshots
                         if s.get("arbitrator", {}).get("recommendation", {}).get("requires_human_action")]
+    highlight = peak_security_step(action_snapshots) if action_snapshots else None
+    if not detailed_output and highlight is not None:
+        action_snapshots = [action_snapshots[highlight]]
+        highlight = 0
     return {
         "schema_version": 2,
         "scope": "offline_simulation_not_independent_external_validation",
@@ -111,13 +121,13 @@ def build_run_summary(dynamics, *, include_charts=True):
              **snapshot["arbitrator"]["recommendation"]}
             for snapshot in action_snapshots
         ],
-        "highlighted_recommendation_index": peak_security_step(action_snapshots) if action_snapshots else None,
-        "service_sla_forecast": {
+        "highlighted_recommendation_index": highlight,
+        **({"service_sla_forecast": {
             k: v for k, v in dynamics.get("service_sla_evaluation", {}).items()
             if k in {"maximum_horizon_seconds", "methods", "by_horizon_seconds", "by_service", "cases",
                      "attribution", "route_stress", "operator_alert_evaluation", "operator_rule_version"}
         },
-        "service_sla_runtime": dynamics.get("service_sla_runtime", {}),
+        "service_sla_runtime": dynamics.get("service_sla_runtime", {})} if detailed_output else {}),
         "operation_mode": "forecast_and_human_recommendations_only",
         "events": [{key: record.get(key) for key in (
             "attack_id", "kind", "attack_family", "attack_mechanism", "attack_label_ru",
@@ -131,12 +141,10 @@ def build_run_summary(dynamics, *, include_charts=True):
             "Ляпунов относится к выбранной линейной модели; внешний перенос точности не подтверждён.",
             "SLA относится к проверяемым требованиям; полнота их моделирования указана отдельно в assessment_coverage_ratio_at_worst_step.",
         ],
-        "files": {"step_log": "step_log.csv", "complete_result": "network_dynamics.json",
-                  "decisions": "algorithm_dialogue.md",
-                  "detection_rules": "detection_rules/manifest.json",
-                  **({key: f"charts/{name}" for key, name in DYNAMICS_CHART_FILES.items()} if include_charts else {}),
-                  **({"security_dashboard": "charts/security_dashboard.png"}
-                     if include_charts and any("traffic" in s for s in snapshots) else {})},
+        "files": {"step_log": "step_log.csv",
+                  **({"complete_result": "network_dynamics.json", "decisions": "algorithm_dialogue.md",
+                      "detection_rules": "detection_rules/manifest.json"} if detailed_output else {}),
+                  **({key: f"charts/{name}" for key, name in DYNAMICS_CHART_FILES.items()} if include_charts else {})},
     }
 
 
@@ -257,13 +265,24 @@ def write_run_summary(summary, directory: Path):
         f"Сценарий: `{summary['config'].get('attack_scenario', 'не указан')}`. "
         f"Период наблюдений: {_display(summary['observation']['first_time_seconds'])}–"
         f"{_display(summary['observation']['last_time_seconds'])} с.", ""]
-    if "security_dashboard" in summary["files"]:
-        lines += ["[Открыть обзор ключевого шага](charts/security_dashboard.png)", ""]
     if prediction.get("attack_onset_count"):
         lines.append(f"Предупреждены {_display(prediction['predicted_before_onset_count'])} "
             f"из {_display(prediction['attack_onset_count'])} начал атак; "
             f"ложных эпизодов — {_display(prediction['false_positive_warning_count'])}; "
             f"минимальное упреждение — {_display(prediction['minimum_observed_lead_seconds'])} с.")
+        lines.append(f"Точность предупреждений — {_display(prediction['prediction_precision'], percent=True)}, "
+                     f"полнота по началам атак — {_display(prediction['prediction_recall'], percent=True)}. "
+                     f"За {_display(prediction['prediction_slo_seconds'])} с или раньше предупреждено "
+                     f"{_display(prediction['prediction_slo_predicted_count'])} из {_display(prediction['attack_onset_count'])}.")
+        if prediction["records"]:
+            lines += ["", "| Событие | Цель | Начало, с | Предупреждение, с | Упреждение, с |",
+                      "|---|---|---:|---:|---:|"]
+            for event in prediction["records"]:
+                warned = event["predicted_before_onset"]
+                lines.append(f"| {event['attack_id']} | {event['target_id']} | {_display(event['onset_time_seconds'])} "
+                             f"| {_display(event['warning_time_seconds']) if warned else 'пропуск'} "
+                             f"| {_display(event['lead_time_seconds']) if warned else '—'} |")
+            lines.append("")
     else:
         lines.append("Наблюдённых начал атак нет: точность предупреждений по этому прогону не оценивается.")
     if prediction.get("observed_duration_seconds") is not None:
@@ -276,7 +295,7 @@ def write_run_summary(summary, directory: Path):
     if prediction.get("right_censored_warning_count"):
         lines.append(f"Непроверенные предупреждения с окном за концом прогона — "
                      f"{prediction['right_censored_warning_count']}.")
-    at_issue_horizon = summary["service_sla_forecast"].get("operator_alert_evaluation", {}).get("2")
+    at_issue_horizon = summary.get("service_sla_forecast", {}).get("operator_alert_evaluation", {}).get("2")
     if at_issue_horizon:
         lines += ["", "**Предупреждения о нарушении SLA (требований к качеству услуг) за 2 с.** "
                   f"Подтверждено {at_issue_horizon['hits']} из {at_issue_horizon['onsets']} начал нарушений "
@@ -313,7 +332,8 @@ def write_run_summary(summary, directory: Path):
               f"В обучение принято переходов: {_display(training['accepted_transitions_total'])}; "
               f"до первых предвестников — {_display(training['accepted_transitions_before_first_precursor'])}. "
               f"Начальный участок по плану: {_display(training['planned_initial_clean_steps'])} шагов."]
-    lines += _service_forecast_text(summary)
+    if "service_sla_forecast" in summary:
+        lines += _service_forecast_text(summary)
     lines += ["", "## Наблюдённые события", ""]
     for event in summary["events"]:
         label = event["attack_label_ru"] or ATTACK_KIND_DISPLAY_NAMES.get(event["kind"], event["kind"])
@@ -324,17 +344,16 @@ def write_run_summary(summary, directory: Path):
     lines += ["", "</details>"]
     lines += ["", "## Как читать результат", ""]
     lines += [f"- {text}" for text in summary["interpretation_ru"]]
-    lines += ["", "Подробности в [журнале шагов](step_log.csv), [расчётах JSON](network_dynamics.json) "
-              "и [пояснениях решений](algorithm_dialogue.md).",
-              "Состав правил наблюдения приведён в [перечне Sigma, Suricata и YARA](detection_rules/manifest.json).", ""]
+    lines += ["", "[Журнал шагов](step_log.csv)", ""]
+    if "complete_result" in summary["files"]:
+        lines += ["[Расчёты JSON](network_dynamics.json) · [Пояснения решений](algorithm_dialogue.md) · "
+                  "[Правила наблюдения](detection_rules/manifest.json)", ""]
     if "koopman" in summary["files"]:
         lines += ["[Прогноз, доставка и качество услуг на одной шкале времени](charts/incident_overview.png)", "",
                   "[Купман](charts/koopman_risk.png) · [Ляпунов](charts/lyapunov_growth.png) · "
                   "[Хронология](charts/event_timeline.png) · [Арбитр](charts/arbitrator_signals.png)", "",
                   "[Обычный трафик](charts/native_traffic.png) · [Трафик атак](charts/attack_traffic.png) · "
                   "[SLA сети](charts/sla_by_class.png) · [SLA атакованных узлов](charts/attacked_node_sla.png)", "",
-                  "[Линии с наибольшей предложенной нагрузкой](charts/capacity_bottlenecks.png) · "
-                  "[Предложенная нагрузка по шагам](charts/link_utilization.png) · "
-                  "[Ресурсы](charts/resource_utilization.png).", ""]
+                  "[Линии с наибольшей предложенной нагрузкой](charts/capacity_bottlenecks.png)", ""]
     text_path.write_text("\n".join(lines), encoding="utf-8")
     return summary

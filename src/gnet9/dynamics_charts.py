@@ -16,7 +16,7 @@ from matplotlib.ticker import MaxNLocator
 from matplotlib.transforms import blended_transform_factory
 import numpy as np
 from .arbitrator import TRIGGER_BANDS
-from .constants import DYNAMICS_CHART_FILES
+from .constants import DYNAMICS_CHART_FILES, RESPONSE_STAGE_DISPLAY_NAMES
 from .flow_details import TRAFFIC_LABELS
 from .chart_style import BACKGROUND, TEXT, MUTED, BLUE, GREEN, AMBER, RED, PURPLE, style_axis
 from .plot_style import save_figure
@@ -78,7 +78,7 @@ def export_dynamics_charts(
     detail = flow_snapshots if flow_snapshots is not None else snapshots
     charts = {key: output_dir / name for key, name in DYNAMICS_CHART_FILES.items()}
     run = RunTimeAxis.from_result(dynamics)
-    line_peaks, peak_series = _link_load_summary(model, detail)
+    line_peaks, _ = _link_load_summary(model, detail)
     risk, threshold = _risk_series(series, dynamics)
     _plot_overview(series, risk, threshold, run, charts["overview"])
     _plot_koopman(series, risk, threshold, run, charts["koopman"])
@@ -87,17 +87,15 @@ def export_dynamics_charts(
     _plot_attack_traffic(snapshots, run, charts["attack_traffic"])
     _plot_sla_by_class(series, run, charts["sla"])
     _plot_target_sla(detail or snapshots, run, charts["target_sla"])
-    _plot_service_forecast(dynamics.get("service_sla_evaluation", {}), charts["service_forecast"], run)
     _plot_timeline(dynamics, run, charts["timeline"])
-    _plot_arbitrator(series, run, charts["arbitrator"])
+    _plot_arbitrator(snapshots, run, charts["arbitrator"])
     _plot_capacity_bottlenecks(line_peaks, charts["capacity"])
-    _plot_link_utilization(_steps(detail), peak_series, run, charts["links"])
-    _plot_resource_utilization(detail, run, charts["resources"])
 
     # Не оставлять в каталоге старые перегруженные диаграммы: так результат
     # текущего запуска не смешивается с историческими файлами.
     for legacy_name in (
-        "dynamics_overview.png",
+        "service_sla_forecast.png", "link_utilization.png", "resource_utilization.png",
+        "security_dashboard.png", "dynamics_overview.png",
         "dynamics_health.png",
         "traffic_composition.png",
         "link_capacity.png",
@@ -595,14 +593,32 @@ def _plot_observed_grid(
     _save_time(fig, [ax], run, path, bottom=.85 / fig.get_figheight(), top=1 - .85 / fig.get_figheight())
 
 
-def _plot_arbitrator(series, run, path):
-    fig, ax = plt.subplots(figsize=(11.5, 4.7))
-    for key, label, color in (("state_hausdorff_normalized", "расстояние Хаусдорфа", BLUE),
-                              ("lyapunov_remap_pressure", "вклад Ляпунова в решение", PURPLE),
-                              ("remap_pressure", "необходимость защиты", RED)):
-        _plot_line(ax, run.seconds(series["steps"]), series[key], label, color)
-    _style_axes(ax, "Основания решения арбитра", "оценка 0–1", (0, 1))
-    _save_time(fig, [ax], run, path, bottom=.21)
+def _plot_arbitrator(snapshots, run, path):
+    fig, (signals_ax, stage_ax) = plt.subplots(2, 1, figsize=(14, 6.6), sharex=True,
+                                               height_ratios=(2, 1))
+    times = run.seconds(_steps(snapshots))
+    cards = [s.get("arbitrator", {}).get("trigger_card", {}) for s in snapshots]
+    for key, label, color, style in (
+        ("hausdorff", "расстояние Хаусдорфа", BLUE, "-"),
+        ("lyapunov", "вклад Ляпунова", PURPLE, "-"),
+        ("decision", "необходимость защиты", RED, "-"),
+        ("koopman", "риск Купмана", AMBER, "--"),
+    ):
+        values = [_nested_float(card, ("signals", key, "value"), default=np.nan) for card in cards]
+        _plot_line(signals_ax, times, values, label, color, linestyle=style)
+    _style_axes(signals_ax, "Основания решения арбитра", "оценка 0–1", (-.025, 1.025))
+
+    stages = list(RESPONSE_STAGE_DISPLAY_NAMES)
+    positions = {stage: index for index, stage in enumerate(stages)}
+    decisions = [positions.get(card.get("response_stage"), np.nan) for card in cards]
+    if any(np.isfinite(decisions)):
+        stage_ax.step(times, decisions, where="post", color=GREEN, marker=".", markersize=3)
+    else:
+        stage_ax.text(.5, .5, "Нет сохранённых решений", transform=stage_ax.transAxes,
+                      ha="center", color=MUTED)
+    _style_axes(stage_ax, "Рекомендация оператору", "", (-.35, len(stages) - .65), legend=False)
+    stage_ax.set_yticks(range(len(stages)), list(RESPONSE_STAGE_DISPLAY_NAMES.values()))
+    _save_time(fig, [signals_ax, stage_ax], run, path, bottom=.12, top=.89, hspace=.48)
 
 
 def _plot_capacity_bottlenecks(line_peaks, path: Path) -> None:

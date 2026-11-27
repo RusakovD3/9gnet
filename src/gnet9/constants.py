@@ -131,10 +131,7 @@ DYNAMICS_CHART_FILES = {
     "attack_traffic": "attack_traffic.png",
     "sla": "sla_by_class.png",
     "target_sla": "attacked_node_sla.png",
-    "service_forecast": "service_sla_forecast.png",
     "timeline": "event_timeline.png",
     "arbitrator": "arbitrator_signals.png",
     "capacity": "capacity_bottlenecks.png",
-    "links": "link_utilization.png",
-    "resources": "resource_utilization.png",
 }

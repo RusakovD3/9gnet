@@ -31,5 +31,4 @@ dist/
 # Поставляемая документация; остальные исходные материалы остаются локально
 doc/*
 !doc/full_project_explanation_ru.md
-!doc/demo_overview.png
 !doc/incident_overview.png

@@ -14,7 +14,8 @@ from src.gnet9.dynamics import DynamicsConfig
 from src.gnet9.topology_builder import GNetBaselineBuilder
 
 
-def test_reports_only_writes_linked_results_in_separate_directory(tmp_path, monkeypatch):
+@pytest.mark.parametrize("detailed", [False, True])
+def test_reports_only_writes_linked_results_in_separate_directory(tmp_path, monkeypatch, detailed):
     import main
 
     root = Path(main.__file__).parent
@@ -22,17 +23,22 @@ def test_reports_only_writes_linked_results_in_separate_directory(tmp_path, monk
     policy.parent.mkdir()
     policy.write_bytes((root / "policies" / policy.name).read_bytes())
     monkeypatch.setattr(main, "__file__", str(tmp_path / "main.py"))
-    monkeypatch.setattr(sys, "argv", ["main.py", "--reports-only", "--dynamics-steps", "1"])
+    monkeypatch.setattr(sys, "argv", ["main.py", "--reports-only", "--dynamics-steps", "1"] + (["--detailed-output"] if detailed else []))
     main.main()
 
     directory = tmp_path / "output" / "reports"
     assert set(directory.parent.iterdir()) == {directory}
+    if detailed:
+        directory = directory / "details"
     assert not list(directory.rglob("*.png"))
     assert not (directory / "baseline_topology.json").exists()
     report = json.loads((directory / "run_summary.json").read_bytes())
-    assert report == json.loads((directory / "network_dynamics.json").read_bytes())["result_summary"]
+    if detailed:
+        assert report == json.loads((directory / "network_dynamics.json").read_bytes())["result_summary"]
+        assert report["files"]["detection_rules"] == "detection_rules/manifest.json"
+    else:
+        assert {p.name for p in directory.iterdir()} == {"run_summary.md", "run_summary.json", "step_log.csv"}
     assert report["observation"]["snapshot_count"] == 2
-    assert report["files"]["detection_rules"] == "detection_rules/manifest.json"
     links = re.findall(r"\]\(([^)]+)\)", (directory / "run_summary.md").read_text(encoding="utf-8"))
     for name in [*report["files"].values(), *links]:
         assert (directory / name).is_file(), name

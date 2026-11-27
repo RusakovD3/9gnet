@@ -525,6 +525,7 @@ def test_chart_export_keeps_only_the_compact_current_chart_set(
         "dynamics_remapping.png",
         "attack_arrival_weibull.png",
         "dynamics_overview.png",
+        "service_sla_forecast.png", "link_utilization.png", "resource_utilization.png", "security_dashboard.png",
     )
     for stale_name in stale_names:
         (tmp_path / stale_name).write_bytes(b"obsolete chart")
@@ -537,5 +538,5 @@ def test_chart_export_keeps_only_the_compact_current_chart_set(
     )
 
     assert set(paths) == {"overview", "koopman", "lyapunov", "native_traffic", "attack_traffic", "sla",
-                          "target_sla", "service_forecast", "timeline", "arbitrator", "capacity", "links", "resources"}
+                          "target_sla", "timeline", "arbitrator", "capacity"}
     assert all(not (tmp_path / stale_name).exists() for stale_name in stale_names)

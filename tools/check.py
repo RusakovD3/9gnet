@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 import uuid
-import xml.etree.ElementTree as ET
+import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,17 +26,9 @@ QUICK_TESTS = (
     "tests/test_check_tool.py",
 )
 SMOKE_FILES = (
-    "baseline_topology.json", "baseline_topology.graphml", "baseline_summary.txt",
-    "l1_d0sl_profiles.json", "l1_monitoring.csv", "l2_equipment_profiles.json",
-    "l0_server_service_catalog.json", "ip_address_plan.json", "mitre_attack_catalog.json",
-    "l1_d0sl_parsed.json", "l1_policies.d0sl", "network_dynamics.json",
-    "algorithm_dialogue.json", "algorithm_dialogue.md", "standards_and_equipment_audit.json",
-    "network_logic.png", "layer_scheme.png", "ip_address_map.png", "service_flows.png",
     "charts/incident_overview.png", "charts/koopman_risk.png", "charts/lyapunov_growth.png", "charts/native_traffic.png",
     "charts/attack_traffic.png", "charts/sla_by_class.png", "charts/attacked_node_sla.png",
     "charts/event_timeline.png", "charts/arbitrator_signals.png", "charts/capacity_bottlenecks.png",
-    "charts/link_utilization.png", "charts/resource_utilization.png", "charts/service_sla_forecast.png",
-    "charts/security_dashboard.png",
     "step_log.csv",
     "run_summary.json", "run_summary.md",
 )
@@ -108,46 +100,27 @@ def verify_smoke_exports(output: Path) -> dict[str, str]:
         if path.suffix == ".png" and not data.startswith(b"\x89PNG\r\n\x1a\n"):
             raise ValueError(f"Invalid PNG signature: {name}")
 
-    topology = json.loads((output / "baseline_topology.json").read_text(encoding="utf-8"))
-    if topology["level_summary"]["L1"] != 480 or topology["level_summary"]["L2"] != 30:
-        raise ValueError("Unexpected baseline L1/L2 counts")
-    if len(topology["services"]) != 6 or len(topology["servers"]) != 4:
-        raise ValueError("Unexpected service/server counts")
-    graphml = ET.parse(output / "baseline_topology.graphml")
-    namespace = {"g": "http://graphml.graphdrawing.org/xmlns"}
-    if len(graphml.findall(".//g:node", namespace)) != len(topology["nodes"]):
-        raise ValueError("GraphML/JSON node count mismatch")
-    if len(graphml.findall(".//g:edge", namespace)) != len(topology["edges"]):
-        raise ValueError("GraphML/JSON edge count mismatch")
-    with (output / "l1_monitoring.csv").open(encoding="utf-8", newline="") as stream:
-        if sum(1 for _ in csv.DictReader(stream)) != 480 * 30:
-            raise ValueError("Unexpected monitoring row count")
-    dynamics = json.loads((output / "network_dynamics.json").read_text(encoding="utf-8"))
+    actual = {p.relative_to(output).as_posix() for p in output.rglob("*") if p.is_file()}
+    if actual != set(SMOKE_FILES):
+        raise ValueError(f"Unexpected smoke artifacts: {actual - set(SMOKE_FILES)}")
     summary = json.loads((output / "run_summary.json").read_text(encoding="utf-8"))
-    if dynamics.get("export_metadata", {}).get("schema_version") != 3:
-        raise ValueError("Не указана версия представления результатов")
-    if summary.get("schema_version") != 2:
-        raise ValueError("Неизвестная версия краткого результата")
-    if summary["training"]["accepted_transitions_total"] != dynamics["training_summary"]["nominal_transitions"]:
-        raise ValueError("Итог обучения расходится с полными результатами")
+    report = (output / "run_summary.md").read_text(encoding="utf-8")
+    for name in [*summary["files"].values(), *re.findall(r"\]\(([^)]+)\)", report)]:
+        if name not in actual:
+            raise ValueError(f"Broken report link: {name}")
+    if summary["observation"]["snapshot_count"] != 2 or not summary["observation"]["ideal_t0_ok"]:
+        raise ValueError("Expected healthy t0 and one subsequent snapshot")
     if summary["prediction"]["evaluated"] or summary["prediction"]["prediction_precision"] is not None:
         raise ValueError("Исправный smoke не должен утверждать точность прогноза атак")
     for grade in ("gold", "silver", "bronze"):
         if summary["sla"]["by_class"][grade]["minimum_compliance_ratio"] != 1.0:
             raise ValueError(f"Smoke не подтвердил SLA класса {grade}")
-    if not dynamics["health"]["ok"] or len(dynamics["snapshots"]) != 2:
-        raise ValueError("Smoke requires healthy t0 and one subsequent snapshot")
-    if [item["step_index"] for item in dynamics["snapshots"]] != [0, 1]:
-        raise ValueError("Unexpected smoke snapshot sequence")
     with (output / "step_log.csv").open(encoding="utf-8-sig", newline="") as stream:
         rows = list(csv.DictReader(stream))
     if [row["шаг"] for row in rows] != ["0", "1"]:
         raise ValueError("Журнал шагов не соответствует состояниям модели")
-    expected_update = "да" if dynamics["snapshots"][1]["training"]["operator_updated"] else "нет"
-    if rows[1]["модель_обновлена"] != expected_update:
-        raise ValueError("Журнал неверно отражает обновление прогноза")
-    if (output / "service_flows_remapped.png").exists():
-        raise ValueError("Healthy smoke unexpectedly exported remapped flows")
+    if rows[1]["модель_обновлена"] != "да" or summary["training"]["accepted_transitions_total"] != 1:
+        raise ValueError("Первый исправный переход не подтверждён")
     return digests
 
 
@@ -159,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("profile", choices=("doctor", "quick", "full", "smoke"))
     args = parser.parse_args(argv)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    report_dir = ROOT / "output" / "verification" / f"{stamp}-{args.profile}-{uuid.uuid4().hex[:8]}"
+    report_dir = ROOT / "temp-local" / "verification" / f"{stamp}-{args.profile}-{uuid.uuid4().hex[:8]}"
     report_dir.mkdir(parents=True, exist_ok=False)
     report = {
         "profile": args.profile, "started_utc": stamp, "python": sys.version,
@@ -208,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
             report["checks"].append({"name": "export_contract", "exit_code": 0})
         report["passed"] = True
     except (OSError, ValueError, SyntaxError, RuntimeError, metadata.PackageNotFoundError,
-            KeyError, ET.ParseError) as error:
+            KeyError) as error:
         report["error"] = str(error)
         print(f"FAILED: {error}", file=sys.stderr, flush=True)
     finally:

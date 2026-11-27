@@ -309,7 +309,7 @@ def _dynamics_export_view(
         exported_snapshots.append(snapshot)
     exported["snapshots"] = exported_snapshots
     return {"export_metadata": exported.pop("export_metadata"),
-            "result_summary": build_run_summary(dynamics, include_charts=include_charts), **exported}
+            "result_summary": build_run_summary(dynamics, include_charts=include_charts, detailed_output=True), **exported}
 
 
 def _write_dynamics_json(path: Path, payload: dict[str, Any]) -> None:
@@ -340,17 +340,24 @@ def export_stationary_dynamics(
     *,
     packet_detail: str | None = None,
     include_charts: bool = True,
+    detailed_output: bool = True,
 ) -> dict[str, Any]:
     """Simulate once, export the selected detail and retain runtime flows."""
     dynamics = simulate_stationary_dynamics(
         model, config, compact_traffic_history=not include_charts and packet_detail == "summary",
     )
     export_detail = packet_detail or str(dynamics.get("config", {}).get("packet_detail", "sample"))
-    export_view = _dynamics_export_view(dynamics, export_detail, include_charts=include_charts)
-    _write_dynamics_json(path, export_view)
+    if detailed_output:
+        export_view = _dynamics_export_view(dynamics, export_detail, include_charts=include_charts)
+        _write_dynamics_json(path, export_view)
+        summary = export_view["result_summary"]
+        export_detection_rules(model, dynamics["snapshots"], path.parent / "detection_rules")
+        export_algorithm_dialogue(dynamics, path.with_name("algorithm_dialogue.json"),
+                                  path.with_name("algorithm_dialogue.md"))
+    else:
+        summary = build_run_summary(dynamics, include_charts=include_charts)
     export_step_log(dynamics, path.with_name("step_log.csv"))
-    write_run_summary(export_view["result_summary"], path.parent)
-    export_detection_rules(model, dynamics["snapshots"], path.parent / "detection_rules")
+    write_run_summary(summary, path.parent)
     return dynamics
 
 
@@ -360,7 +367,7 @@ def export_step_log(dynamics: dict[str, Any], path: Path) -> None:
         "фильтр_применён", "переход_принят_в_обучение", "раннее_предупреждение",
         "окно_прогноза_начало_с", "окно_прогноза_конец_с",
         "SLA_gold", "SLA_silver", "SLA_bronze", "наблюдаемые_события", "цели_атак",
-        "рекомендации_человеку", "семейство_и_механизм_событий"]
+        "рекомендации_человеку", "семейство_и_механизм_событий", "доля_доставленных_обычных_пакетов"]
     phases = {"reference": "эталон", "nominal_training": "начальный участок наблюдения", "observation_and_recommendations": "наблюдение и рекомендации"}
     sla_by_step = {point["step_index"]: point["score"]
                    for point in dynamics.get("sla_resilience", {}).get("points", [])}
@@ -404,6 +411,7 @@ def export_step_log(dynamics: dict[str, Any], path: Path) -> None:
                 "; ".join(sorted({str(e["target_id"]) for e in attacks.get("events", []) if e.get("target_id")})),
                 "; ".join(snapshot["arbitrator"]["recommendation"]["steps_ru"]),
                 "; ".join(e["attack_label_ru"] for e in attacks.get("events", []) if e.get("attack_label_ru")),
+                attacks.get("legitimate_delivery_ratio", ""),
             ])
 
 
@@ -593,7 +601,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="summary",
         help=(
             "Детализация снимка: полный граф, только тензоры или краткая сводка. "
-            "По умолчанию summary: полный граф уже хранится отдельно в baseline_topology.json."
+            "Значения tensor и full включают подробный экспорт."
         ),
     )
     parser.add_argument(
@@ -634,8 +642,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "с прогнозом по наблюдениям и рекомендациями человеку по защите услуг."
         ),
     )
+    parser.add_argument("--detailed-output", action="store_true",
+                        help="Дополнительно записать снимки JSON, пояснения решений, правила и справочные данные.")
     parser.add_argument("--reports-only", action="store_true",
-                        help="Сохранить расчёты, рекомендации и правила в output/reports без карт и каталогов.")
+                        help="Сохранить итог и журнал в output/reports без графиков.")
     args = parser.parse_args(argv)
     if args.reports_only and (args.validate_telemetry_csv or args.show_window or args.show_debug or args.debug_diagram):
         parser.error("--reports-only предназначен для расчёта модели без графики и внешней проверки CSV")
@@ -670,21 +680,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _export_baseline(model, output_dir: Path, d0sl_policy_path: Path, dynamics_config: DynamicsConfig) -> None:
-    from src.gnet9.address_visualizer import draw_ip_address_map, export_ip_address_plan
-    from src.gnet9.visualizer import GNetVisualizer
-
-    # Артефакты ранних ручных прототипов больше не входят в контракт output/.
-    # Удаляем только известные имена, не затрагивая пользовательские файлы.
-    for legacy_preview in (
-        "service_flows_remapped.png",
-        "interactive_flow_preview.png",
-        "koopman_warning_window_test.png",
-    ):
-        (output_dir / legacy_preview).unlink(missing_ok=True)
-    visualizer = GNetVisualizer(model)
-    visualizer.draw_network_logic(output_dir / "network_logic.png")
-    visualizer.draw_layer_scheme(output_dir / "layer_scheme.png")
-    draw_ip_address_map(model, output_dir / "ip_address_map.png")
+    from src.gnet9.address_visualizer import export_ip_address_plan
 
     model.export_json(output_dir / "baseline_topology.json")
     model.export_graphml(output_dir / "baseline_topology.graphml")
@@ -709,18 +705,6 @@ def _export_baseline(model, output_dir: Path, d0sl_policy_path: Path, dynamics_c
 
 def _export_charts(model, dynamics, flow_snapshots, output_dir: Path) -> dict[str, Path]:
     from src.gnet9.dynamics_charts import export_dynamics_charts
-    from src.gnet9.flow_visualizer import draw_security_dashboard, draw_service_flow_map
-
-    if flow_snapshots:
-        draw_service_flow_map(model, flow_snapshots[0]["traffic"]["flows"], output_dir / "service_flows.png")
-    else:
-        draw_service_flow_map(
-            model,
-            [],
-            output_dir / "service_flows.png",
-            title_suffix="пакетная модель отключена: показана только топология",
-        )
-    draw_security_dashboard(model, flow_snapshots, output_dir / "charts" / "security_dashboard.png")
     return export_dynamics_charts(
         dynamics,
         output_dir / "charts",
@@ -735,6 +719,9 @@ def main() -> None:
     output_dir = project_root / "output"
     if args.reports_only:
         output_dir = output_dir / "reports"
+    detailed_output = args.detailed_output or args.snapshot_detail != "summary" or args.packet_detail != "summary"
+    if detailed_output and not args.validate_telemetry_csv:
+        output_dir = output_dir / "details"
     output_dir.mkdir(parents=True, exist_ok=True)
     if args.validate_telemetry_csv:
         telemetry_config = TelemetryValidationConfig(
@@ -817,7 +804,7 @@ def main() -> None:
             else "model_default_not_externally_validated"
         ),
     )
-    if not args.reports_only:
+    if detailed_output and not args.reports_only:
         _export_baseline(model, output_dir, d0sl_policy_path, dynamics_config)
     dynamics = export_stationary_dynamics(
         model,
@@ -825,11 +812,7 @@ def main() -> None:
         dynamics_config,
         packet_detail=export_packet_detail,
         include_charts=not args.reports_only,
-    )
-    export_algorithm_dialogue(
-        dynamics,
-        output_dir / "algorithm_dialogue.json",
-        output_dir / "algorithm_dialogue.md",
+        detailed_output=detailed_output,
     )
     flow_snapshots = dynamics["snapshots"] if dynamics_config.include_packet_simulation else []
     chart_paths = {}
@@ -880,15 +863,8 @@ def main() -> None:
             f"{koopman_evaluation.get('attack_onset_count', 0)}; "
             f"статус={koopman_evaluation.get('prediction_slo_status_ru', '—')}."
         )
-    print(f"Пояснения к решениям: {output_dir / 'algorithm_dialogue.md'}")
-    print(f"Правила наблюдения: {output_dir / 'detection_rules' / 'manifest.json'}")
     if chart_paths:
-        print("Графики динамики:")
-        for path in chart_paths.values():
-            print(f"  - {path}")
-        print(f"Карта сервисных потоков: {output_dir / 'service_flows.png'}")
-        print(f"Карта IP-адресации: {output_dir / 'ip_address_map.png'}")
-        print(f"Аудит RFC и характеристик: {output_dir / 'standards_and_equipment_audit.json'}")
+        print(f"Графики ({len(chart_paths)}): {output_dir / 'charts'}")
     if debug_paths:
         print("Графическая диагностика:")
         for path in debug_paths.values():
